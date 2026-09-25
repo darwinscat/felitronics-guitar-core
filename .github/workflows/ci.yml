@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: ci
+
+# The rows core carried for these modules (its old nam=ON axis, ASan, gcc-14), plus the lints run from this
+# repository's root. felitronics-core is fetched at FELITRONICS_GUITAR_FCORE_TAG (CMakeLists.txt): CI checks
+# out this repository alone, so a green run proves the PIN — and it cannot be green before that core tag
+# exists.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 2 * * *"   # nightly: the core-main row below catches a core change that breaks these modules
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }} pffft=${{ matrix.pffft }} nam=${{ matrix.nam }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  pffft: ON,  nam: ON  }
+          - { os: macos-latest,   pffft: OFF, nam: ON  }
+          - { os: macos-latest,   pffft: ON,  nam: ON  }
+          - { os: windows-latest, pffft: OFF, nam: ON  }
+          # arm64 LINUX (gcc + glibc), the row that found poweramp's "silence in => exactly 0" reading
+          # 1.26e-08 under gcc's default FP contraction (FelitronicsPolicy.cmake). Core carried it with NAM
+          # off, which is what this row keeps: poweramp alone.
+          - { os: ubuntu-24.04-arm, pffft: OFF, nam: OFF }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_GUITAR_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }} -DFELITRONICS_GUITAR_WITH_NAM=${{ matrix.nam }}
+      - name: Build
+        run: cmake --build build --config Release -j 4
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error -j 4
+
+  # Against core's CURRENT main instead of the pin: the rows above prove the pinned core, and nothing on
+  # core's side builds these modules any more, so a core change that breaks them is found here (nightly
+  # at the latest), not at the next pin bump.
+  core-main:
+    name: against felitronics-core main
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_GUITAR_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_GUITAR_FCORE_TAG=main
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 4
+
+  sanitizers:
+    name: ubuntu-clang-asan-ubsan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure (ASan + UBSan, hard-fail on any UB)
+        run: >
+          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
+          -DFELITRONICS_GUITAR_BUILD_TESTS=ON -DFELITRONICS_ENABLE_SANITIZERS=ON -DFELITRONICS_WITH_PFFFT=ON
+      - name: Build
+        run: cmake --build build-san -j "$(nproc)"
+      - name: Test
+        run: ctest --test-dir build-san --output-on-failure --no-tests=error -j "$(nproc)"
+
+  gcc14:
+    name: ubuntu-gcc-14
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install g++-14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure
+        env: { CXX: g++-14, CC: gcc-14 }
+        run: cmake -S . -B build-gcc14 -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_GUITAR_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=ON
+      - name: Build
+        run: cmake --build build-gcc14 -j 4
+      - name: Test
+        run: ctest --test-dir build-gcc14 --output-on-failure --no-tests=error -j 4
+
+  lints:
+    name: lints (core's, run from this root)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch core (configure only)
+        run: cmake -S . -B build -DFELITRONICS_GUITAR_BUILD_TESTS=OFF -DFELITRONICS_GUITAR_WITH_NAM=OFF
+      - name: det-math manifest
+        run: node build/_deps/felitronics_core-src/tools/lint/check-det-math.mjs --satellite
+      - name: One allocation counter
+        run: node build/_deps/felitronics_core-src/tools/lint/check-alloc-counter.mjs modules tests
+      - name: No long double
+        run: node build/_deps/felitronics_core-src/tools/lint/check-no-long-double.mjs modules tests
+
+  wasm-audio:
+    name: wasm-audio (poweramp)
+    # poweramp was part of core's wasm-audio tier; it stays wasm-clean here. NAM is not in that tier (its
+    # upstream sources throw), so this row builds with FELITRONICS_GUITAR_WITH_NAM=OFF. The flags are core's
+    # wasm-audio preset's, and the toolchain is core's pin.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install emsdk 6.0.9
+        run: |
+          git clone --depth 1 --branch 6.0.9 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          "$HOME/emsdk/emsdk" install 6.0.9
+          "$HOME/emsdk/emsdk" activate 6.0.9
+          source "$HOME/emsdk/emsdk_env.sh"
+          echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
+          echo "PATH=$PATH"   >> "$GITHUB_ENV"
+      - name: Configure + build
+        run: |
+          cmake -S . -B build-wasm -DCMAKE_TOOLCHAIN_FILE="$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake" \
+                -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_GUITAR_WITH_NAM=OFF -DFELITRONICS_GUITAR_BUILD_TESTS=ON \
+                "-DCMAKE_CXX_FLAGS=-fno-exceptions -fno-rtti -ffp-contract=off -msimd128"
+          cmake --build build-wasm -j "$(nproc)"
+      - name: Run the suite in node
+        run: ctest --test-dir build-wasm --output-on-failure --no-tests=error -j "$(nproc)"
+      - name: No threads in any emitted .wasm
+        run: node build-wasm/_deps/felitronics_core-src/tools/wasm/check-no-threads.mjs --all build-wasm
+      - name: No threading header in a public module header
+        # The .wasm audit cannot see std::mutex: it lives inside libc++-noexcept.a and its stub succeeds.
+        run: |
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(thread|mutex|shared_mutex|condition_variable|future|latch|barrier|semaphore|stop_token)>' modules/poweramp/include; then
+            echo "^^ the wasm-audio tier is single-threaded by contract (felitronics-core DSP-ARCHITECTURE.md 2)"; exit 1
+          fi
+          echo "no threading headers in poweramp's public headers"
+      - name: No long double arithmetic in any emitted object — law 9, from the ARTIFACT
+        run: |
+          NM="$EMSDK/upstream/bin/llvm-nm"
+          if find build-wasm -name '*.o' -print0 \
+             | xargs -0 "$NM" --undefined-only --print-file-name \
+             | grep -E ' U (__(add|sub|mul|div|neg|extend[sd]f|trunc|fix|float|eq|ne|lt|le|gt|ge|unord)tf[0-9a-z]*|(sqrt|pow|exp|log|sin|cos|tan|fabs|floor|ceil|fmod|hypot|fma)l)$'; then
+            echo "^^ a wasm32 long double operation is a compiler-rt libcall — law 9."; exit 1
+          fi
+          echo "no long double arithmetic in any emitted object"
+      - name: Checked build — SAFE_HEAP + assertions + stack-overflow checks
+        run: |
+          cmake -S . -B build-wasm-checked -DCMAKE_TOOLCHAIN_FILE="$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake" \
+                -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_GUITAR_WITH_NAM=OFF -DFELITRONICS_GUITAR_BUILD_TESTS=ON \
+                "-DCMAKE_CXX_FLAGS=-fno-exceptions -fno-rtti -ffp-contract=off -msimd128" \
+                -DFELITRONICS_WASM_ASSERTIONS=2 -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
+          cmake --build build-wasm-checked -j "$(nproc)"
+          ctest --test-dir build-wasm-checked --output-on-failure --no-tests=error -j "$(nproc)"

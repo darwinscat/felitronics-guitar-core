@@ -1,0 +1,18 @@
+# THE SYSTEM-libm MANIFEST of felitronics-guitar-core — every call to a system transcendental in this
+# repository. Checked by felitronics-core's tools/lint/check-det-math.mjs, run from THIS repository's root
+# (it reads ./modules and ./tools/lint/det-math-manifest.txt); read that file for what the zone is and why
+# the list is per-FILE. The lines below moved verbatim from core's manifest with their modules.
+#
+# Format:   <path>  [<fn>*<count> ...]  <disposition>  <reason>
+# Dispositions: as defined in felitronics-core's tools/lint/det-math-manifest.txt.
+
+modules/poweramp/include/felitronics/poweramp/PowerAmpStage.h  [exp*4 pow*2 tanh*1]  retain-rt  power-amp stage curve and bias, per sample on the shaping path
+modules/poweramp/include/felitronics/poweramp/SagEnvelope.h  [exp*3]  retain-rt  supply-sag envelope coefficients
+modules/nam/src/NamStage.cpp  [pow*1]  retain-rt  one gain conversion in the neural amp stage
+
+# --- rigplayer: pack playback and its knobs ---
+modules/rigplayer/include/felitronics/rigplayer/AlignmentTable.h  [exp*1 log*1 sin*1]  retain-offline  alignment search between IRs; the chosen delay becomes persisted pack metadata, so it is a decision that outlives the run — recorded here rather than dismissed
+modules/rigplayer/include/felitronics/rigplayer/BlendKnob.h  [pow*1]  retain-rt  a knob taper
+modules/rigplayer/include/felitronics/rigplayer/RigPlayer.h  [exp*2 log*2 pow*1]  retain-rt  block ramps and level conversions on the playback path
+modules/rigplayer/include/felitronics/rigplayer/SectionBiquad.h  [cos*1 log10*1 pow*2 sin*1]  retain-rt  the tone-section biquad's coefficients
+modules/rigplayer/include/felitronics/rigplayer/ToneKnobs.h  [pow*1]  retain-rt  knob-to-gain taper

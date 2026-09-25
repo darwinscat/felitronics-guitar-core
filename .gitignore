@@ -1,0 +1,70 @@
+# Build output
+/build/
+/build-*/
+/build32/
+/cmake-build-*/
+/out/
+*.o
+*.obj
+*.a
+*.lib
+*.dylib
+*.so
+*.dll
+*.exe
+
+# CMake / fetched deps
+/_deps/
+/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# IDEs
+.idea/
+.vscode/
+*.xcodeproj/
+*.xcworkspace/
+.cache/
+
+# macOS
+.DS_Store
+
+# Local working files — never shipped. No trailing slash: one pattern covers a directory, a symlink to
+# it, and a stray file of the same name.
+CLAUDE.md
+.claude
+.private
+.dev
+
+# Stray logs
+*.log
+
+# --- build / tooling (pre-publication hygiene) ---
+compile_commands.json
+CMakeUserPresets.json
+/Testing/
+CTestTestfile.cmake
+*.dSYM/
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+.vs/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.swp
+*~
+.env
+.env.*
+
+# test audio and captures — never commit songs / IRs / models / raw dumps
+*.wav
+*.aiff
+*.flac
+*.mp3
+*.raw
+*.f32
+*.nam
+*.namz
+*.orbitrig

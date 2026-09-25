@@ -1,0 +1,27 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "desktop",
+            "displayName": "desktop — Release + self-tests",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "FELITRONICS_GUITAR_BUILD_TESTS": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "desktop", "configurePreset": "desktop", "jobs": 0, "configuration": "Release" }
+    ],
+    "testPresets": [
+        {
+            "name": "desktop",
+            "configurePreset": "desktop",
+            "configuration": "Release",
+            "output": { "outputOnFailure": true },
+            "execution": { "jobs": 0 }
+        }
+    ]
+}
