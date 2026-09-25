@@ -2,7 +2,7 @@
 
 # Changelog
 
-## Unreleased
+## v0.1.0 — 2026-09-25
 
 ### nam · rigplayer · poweramp — split out of felitronics-core
 

@@ -7,6 +7,7 @@
 [![core: felitronics-core](https://img.shields.io/badge/core-felitronics--core-brightgreen.svg)](https://github.com/darwinscat/felitronics-core)
 [![NAM: NeuralAmpModelerCore](https://img.shields.io/badge/NAM-NeuralAmpModelerCore-orange.svg)](https://github.com/sdatkinson/NeuralAmpModelerCore)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/tag/darwinscat/felitronics-guitar-core)](https://github.com/darwinscat/felitronics-guitar-core/tags)
 
 Guitar-amp DSP for the Darwin's Cat products, on top of [felitronics-core](https://github.com/darwinscat/felitronics-core).
 
