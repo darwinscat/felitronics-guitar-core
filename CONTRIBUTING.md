@@ -13,7 +13,8 @@ feature lands because you raised it, you are credited in `CHANGELOG.md`.
 ## Code — not accepted
 
 Pull requests containing code are closed unmerged, automatically, regardless of how good the
-change is. This is a standing policy, not a verdict on your patch.
+change is. This is a standing policy, not a verdict on your patch. Only the two authors merge into
+`main`, and the repository enforces it: `main` changes only through a pull request merged by them.
 
 **Why.** felitronics-guitar-core is AGPL-3.0-or-later and the copyright is held solely by its two
 authors, Oleh Tsymaienko and Alisa Lafoks. A merged contribution leaves its author holding
