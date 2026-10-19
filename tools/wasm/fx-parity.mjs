@@ -52,32 +52,47 @@ const Q = 128;   // the render quantum
 // ---- the simulated AudioWorkletGlobalScope -------------------------------------------------------------------------
 class AudioWorkletProcessor {
     constructor() {
-        this.port = { onmessage: null, posted: [], postMessage(m) { this.posted.push(m); } };
+        this.port = { onmessage: null, posted: [], closed: false,
+                      postMessage(m) { this.posted.push(m); }, close() { this.closed = true; } };
     }
 }
 
-async function loadWorklet(sampleRate) {
+const GLUE = fs.readFileSync(path.join(dir, 'fcguitarfx.mjs'), 'utf8');
+
+// The worklet's import of ./fcguitarfx.mjs is linked to a thin wrapper around the real glue, so a test can see the
+// module object a processor receives (and spy on it) before the processor starts using it.
+const WRAPPER = "import create from './glue.mjs';\n" +
+    'export default async function (arg) { const m = await create(arg); globalThis.__onFxModule?.(m); return m; }\n';
+
+/** A context shaped like an AudioWorkletGlobalScope. `renderQuantumSize` is put in scope only when given. And, as on
+    every engine older than Chrome 144 / Firefox 145 / Safari 26.2, WebAssembly.Memory has no toResizableBuffer. */
+async function loadWorklet(sampleRate, { renderQuantumSize } = {}) {
     let registered = null;
     const ctx = vm.createContext({
         console, AudioWorkletProcessor, sampleRate, currentFrame: 0, currentTime: 0,
         registerProcessor: (name, cls) => { registered = { name, cls }; },
+        ...(renderQuantumSize ? { renderQuantumSize } : {}),
     });
-    vm.runInContext('globalThis.AudioWorkletGlobalScope = function AudioWorkletGlobalScope() {};', ctx);
+    vm.runInContext('globalThis.AudioWorkletGlobalScope = function AudioWorkletGlobalScope() {};' +
+                    'delete WebAssembly.Memory.prototype.toResizableBuffer;', ctx);
     const absent = vm.runInContext(
         "['fetch', 'URL', 'TextDecoder', 'atob', 'setTimeout', 'importScripts', 'window', 'self']" +
-        '.filter((n) => typeof globalThis[n] !== "undefined")', ctx);
+        '.filter((n) => typeof globalThis[n] !== "undefined")' +
+        ".concat(typeof WebAssembly.Memory.prototype.toResizableBuffer === 'undefined' ? [] : ['toResizableBuffer'])", ctx);
     if (absent.length) throw new Error('the simulated worklet scope leaks ' + absent.join(', '));
 
-    const glue = new vm.SourceTextModule(fs.readFileSync(path.join(dir, 'fcguitarfx.mjs'), 'utf8'), {
+    const glue = new vm.SourceTextModule(GLUE, {
         context: ctx, identifier: 'fcguitarfx.mjs',
         initializeImportMeta(meta) { meta.url = 'https://worklet.invalid/fcguitarfx.mjs'; },
     });
+    const wrapper = new vm.SourceTextModule(WRAPPER, { context: ctx, identifier: 'fcguitarfx.mjs (spy)' });
     const worklet = new vm.SourceTextModule(fs.readFileSync(path.join(dir, 'fcguitarfx-worklet.js'), 'utf8'), {
         context: ctx, identifier: 'fcguitarfx-worklet.js',
         initializeImportMeta(meta) { meta.url = 'https://worklet.invalid/fcguitarfx-worklet.js'; },
     });
-    await worklet.link((spec) => {
-        if (spec === './fcguitarfx.mjs') return glue;
+    await worklet.link((spec, referrer) => {
+        if (spec === './fcguitarfx.mjs' && referrer === worklet) return wrapper;
+        if (spec === './glue.mjs' && referrer === wrapper) return glue;
         throw new Error('the worklet imports ' + spec);
     });
     await worklet.evaluate();
@@ -85,16 +100,23 @@ async function loadWorklet(sampleRate) {
 
     // The page compiles; the structured clone lands a Module of the WORKLET's realm, so compile in that realm.
     const CtxWasm = vm.runInContext('WebAssembly', ctx);
-    const module = await CtxWasm.compile(fs.readFileSync(path.join(dir, 'fcguitarfx.wasm')));
-    return { cls: registered.cls, module };
+    const bytes = fs.readFileSync(path.join(dir, 'fcguitarfx.wasm'));
+    const module = await CtxWasm.compile(bytes);
+    const wasmBytes = vm.runInContext('(n) => new ArrayBuffer(n)', ctx)(bytes.length);
+    new Uint8Array(wasmBytes).set(bytes);
+    return { cls: registered.cls, module, wasmBytes, ctx };
 }
 
-async function newProcessor(w, knobs) {
-    const proc = new w.cls({ numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
-                             processorOptions: { module: w.module, knobs } });
+async function settle(proc) {
     for (let i = 0; i < 1000 && proc.port.posted.length === 0; ++i)
         await new Promise((r) => setImmediate(r));
-    const first = proc.port.posted[0];
+    return proc.port.posted[0];
+}
+
+async function newProcessor(w, knobs, options = { module: w.module }) {
+    const proc = new w.cls({ numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+                             processorOptions: { ...options, knobs } });
+    const first = await settle(proc);
     if (!first || !first.ready) throw new Error('the processor did not come up: ' + JSON.stringify(first));
     return proc;
 }
@@ -180,6 +202,11 @@ group('the worklet loads in an AudioWorkletGlobalScope, and its exports are the 
     ok(JSON.stringify(got) === JSON.stringify(want), `the module exports exactly the header's entry points\n      got  ${got}\n      want ${want}`);
     ok(proc.m._fc_guitar_fx_abi_version() === 1, 'abi_version answers 1');
 }
+
+group('the glue runs without growable ArrayBuffers (the browser floor)');
+ok(!/toResizableBuffer/.test(GLUE),
+   'the glue never calls WebAssembly.Memory.toResizableBuffer — Chrome 144, Firefox 145 and Safari 26.2 have it, nothing older');
+// ...and every processor in this file runs with the method deleted (loadWorklet), as on those older engines.
 
 group(`the wasm render against the native render, within ${TOLERANCE} (law 10)`);
 for (const s of SCENARIOS) {

@@ -46,6 +46,17 @@ if(EMSCRIPTEN)
     #                           compiles the .wasm itself and posts the WebAssembly.Module to the processor, which
     #                           hands it to the factory through `instantiateWasm`. So the glue never fetches,
     #                           never builds a URL and never decodes text (README.md, "Loading it in a worklet").
+    #   -sGROWABLE_ARRAYBUFFERS=0   STATED, because a worklet-only link drops emscripten's browser minimums
+    #                           (tools/link.py: no web, worker or webview environment => MIN_*_VERSION unsupported),
+    #                           and with no minimum the feature table then picks 2: an UNGUARDED
+    #                           wasmMemory.toResizableBuffer(), which only Chrome 144, Firefox 145 and Safari 26.2
+    #                           have — every older engine fails at instantiation. 0, not 1 (try it, fall back):
+    #                           the processor makes its views once, after prepare, and nothing allocates after
+    #                           that, so a buffer that follows growth buys nothing, and 0 is one code path on every
+    #                           engine. Measured: with it, this glue differs from a `web,worklet` link at
+    #                           emscripten's default floor only in the web loader it does not need, and the .wasm
+    #                           is byte-identical. fx-parity.mjs holds both: no toResizableBuffer in the glue, and
+    #                           every render runs with the method deleted.
     #   -sEXPORT_ES6            a worklet is an ES module; the processor imports this one statically.
     #   -sMODULARIZE            one factory, one instance per processor: two nodes on a page share nothing.
     #   -sDYNAMIC_EXECUTION=0   no eval / new Function in the glue.
@@ -61,7 +72,7 @@ if(EMSCRIPTEN)
     target_link_options(fcguitarfx PRIVATE
         -O3 --no-entry
         -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createFcGuitarFx
-        -sENVIRONMENT=worklet
+        -sENVIRONMENT=worklet -sGROWABLE_ARRAYBUFFERS=0
         -sDYNAMIC_EXECUTION=0 -sFILESYSTEM=0 -sMALLOC=emmalloc
         "-sEXPORTED_FUNCTIONS=${_fx_exports}"
         "-sEXPORTED_RUNTIME_METHODS=HEAPF32")
