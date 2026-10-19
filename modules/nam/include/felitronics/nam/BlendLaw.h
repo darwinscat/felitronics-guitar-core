@@ -17,7 +17,9 @@
 // listening.
 //
 //   1. The applied weight moves by at most `maxDeltaPerBlock` per block. There is no other writer,
-//      so no path — a load, a device change, a give-up, a mode flip — can step it.
+//      so no path — a load, a device change, a give-up, a mode flip — can step it. (One-model mode,
+//      blendStepSingle, places it on a rail instead — only at a block that begins with the gain at
+//      exactly zero, so no sample anybody hears carries the step.)
 //   2. A model is replaced only in a slot whose applied weight is exactly zero.
 //   3. A model that has not yet been fed its receptive field is never audible. Its weight is zero,
 //      not small: a network that has not heard the last 132 ms does not produce a quiet version of
@@ -61,6 +63,17 @@ struct BlendPolicy {
     // its seconds into these. Zero or less = never — the law's own default, because sleeping is an
     // economy the host asks for with a number in its own rate, not a property of the recurrence.
     long long coldAfterSamples = 0;
+    // ONE MODEL AT A TIME (blendStepSingle). Off — the default — is the two-slot law, which this flag
+    // and the two numbers below do not reach: the single path is a separate function, entered here and
+    // nowhere else. On, the weight never rests
+    // between two slots while anything is heard, and a capture is replaced by a DIP instead of a
+    // crossfade: the gain falls to exactly zero, the outgoing slot rests, the incoming one is loaded
+    // or woken and fed its field while nothing is heard, the weight moves to it, and the gain rises.
+    bool single = false;
+    // …and how long the dip's two ramps take, in host samples (the host turns its seconds into
+    // these, as with coldAfterSamples). Fewer than one counts as one.
+    long long dipDownSamples = 1;
+    long long dipUpSamples   = 1;
 };
 
 struct BlendRequest {
@@ -106,6 +119,10 @@ struct BlendStep {
     // when nothing is — which happens only at a cold start, where silence is what a person expects.
     double    beginGain = 1.0, endGain = 1.0;
     BlendLoad load;
+    // How many samples of the block, from its first, the gain takes to travel from beginGain to
+    // endGain; it holds endGain after them. Zero = all of them — always, outside the single path, whose
+    // dip is stated in samples and so may end inside a block (a 15 ms ramp is not stretched to a block).
+    int       gainRamp = 0;
 };
 
 // A slot is SAFE TO HEAR when it holds a model that has been fed enough. Note this does not ask
@@ -123,11 +140,13 @@ inline bool blendSameRequest(const BlendRequest& a, const BlendRequest& b) {
 }
 
 inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long prewarm);
+inline BlendStep blendStepSingle(BlendState& s, const BlendRequest& r, int blockSamples, const BlendPolicy& p);
 
 // One audio block. Advances the fed counters, decides the goal, moves the weight toward it by at
 // most one step, and — only where a slot has arrived at exactly zero — asks for the swap.
 inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSamples,
                            const BlendPolicy& p = {}) {
+    if (p.single) return blendStepSingle(s, r, blockSamples, p);
     BlendStep out;
     out.beginB = s.x;
     if (blockSamples <= 0) { out.endB = s.x; return out; }
@@ -183,8 +202,15 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     s.x = std::clamp(s.x + std::clamp(goal - s.x, -d, d), 0.0, 1.0);
     out.endB = s.x;
 
+    // THE GAIN rises only while no slot that is unsafe to hear carries any weight in this block — at either edge.
+    // "One slot is safe" is not enough: a host that held one model and turns two on mid-dip (blendStepSingle) hands
+    // this path a weight standing on a slot that is in flight or unfed, and a cold start puts the weight on an EMPTY
+    // slot while the other loads — whose stage passes the raw DI. Until v0.2.0 the gain rose as soon as either slot
+    // was safe and both were heard, the unsafe one at its weight, for the blocks the weight took to leave it.
     out.beginGain = s.gain;
-    const double wantGain = (unsafe0 && unsafe1) ? 0.0 : 1.0;
+    const bool risk0 = unsafe0 && std::max(1.0 - out.beginB, 1.0 - out.endB) > 0.0;
+    const bool risk1 = unsafe1 && std::max(out.beginB, out.endB) > 0.0;
+    const double wantGain = (risk0 || risk1) ? 0.0 : 1.0;
     s.gain = std::clamp(s.gain + std::clamp(wantGain - s.gain, -d, d), 0.0, 1.0);
     out.endGain = s.gain;
 
@@ -232,6 +258,112 @@ inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long p
     s.still[slot] = 0;
     s.asked[slot] = 0;
     s.refused[slot] = 0;                 // what landed is real; whatever was refused may be asked anew
+}
+
+// ONE MODEL AT A TIME — BlendPolicy::single, for a host that can afford one network and not two (a
+// browser's audio thread on a slow machine). The request names ONE capture: the slot `targetB` sits
+// on (it is a rail here, 0 or 1) and the model that slot wants; the other slot is asked for nothing
+// and is never loaded. What this path adds is the one thing the crossfade cannot do without a second
+// network — replacing the capture that IS the sound — and it does it by a DIP:
+//
+//   1. the gain falls to exactly zero over dipDownSamples (the outgoing capture still plays alone);
+//   2. once nothing is heard, every slot but the one meant to sound RESTS (BlendState::cold — the host
+//      does not run it, and it keeps its model: a hand coming back to it costs a warm-up, not a load);
+//   3. the incoming capture is loaded — in its own slot, or in place of the outgoing one when both
+//      live in the same slot — or woken if its slot already holds it, and it is fed its receptive
+//      field while nothing is heard (invariant 3, unchanged: the silence is what pays for it);
+//   4. the weight is PLACED on its slot's rail — invariant 1 restated: it moves without a ramp only at a
+//      block that begins with the gain at exactly zero, where nothing of it is heard — and only once the
+//      slot is fed does the gain rise over dipUpSamples. So the hole is the dip and the warm-up, in time:
+//      a capture with no field is heard again in the block after the fall ends.
+//
+// So at most ONE NETWORK RUNS ON AUDIO at any instant — the dip ends the old one's sound before the new
+// one is run — plus the outgoing capture's bounded DRAIN: the host does not hand a resting slot audio,
+// and its stage feeds the lane its receptive field of silence once and stops (NamStage, law 11(d)), which
+// overlaps the incoming capture's warm-up. With ONE exception, stated rather than hidden: a switch into
+// this mode while two captures are sounding (a mode-two crossfade, half way) plays both through the dip's
+// fall, because silencing one of them sooner would be a step. Invariant 2 is restated, not broken: a model is replaced only where
+// nothing of it is heard — its weight is exactly zero, or the gain is. A slot whose weight is exactly
+// zero is put to rest at once, not after BlendPolicy::coldAfterSamples: there is no neighbour to keep
+// warm in this mode, which is the point of it.
+//
+// A capture that fails to load is refused as in the two-slot law (asked once); the slot keeps — and
+// sounds — whatever it held, warmed afresh, because it was not run while its replacement was out.
+//
+// AND THE WAY BACK: a host that turns two models on again hands blendStep a weight standing on whatever
+// this path left — a slot in flight, or one landed and not yet fed. The two-slot law raises its gain only
+// once no unsafe slot carries weight, so that hand-over is silent until the weight has left the slot.
+inline BlendStep blendStepSingle(BlendState& s, const BlendRequest& r, int blockSamples, const BlendPolicy& p) {
+    BlendStep out;
+    out.beginB = s.x;
+    if (blockSamples <= 0) { out.endB = s.x; return out; }
+    if (! blendSameRequest(r, s.last)) {
+        for (int i = 0; i < kBlendSlots; ++i)
+            if (r.want[i] != s.last.want[i]) s.refused[i] = 0;   // a new wish is worth a new try
+        s.last = r;
+    }
+    // The slot meant to sound, and what it should hold. A refused capture falls back to what its slot
+    // still holds, else to whatever the other slot holds: a real model rather than a silent panel.
+    int t = r.targetB >= 0.5 ? 1 : 0;
+    BlendModelId m = r.want[t];
+    if (m != 0 && m == s.refused[t]) {
+        if (s.held[t] != 0) m = s.held[t];
+        else if (s.held[1 - t] != 0) { t = 1 - t; m = s.held[t]; }
+    }
+    const bool muted = s.gain <= 0.0;                            // at the block's first sample
+    const auto weight = [&s](int i) { return i == 0 ? 1.0 - s.x : s.x; };
+    // REST: while anything is heard, every slot that is not heard; once nothing is, every slot but the
+    // one meant to sound. A slot in flight is not run by the host either way, and is not marked.
+    for (int i = 0; i < kBlendSlots; ++i) {
+        const bool keeper = i == t && m != 0 && s.held[i] == m;
+        if (s.held[i] != 0 && ! s.inFlight[i] && ! s.cold[i] && (muted ? ! keeper : weight(i) <= 0.0))
+            s.cold[i] = true;
+        s.still[i] = 0;                                          // the rest timer is the two-slot law's
+        // A slot in flight is not run by this host — the two-slot host plays its old model meanwhile, and does not
+        // reset its count when it asks — so if the load fails, what it keeps has not heard this audio: it warms again.
+        if (s.inFlight[i]) s.fed[i] = 0;
+    }
+    // WAKE the one meant to sound, and only once nothing is heard — sooner would be a second network.
+    if (muted && m != 0 && s.held[t] == m && s.cold[t]) blendLanded(s, t, m, s.need[t]);
+    const bool wasFed[kBlendSlots] { ! s.cold[0] && s.fed[0] >= s.need[0], ! s.cold[1] && s.fed[1] >= s.need[1] };
+    for (int i = 0; i < kBlendSlots; ++i)
+        if (s.held[i] != 0 && ! s.inFlight[i] && ! s.cold[i]) s.fed[i] += blockSamples;
+    // The weight moves only while nothing is heard, and then it is PLACED on the rail at the block's first sample
+    // rather than travelled there: the gain is exactly zero, so the travel would buy nothing anybody hears and cost a
+    // block of silence per quarter (four at 0.25 — 21 ms at a 256-sample block, 340 at 4096). The gain may rise only
+    // with the weight on the rail for the WHOLE block — so a block that is heard at all is one slot alone, never a mix.
+    const double rail = t == 1 ? 1.0 : 0.0;
+    if (muted) { s.x = rail; out.beginB = rail; }
+    const bool onRail = t == 1 ? s.x >= 1.0 : s.x <= 0.0;
+    out.endB = s.x;
+    const bool ready = onRail && m != 0 && s.held[t] == m && ! s.inFlight[t] && ! s.cold[t] && wasFed[t];
+    // THE DIP, in samples, ending where it ends rather than at the block's edge (BlendStep::gainRamp).
+    out.beginGain = s.gain;
+    const double want = ready ? 1.0 : 0.0;
+    const long long len = std::max(1LL, want > s.gain ? p.dipUpSamples : p.dipDownSamples);
+    const double room = (double) blockSamples / (double) len;   // how far the gain may travel this block
+    const double dist = want - s.gain;
+    if (std::abs(dist) <= room) {
+        if (std::abs(dist) > 0.0)
+            out.gainRamp = std::clamp((int) std::lround(std::abs(dist) * (double) len), 1, blockSamples);
+        s.gain = want;                                           // lands EXACTLY — law 8, as the weight does
+    } else {
+        s.gain += dist > 0.0 ? room : -room;
+    }
+    out.endGain = s.gain;
+    // THE LOAD, one at a time, into the slot meant to sound — once nothing of that slot is heard: the
+    // gain is down, or the slot is not being run at all (empty, or resting at weight zero), in which
+    // case the load overlaps the dip's fall instead of following it.
+    const bool busy = s.inFlight[0] || s.inFlight[1];
+    const bool unheard = muted || (weight(t) <= 0.0 && (s.held[t] == 0 || s.cold[t]));
+    if (! busy && m != 0 && s.held[t] != m && m != s.refused[t] && unheard) {
+        out.load = { true, t, m };
+        s.inFlight[t] = true;
+        s.asked[t] = m;
+        s.cold[t] = false;      // in flight now, which the host does not run either
+        s.fed[t] = 0;           // …and if it fails, what it keeps has not been run: it warms again
+    }
+    return out;
 }
 
 // 🔴 THE HOST RATE MOVED, AND THREE OF THIS LEDGER'S NUMBERS ARE HOST SAMPLES. `need` is a count of them

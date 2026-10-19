@@ -366,6 +366,42 @@ int main() {
     }
 
     // ------------------------------------------------------------------------------------------
+    group("ONE model at a time: the dip, the swap, and both mode switches allocate nothing");
+    {
+        // The one-model path has a state machine of its own on the audio side — a rest, a wake, a fall
+        // and a rise of the gain, a ramp that may end inside a block, a block written as silence. Each
+        // window below is a stretch of blocks with NOTHING but process() in it; the message thread's
+        // half (the knob, the load job, the mode) is published and run outside, where it may allocate.
+        Bench b(waveNetModel(512), 48000.0, 2);
+        felitronics::test::run (b.p.setMaxModels(1));
+        b.p.setDial("gain", 150.0);
+        b.settle(40);
+        Driver d;
+        double ph = 0.0;
+        d.fill(0.3, ph, 48000.0);
+        const auto blocks = [&](int n) {
+            return allocsAcross([&] { for (int k = 0; k < n; ++k) felitronics::test::run (b.p.process(d.io, 2, kBlock)); });
+        };
+        const long long steady = blocks(24);
+        felitronics::test::okNoAlloc(steady == 0, "24 steady one-model blocks allocate nothing (" + std::to_string(steady) + ")");
+        b.p.setDial("gain", 240.0);                     // the other slot's capture: a dip, then a load
+        const long long fall = blocks(8);               // the fall, and the load asked for
+        b.p.serviceHere();                              // the job, run off the clock
+        const long long rise = blocks(48);              // the landing, the rest, the warm-up, the travel, the rise
+        felitronics::test::okNoAlloc(fall == 0 && rise == 0, "the dip-swap allocates nothing (fall " + std::to_string(fall)
+                                     + ", landing to rise " + std::to_string(rise) + ")");
+        ok(b.p.heldFileId(0) == "late" && b.p.liveMix() <= 0.0f && b.p.pairBlocks() == 0,
+           "…and the swap really happened inside those windows, one network at a time");
+        felitronics::test::run (b.p.setMaxModels(2));   // 1 -> 2: the neighbour is asked for
+        const long long widen = blocks(24);
+        b.p.serviceHere();
+        const long long wide = blocks(24);
+        felitronics::test::run (b.p.setMaxModels(1));   // 2 -> 1 on a capture: the neighbour rests
+        const long long narrow = blocks(24);
+        felitronics::test::okNoAlloc(widen == 0 && wide == 0 && narrow == 0, "1 -> 2 and back allocate nothing ("
+                                     + std::to_string(widen) + ", " + std::to_string(wide) + ", " + std::to_string(narrow) + ")");
+    }
+
     group("the read-outs a strip polls beside the callback allocate nothing");
     {
         Bench b(delayModel(2000), 48000.0, 2);

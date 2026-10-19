@@ -8,6 +8,12 @@
 // read off the audio, not off a variable.
 
 #include <felitronics_test.h>
+// THE TEST SEAM in RigPlayer::process (FELITRONICS_RIGPLAYER_TEST_AFTER_LAW): called on every block right after the
+// law has stepped and before either stage runs — the instant a native host's job thread, pre-empting the audio thread,
+// could deliver a load the law has just asked for. Defined here, before the header, for this executable alone.
+namespace felitronics::rigplayer { class RigPlayer; }
+void afterLaw(felitronics::rigplayer::RigPlayer& player);
+#define FELITRONICS_RIGPLAYER_TEST_AFTER_LAW(player) afterLaw(player)
 #include <felitronics/rigplayer/RigPlayer.h>
 
 #include <namz.h>
@@ -223,6 +229,90 @@ struct Bench {
 };
 
 double db(double lin) { return 20.0 * std::log10(std::max(1e-12, lin)); }
+
+// The test device with captures that REMEMBER: the 150 and the 240 are WaveNets reaching back 300 and
+// 700 samples, so a model not fed its field sounds wrong and a second network is real work. The 60
+// stays a gain, a capture with no field at all.
+constexpr long kField150 = 300, kField240 = 700;   // the dilations; a kernel-2 WaveNet's field is one more
+void withFields(Bench& b, const namz::rig::Rig& rig) {
+    b.files["g150"] = bytesOf(waveNetDelayModel((int) kField150));
+    b.files["g240"] = bytesOf(waveNetDelayModel((int) kField240));
+    b.p.unload();
+    b.load(rig);
+}
+// The blocks a resting capture's DRAIN can span: NamStage feeds a lane it is no longer handed its receptive field of
+// silence (no tail for a WaveNet), and that is a network running.
+int drainBlocks(long dilation) { return (int) ((dilation + 1 + kBlock - 1) / kBlock); }
+
+// A host, one block at a time: the audio callback, then the timer — every load job COUNTED as it is
+// taken, then run right here. The guitar is a function of the absolute sample index, so two hosts
+// started together feed their players the same signal, sample for sample.
+struct Host {
+    Bench& b;
+    int jobs = 0;
+    std::string took;                         // "slot:fileId " per job, in order
+    long long k = 0;
+    std::vector<float> l, r;
+    explicit Host(Bench& bench) : b(bench), l((std::size_t) kBlock), r((std::size_t) kBlock) {}
+    const std::vector<float>& block() {
+        for (int i = 0; i < kBlock; ++i) {
+            const double t = (double) (k * kBlock + i) / b.fs;
+            const float s = (float) (0.2 * std::sin(2.0 * 3.14159265358979323846 * 220.0 * t)
+                                   + 0.05 * std::sin(2.0 * 3.14159265358979323846 * 1730.0 * t));
+            l[(std::size_t) i] = s; r[(std::size_t) i] = -s;
+        }
+        float* io[2] { l.data(), r.data() };
+        felitronics::test::run (b.p.process(io, b.p.channels(), kBlock));
+        b.p.service();
+        while (auto job = b.p.takeLoadJob()) {
+            ++jobs;
+            took += std::to_string(job->slot) + ":" + job->fileId + " ";
+            b.p.deliver(RigPlayer::run(std::move(*job)));
+        }
+        ++k;
+        return l;
+    }
+    void play(int blocks) { for (int i = 0; i < blocks; ++i) block(); }
+    void forget() { jobs = 0; took.clear(); b.p.clearCounters(); }
+};
+
+// The seam's other half: on the one player a test arms it for, a load the law asks for is taken and delivered INSIDE
+// the block that asked — what an audio thread pre-empted for as long as a prepareModel takes would meet.
+RigPlayer* gDeliverInside = nullptr;
+int        gDeliveredInside = 0;
+}  // namespace
+void afterLaw(felitronics::rigplayer::RigPlayer& player) {
+    if (&player != gDeliverInside) return;
+    while (auto job = player.takeLoadJob()) { ++gDeliveredInside; player.deliver(RigPlayer::run(std::move(*job))); }
+}
+namespace {
+
+// Stretches of silence at least `minRun` samples long — a dip is one; a sine crossing zero is not. Silence
+// is below -240 dBFS rather than exactly zero: the dip is a GAIN on the models' mix, and the post-model
+// tone after it (a band at its reference) rings its own rounding out at some 1e-19 for the rest of the
+// block in which the gain arrives.
+struct Silence { int runs = 0; long first = -1, last = -1; };
+Silence silenceIn(const std::vector<float>& y, int minRun = 32) {
+    Silence s;
+    long start = -1;
+    for (long i = 0; i <= (long) y.size(); ++i) {
+        const bool z = i < (long) y.size() && std::abs(y[(std::size_t) i]) <= 1.0e-12f;
+        if (z && start < 0) start = i;
+        if (! z && start >= 0) {
+            if (i - start >= minRun) { if (s.runs == 0) s.first = start; s.last = i - 1; ++s.runs; }
+            start = -1;
+        }
+    }
+    return s;
+}
+
+// Sample for sample, from `from` on: the count of samples that differ (== on floats, so -0 is 0).
+long differing(const std::vector<float>& a, const std::vector<float>& b, long from) {
+    long n = 0;
+    for (long i = std::max(0L, from); i < (long) std::min(a.size(), b.size()); ++i)
+        if (a[(std::size_t) i] != b[(std::size_t) i]) ++n;
+    return n;
+}
 
 // What the test rig's high shelf (3 kHz, Q 0.7) reads between 10 kHz and 100 Hz at `gainDb`, by the
 // format's own formula at this rate — the claim is "the player applies that formula", not "a shelf is
@@ -1414,6 +1504,364 @@ int main() {
                "two and a half seconds at 200: still 4/9 and 5/9 of each");
         ok(! b.p.slotCold(0) && ! b.p.slotCold(1), "neither slot is cold");
         ok(b.p.coldBlocks(0) == 0 && b.p.coldBlocks(1) == 0, "…and neither slept a single block");
+    }
+
+    // ---------------------------------------------------------------- ONE MODEL AT A TIME ----
+    const long dipLen = std::lround(RigPlayer::kDipSeconds * kFs);   // 720 samples
+
+    group("one model: the neighbour is never asked for, never run — and the capture alone is the player as it was");
+    {
+        Bench b(rig);
+        withFields(b, rig);
+        ok(b.p.maxModels() == 2, "two by default: the player as it always was");
+        ok(! b.p.setMaxModels(0) && ! b.p.setMaxModels(3) && ! b.p.setMaxModels(-1) && b.p.maxModels() == 2,
+           "law 11: 0, 3 and -1 are refused, and change nothing");
+        ok(b.p.setMaxModels(1) && b.p.maxModels() == 1, "one, asked for");
+        Host h(b);
+        h.play(400);                                                     // two seconds at 150, and more
+        ok(h.jobs == 1 && h.took == "0:g150 ", "ONE job in two seconds at 150 — the capture, in its own slot (" + h.took + ")");
+        ok(b.fetches == 1 && b.p.heldFileId(1).empty(), "…one fetch, and the far slot holds nothing: it was asked for nothing");
+        ok(b.p.runBlocks(1) == 0 && b.p.pairBlocks() == 0,
+           "no block ran a second network (" + std::to_string(b.p.pairBlocks()) + " pair blocks)");
+        ok(b.p.runBlocks(0) >= 398, "the one model ran every block once it had landed (" + std::to_string(b.p.runBlocks(0)) + ")");
+
+        // THE SAME SOUND as the player as it always was, with a pack that holds ONLY this capture on the
+        // green channel — which plays both slots of it, and runs both for two seconds. This plays one.
+        auto soloRig = testRig();
+        auto& files = soloRig.chain[0].device.files;
+        files.erase(std::remove_if(files.begin(), files.end(), [](const namz::rig::FileEntry& f) {
+            return f.settings.at("channel") == "green" && f.settings.at("gain") != "150"; }), files.end());
+        Bench s(soloRig);
+        withFields(s, soloRig);
+        Bench o(rig);
+        withFields(o, rig);
+        o.p.setMaxModels(1);
+        Host hs(s), ho(o);
+        std::vector<float> ys, yo;
+        for (int k = 0; k < 400; ++k) {
+            const auto& a = hs.block(); ys.insert(ys.end(), a.begin(), a.end());
+            const auto& c = ho.block(); yo.insert(yo.end(), c.begin(), c.end());
+        }
+        ok(hs.jobs == 2 && ho.jobs == 1, "the solo pack loaded its capture twice, the one-model player once ("
+                                         + hs.took + "/ " + ho.took + ")");
+        const long diff = differing(yo, ys, 32L * kBlock);
+        ok(diff == 0, "…and from the 32nd block on, the two are the same samples (" + std::to_string(diff) + " differ)");
+    }
+
+    group("one model: a change of capture is ONE dip — down, swap, up — never two networks, and it lands on the new capture's bits");
+    {
+        Bench b(rig);
+        withFields(b, rig);
+        b.p.setMaxModels(1);
+        Bench ref(rig);                                 // the player as it always was, parked at 240 throughout
+        withFields(ref, rig);
+        ref.p.setDial("gain", 240.0);
+        Host h(b), hr(ref);
+        for (int k = 0; k < 200; ++k) { h.block(); hr.block(); }
+        h.forget();
+        ok(b.p.setDial("gain", 240.0), "the hand goes to 240 — a capture that lives in the OTHER slot");
+        std::vector<float> y, want;
+        int offRail = 0, blended = 0, restBlock = -1, ranAtRest = -1;
+        for (int k = 0; k < 120; ++k) {
+            const int ran0 = b.p.runBlocks(0);
+            const auto& a = h.block(); y.insert(y.end(), a.begin(), a.end());
+            const auto& c = hr.block(); want.insert(want.end(), c.begin(), c.end());
+            if (b.p.liveMix() > 0.0f && b.p.liveMix() < 1.0f) ++offRail;
+            if (b.p.soundingLoudness().blended) ++blended;
+            if (restBlock < 0 && b.p.slotCold(0)) { restBlock = k; ranAtRest = b.p.runBlocks(0) - ran0; }
+        }
+        ok(offRail == 0 && blended == 0, "through the dip the weight stands on a rail and nothing reads as a blend ("
+                                         + std::to_string(offRail) + " blocks off a rail, " + std::to_string(blended) + " blended)");
+        const auto dip = silenceIn(y);
+        ok(dip.runs == 1, "exactly ONE stretch of silence (" + std::to_string(dip.runs) + ")");
+        ok(std::abs(dip.first - dipLen) <= 1, "the fall ends kDipSeconds after the turn, to the sample (silence from "
+                                              + std::to_string(dip.first) + ", " + std::to_string(dipLen) + " due)");
+        // The hole is the incoming capture's warm-up and nothing else: at least the law's need (the field, 701, plus a
+        // block — RigPlayer::warmFor; no rate-matcher at 48 kHz), at most that rounded up to a block, plus the rest of
+        // the block the fall ends in.
+        const long hole = dip.last - dip.first + 1, need240 = kField240 + 1 + kBlock, fallRest = kBlock - dipLen % kBlock;
+        ok(hole >= need240 && hole <= need240 + kBlock + fallRest,
+           "…and lasts the incoming capture's warm-up, fed while nothing is heard — no longer (" + std::to_string(hole)
+           + " in [" + std::to_string(need240) + ", " + std::to_string(need240 + kBlock + fallRest) + "])");
+        // ONE NETWORK ON AUDIO, plus the outgoing capture's bounded drain (NamStage feeds a lane it is no longer handed
+        // its field of silence), which overlaps the incoming warm-up: the counters see that drain, so the bound is it.
+        ok(b.p.pairBlocks() <= drainBlocks(kField150), "two networks only while the outgoing capture drains ("
+                                                       + std::to_string(b.p.pairBlocks()) + " pair blocks)");
+        ok(restBlock >= 0 && ranAtRest == 1, "…and the block it rests in, its drain is counted as a run ("
+                                             + std::to_string(ranAtRest) + ")");
+        ok(h.jobs == 1 && h.took == "1:g240 ", "ONE job: the new capture, into its own slot (" + h.took + ")");
+        const long rose = dip.last + 1 + dipLen;
+        ok(differing(y, want, rose) == 0 && differing(y, want, rose - kBlock) > 0,
+           "kDipSeconds after the silence ends, every sample is the 240 capture's own — and not before ("
+           + std::to_string(differing(y, want, rose)) + " differ after)");
+        approx(b.p.liveMix(), 1.0, 0.0, "the weight stands on slot 1's rail");
+        ok(b.p.slotCold(0) && b.p.heldFileId(0) == "g150", "the old capture RESTS in its slot, still loaded");
+
+        // BACK to 150: its slot still holds it, so the swap is a wake — a warm-up, no load.
+        h.forget();
+        ok(b.p.setDial("gain", 150.0), "back to 150");
+        y.clear();
+        for (int k = 0; k < 60; ++k) { const auto& a = h.block(); y.insert(y.end(), a.begin(), a.end()); }
+        ok(silenceIn(y).runs == 1 && h.jobs == 0 && b.fetches == 2, "one dip, and no job: the capture never left ("
+                                                                     + h.took + ")");
+        ok(b.p.pairBlocks() <= drainBlocks(kField240) && b.p.slotCold(1) && b.p.heldFileId(1) == "g240",
+           "…one network on audio, beside 240's drain as it rests (" + std::to_string(b.p.pairBlocks()) + " pair blocks)");
+
+        // …and to 0, the bottom LINK — the 60 capture fed softer, in the SAME slot as the one sounding: the
+        // swap happens in place, under the dip, and the far slot is not touched.
+        h.forget();
+        ok(b.p.setDial("gain", 0.0), "down to 0: a capture of the same slot's parity");
+        y.clear();
+        for (int k = 0; k < 60; ++k) { const auto& a = h.block(); y.insert(y.end(), a.begin(), a.end()); }
+        ok(silenceIn(y).runs == 1 && h.jobs == 1 && h.took == "0:g60 ", "one dip, one job, in place (" + h.took + ")");
+        ok(b.p.pairBlocks() == 0 && b.p.heldFileId(0) == "g60" && b.p.heldFileId(1) == "g240",
+           "…one network throughout; the far slot kept its capture");
+        double e = 0.0; for (long i = (long) y.size() - kBlock; i < (long) y.size(); ++i) e += (double) y[(std::size_t) i] * y[(std::size_t) i];
+        ok(e > 0.0, "…and it sounds");
+    }
+
+    group("one model -> two while playing: the neighbour is asked for at weight zero, and nothing changes until the dial moves");
+    {
+        Bench a(rig), twin(rig);
+        withFields(a, rig); withFields(twin, rig);
+        a.p.setMaxModels(1); twin.p.setMaxModels(1);
+        Host ha(a), ht(twin);
+        for (int k = 0; k < 200; ++k) { ha.block(); ht.block(); }
+        ha.forget();
+        ok(a.p.setMaxModels(2), "two, while playing");
+        std::vector<float> ya, yt;
+        float worstMix = 0.0f;
+        for (int k = 0; k < 150; ++k) {
+            const auto& u = ha.block(); ya.insert(ya.end(), u.begin(), u.end());
+            const auto& v = ht.block(); yt.insert(yt.end(), v.begin(), v.end());
+            worstMix = std::max(worstMix, a.p.liveMix());
+        }
+        ok(ha.jobs == 1 && ha.took == "1:g240 ", "the neighbour is asked for (" + ha.took + ")");
+        ok(worstMix <= 0.0f && differing(ya, yt, 0) == 0, "…at weight zero: every sample the same as a twin that stayed at one ("
+                                                          + std::to_string(differing(ya, yt, 0)) + " differ)");
+        ok(a.p.pairBlocks() > 0 && ! a.p.slotCold(1), "…and it runs, warm and waiting, as a two-model player's neighbour does");
+        ok(a.p.setDial("gain", 200.0), "the dial moves");
+        std::vector<float> mix;
+        for (int k = 0; k < 8; ++k) { ha.block(); mix.push_back(a.p.liveMix()); }
+        ok(mix[0] > 0.0f && a.p.biggestJump() <= 0.25f + 1e-6f, "…and the weight glides at once, a quarter per block at most ("
+                                                                + std::to_string(mix[0]) + " after the first block)");
+        approx(mix.back(), 50.0 / 90.0, 1e-6, "…to the pair's mix at 200");
+    }
+
+    group("two -> one while playing: on a capture the neighbour rests and the sound does not change; between two, a dip to the nearer");
+    {
+        Bench a(rig), twin(rig);
+        withFields(a, rig); withFields(twin, rig);
+        Host ha(a), ht(twin);
+        for (int k = 0; k < 100; ++k) { ha.block(); ht.block(); }   // half a second: the neighbour awake
+        ok(! a.p.slotCold(1) && a.p.heldFileId(1) == "g240", "two models: the neighbour awake at zero");
+        ha.forget();
+        ok(a.p.setMaxModels(1), "one, while playing");
+        std::vector<float> ya, yt;
+        for (int k = 0; k < 150; ++k) {
+            const auto& u = ha.block(); ya.insert(ya.end(), u.begin(), u.end());
+            const auto& v = ht.block(); yt.insert(yt.end(), v.begin(), v.end());
+        }
+        ok(differing(ya, yt, 0) == 0, "every sample the same as a twin that stayed at two (" + std::to_string(differing(ya, yt, 0)) + " differ)");
+        ok(a.p.slotCold(1) && a.p.runBlocks(1) <= drainBlocks(kField240) && ha.jobs == 0,
+           "…the neighbour rested on the first block — it ran only its drain — and nothing was loaded ("
+           + std::to_string(a.p.runBlocks(1)) + " blocks)");
+
+        // Between two captures: the nearer one alone, by a dip — the captures both already held.
+        Bench m(rig), ref(rig);
+        withFields(m, rig); withFields(ref, rig);
+        m.p.setDial("gain", 220.0);
+        ref.p.setDial("gain", 240.0);
+        Host hm(m), hr(ref);
+        for (int k = 0; k < 200; ++k) { hm.block(); hr.block(); }
+        approx(m.p.liveMix(), 70.0 / 90.0, 1e-6, "at 220, two captures sound: 2/9 of 150, 7/9 of 240");
+        hm.forget();
+        ok(m.p.setMaxModels(1), "one, between two captures");
+        std::vector<float> y, want;
+        for (int k = 0; k < 60; ++k) {
+            const auto& u = hm.block(); y.insert(y.end(), u.begin(), u.end());
+            const auto& v = hr.block(); want.insert(want.end(), v.begin(), v.end());
+        }
+        const auto dip = silenceIn(y);
+        ok(dip.runs == 1 && hm.jobs == 0, "one dip and no job (" + std::to_string(dip.runs) + " silences, " + hm.took + ")");
+        const int fallBlocks = (int) ((dipLen + kBlock - 1) / kBlock);
+        ok(m.p.pairBlocks() <= fallBlocks + drainBlocks(kField150),
+           "two networks only through the dip's fall — the stated exception — and the farther one's drain ("
+           + std::to_string(m.p.pairBlocks()) + " pair blocks)");
+        ok(differing(y, want, dip.last + 1 + dipLen) == 0, "…and then the 240 capture's own samples");
+        ok(m.p.slotCold(0) && m.p.liveMix() >= 1.0f, "the farther capture rests; the weight stands on the nearer one's rail");
+    }
+
+    group("a cold start: an EMPTY slot that still carries weight is never heard — its stage passes the raw DI");
+    {
+        for (int fields = 0; fields < 2; ++fields) {
+            Bench b(rig);
+            if (fields == 1) withFields(b, rig);
+            Host h(b);
+            int checked = 0, leaks = 0;
+            float prev = b.p.liveMix();
+            for (int k = 0; k < 40; ++k) {
+                const auto& y = h.block();
+                const float mix = b.p.liveMix();
+                const bool empty0 = b.p.heldFileId(0).empty() && (prev < 1.0f || mix < 1.0f);
+                const bool empty1 = b.p.heldFileId(1).empty() && (prev > 0.0f || mix > 0.0f);
+                if (empty0 || empty1) {
+                    ++checked;
+                    for (float v : y) if (v != 0.0f) { ++leaks; break; }
+                }
+                prev = mix;
+            }
+            ok(checked > 0 && leaks == 0, std::string(fields ? "WaveNets" : "gains") + ": every block an empty slot carries "
+               "weight in is digital silence (" + std::to_string(leaks) + " of " + std::to_string(checked) + " leak)");
+        }
+    }
+
+    group("one model -> two in the middle of a dip: the incoming capture is not heard until it is fed");
+    {
+        constexpr long kLong = 4000;                    // 240 with a field of 4001: fed fifteen whole blocks after it lands
+        for (int F : { 3, 5, 7 }) {
+            Bench b(rig);
+            b.files["g150"] = bytesOf(waveNetDelayModel((int) kField150));
+            b.files["g240"] = bytesOf(waveNetDelayModel((int) kLong));
+            b.p.unload();
+            b.load(rig);
+            b.p.setMaxModels(1);
+            Host h(b);
+            h.play(200);
+            b.p.setDial("gain", 240.0);
+            int landed = -1, heard = 0, sounded = 0;
+            float prev = b.p.liveMix();
+            for (int k = 0; k < 60; ++k) {
+                if (k == F) b.p.setMaxModels(2);
+                const auto& y = h.block();
+                const float mix = b.p.liveMix();
+                if (landed < 0 && b.p.heldFileId(1) == "g240") landed = k;
+                bool loud = false;
+                for (float v : y) if (v != 0.0f) { loud = true; break; }
+                const bool unfed = landed < 0 || k <= landed + (int) ((kLong + 1) / kBlock);
+                if (loud && unfed && (prev > 0.0f || mix > 0.0f)) ++heard;
+                sounded += loud ? 1 : 0;
+                prev = mix;
+            }
+            ok(heard == 0 && sounded > 0 && b.p.liveMix() >= 1.0f && b.p.heldFileId(1) == "g240",
+               "two models from dip block " + std::to_string(F) + ": no block with 240's weight in it sounds before 240 is "
+               "fed (" + std::to_string(heard) + "), and 240 sounds in the end");
+        }
+    }
+
+    group("one model: the hole is the incoming capture's warm-up, in time — a capture with no field costs at most a block");
+    {
+        Bench b(rig);
+        withFields(b, rig);
+        b.p.setMaxModels(1);
+        Host h(b);
+        h.play(200);
+        h.forget();
+        ok(b.p.setDial("gain", 60.0), "150 -> 60: a gain capture, no field, in the other slot");
+        std::vector<float> y;
+        for (int k = 0; k < 40; ++k) { const auto& a = h.block(); y.insert(y.end(), a.begin(), a.end()); }
+        const auto dip = silenceIn(y);
+        const long hole = dip.runs == 1 ? dip.last - dip.first + 1 : -1;
+        ok(dip.runs == 1 && hole <= kBlock, "one hole, of at most a block (" + std::to_string(hole) + " samples)");
+        ok(h.jobs == 1 && h.took == "1:g60 " && b.p.liveMix() >= 1.0f, "…one job, and 60 sounds (" + h.took + ")");
+    }
+
+    group("one model: a hand resting on the handover does not flicker — the step has a deadband");
+    {
+        Bench b(rig);
+        withFields(b, rig);
+        b.p.setMaxModels(1);
+        b.p.setDial("gain", 194.0);
+        Host h(b);
+        h.play(200);
+        ok(b.p.heldFileId(0) == "g150" && b.p.liveMix() <= 0.0f, "at 194, the nearer capture: 150");
+        h.forget();
+        std::vector<float> y;
+        for (int k = 0; k < 120; ++k) {
+            if (k % 12 == 0) b.p.setDial("gain", (k / 12) % 2 ? 194.0 : 196.0);
+            const auto& a = h.block(); y.insert(y.end(), a.begin(), a.end());
+        }
+        const auto jitter = silenceIn(y);
+        ok(jitter.runs <= 1 && h.jobs <= 1, "196, 194, ten times across the handover: at most one dip ("
+                                            + std::to_string(jitter.runs) + " dips, " + std::to_string(h.jobs) + " jobs)");
+        h.forget();
+        y.clear();
+        ok(b.p.setDial("gain", 210.0), "…and a real move, to 210");
+        for (int k = 0; k < 40; ++k) { const auto& a = h.block(); y.insert(y.end(), a.begin(), a.end()); }
+        ok(silenceIn(y).runs == 1 && b.p.heldFileId(1) == "g240" && b.p.liveMix() >= 1.0f, "…is one dip, to 240");
+    }
+
+    group("one model -> two between captures: nothing changes until the neighbour is fed, then the weight glides to the dial's blend");
+    {
+        Bench a(rig), twin(rig);
+        withFields(a, rig); withFields(twin, rig);
+        a.p.setMaxModels(1); twin.p.setMaxModels(1);
+        // 240, then back to 200 — inside the step's deadband, so 240 stays (a hand coming from 150 would keep 150).
+        for (auto* p : { &a.p, &twin.p }) { p->setDial("gain", 240.0); p->setDial("gain", 200.0); }
+        Host ha(a), ht(twin);
+        for (int k = 0; k < 200; ++k) { ha.block(); ht.block(); }
+        ok(a.p.liveMix() >= 1.0f && a.p.heldFileId(1) == "g240" && a.p.heldFileId(0).empty(),
+           "one model at 200, come from 240: 240 alone");
+        ha.forget();
+        ok(a.p.setMaxModels(2), "two, the dial where it was");
+        int landed = -1, moved = -1;
+        long differ = 0;
+        for (int k = 0; k < 40; ++k) {
+            const auto& u = ha.block();
+            const auto& v = ht.block();
+            if (landed < 0 && a.p.heldFileId(0) == "g150") landed = k;
+            if (moved < 0 && a.p.liveMix() < 1.0f) moved = k;
+            if (moved < 0) for (int i = 0; i < kBlock; ++i) differ += u[(std::size_t) i] != v[(std::size_t) i] ? 1 : 0;
+        }
+        ok(differ == 0, "until the weight moves, every sample is the twin's that stayed at one (" + std::to_string(differ) + " differ)");
+        ok(landed >= 0 && moved > landed + drainBlocks(kField150) - 1,
+           "…and it moves only once 150 has landed and run its field (landed " + std::to_string(landed) + ", moved "
+           + std::to_string(moved) + ")");
+        ok(a.p.biggestJump() <= 0.25f + 1e-6f, "…then glides, a quarter per block at most");
+        approx(a.p.liveMix(), 50.0 / 90.0, 1e-6, "…to the dial's own blend at 200, with no hand on the dial");
+    }
+
+    group("one model: crossing a LINK costs a load — one file at two angles of different parity");
+    {
+        Bench b(rig);
+        withFields(b, rig);
+        b.p.setMaxModels(1);
+        b.p.setDial("gain", 0.0);
+        Host h(b);
+        h.play(200);
+        ok(b.p.heldFileId(0) == "g60" && b.p.liveMix() <= 0.0f, "at 0, the link: g60, in slot 0");
+        h.forget();
+        b.p.setDial("gain", 60.0);
+        std::vector<float> y;
+        for (int k = 0; k < 40; ++k) { const auto& a = h.block(); y.insert(y.end(), a.begin(), a.end()); }
+        ok(silenceIn(y).runs == 1 && h.jobs == 1 && h.took == "1:g60 ",
+           "0 -> 60: one dip and one job — the same file, into the other slot (" + h.took + ")");
+    }
+
+    group("a load the law asks for is offered to the host only after both stages have run the block that asked");
+    {
+        // 200 -> 100: slot 1's 240 must become 60. Its weight travels to zero, and it is asked for in the block where it
+        // ARRIVES there — a block that STARTED at 0.056 of the sound. A host that took the job and delivered it before
+        // that block's stages ran would play the new, unfed model in it.
+        Bench a(rig), twin(rig);
+        a.p.setDial("gain", 200.0); twin.p.setDial("gain", 200.0);
+        Host ha(a), ht(twin);
+        for (int k = 0; k < 200; ++k) { ha.block(); ht.block(); }
+        ok(a.p.heldFileId(1) == "g240" && a.p.liveMix() > 0.5f, "at 200: 150 and 240 sounding");
+        ha.forget(); ht.forget();
+        a.p.setDial("gain", 100.0); twin.p.setDial("gain", 100.0);
+        gDeliverInside = &a.p;
+        gDeliveredInside = 0;
+        long differ = 0;
+        for (int k = 0; k < 40; ++k) {
+            const auto& u = ha.block();
+            const auto& v = ht.block();
+            for (int i = 0; i < kBlock; ++i) differ += u[(std::size_t) i] != v[(std::size_t) i] ? 1 : 0;
+        }
+        gDeliverInside = nullptr;
+        ok(ha.jobs + gDeliveredInside == 1 && ht.jobs == 1 && a.p.heldFileId(1) == "g60", "one job: 60, into slot 1");
+        ok(gDeliveredInside == 0 && differ == 0, "…and nobody could have delivered it inside the block that asked: every "
+           "sample is the twin's (" + std::to_string(gDeliveredInside) + " delivered inside, " + std::to_string(differ) + " differ)");
     }
 
     group("unload: silence, and a second device loads clean");

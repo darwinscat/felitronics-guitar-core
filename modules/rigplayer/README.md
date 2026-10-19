@@ -26,12 +26,12 @@ Signal order, per block:
 |---|---|
 | `prepare(rate, maxBlock, channels ≤ 2)` | message, never while `process()` runs |
 | `load(rig, source)` / `unload()` | message |
-| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` | message |
+| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` | message |
 | `service()` then `takeLoadJob()` | message, from a timer — a few times a second at least |
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
 | `process(io, channels, n)` | audio — allocates nothing, locks nothing, touches no file |
-| every read-out (`liveMix`, `heldFileId`, `soundingLoudness`, `selection`, `knobValue`, the drawing readers…) | message |
+| every read-out (`liveMix`, `heldFileId`, `soundingLoudness`, `selection`, `knobValue`, `runBlocks`, `pairBlocks`, the drawing readers…) | message |
 
 **Loading is a job the host runs.** `service()` never loads. When the law wants a model,
 `takeLoadJob()` hands out ONE job at a time — slot, `files[].id`, the bytes if already fetched, the
@@ -59,6 +59,40 @@ first turn after a rest trails the hand by one warm-up (some 130 ms for a WaveNe
 slew; a model that declares no field is heard at once). A slot with any weight is never cold: between two captures both models run, on one
 they do not. `setColdAfterSeconds(s)` sets the rest (zero or less = never); `slotCold(i)` and
 `coldBlocks(i)` (since `clearCounters()`) read it out beside `warmBlocks()`, for a dump or a badge.
+
+**One model at a time, for a host that cannot afford two.** `setMaxModels(2)` is the default and the
+player above, bit for bit — but for the first blocks after a load: the law's gain now waits until no
+slot that is empty, in flight or unfed carries weight, where v0.2.0 let an empty slot's raw DI be heard
+while the weight left it. `setMaxModels(1)` — meant for a browser's audio thread on a slow
+machine, which starts with one and turns the blend on only once it has measured that two fit:
+
+- the gain dial is STEPPED to the nearest capture (nearest by the handover `setBlendShape` sets), and
+  `selection()` says so — with a deadband (`kStepDeadband`, a tenth of the gap either side of the
+  handover) around the capture sounding, so a hand resting on the handover does not dip at every
+  tremor; the other slot is asked for nothing, so no neighbour is ever loaded and ONE network runs on
+  audio, plus the outgoing capture's bounded drain as it rests (its stage feeds the lane its receptive
+  field of silence once), which overlaps the incoming capture's warm-up;
+- a change of capture is a DIP, not a crossfade: the output of the models falls to exactly zero over
+  `kDipSeconds` (15 ms — OrbitAmp's `BypassFade`, the app's one fade for a link that replaces the
+  signal), the outgoing capture rests, the incoming one is loaded (one job) — or woken, if its slot
+  still holds it — and fed its receptive field while nothing is heard, and then the sound rises over
+  the same 15 ms. So a capture change costs a hole of the rest of the fall's block plus the incoming
+  model's warm-up, rounded up to blocks (some 130 ms for a WaveNet; a capture with no field is heard
+  again on the block after the fall);
+- slots go by the PARITY of a capture's place on the dial, so crossing a link — one file at two
+  angles, the pack's `0` and `60` for instance — is a change of slot here: a dip and a load of the
+  same file, where two models just glide;
+- `1 → 2` while playing asks for the neighbour at weight zero, and nothing of it is heard until it is
+  fed: on a capture the output then does not change until the dial moves; between two captures the
+  weight glides — a quarter per block at most — to the dial's own blend, with no hand on the dial.
+  `2 → 1` on a capture rests the neighbour and the output does not change; between two captures it
+  dips to the nearer one (the one place two networks run on audio in this mode: through the dip's
+  fall, because both were sounding when it was asked);
+- `runBlocks(slot)` and `pairBlocks()` count the blocks in which a slot's network, and both, actually
+  ran — on audio or draining a rest — since `clearCounters()`: what a host measures its budget with.
+
+The order, the invariants and the one exception are `nam::blendStepSingle`'s; the law owns the dip
+as it owns the weight.
 
 ## What a host must do
 
