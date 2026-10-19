@@ -114,6 +114,48 @@ BlendState settledAt(double deg) {
     return s;
 }
 
+// The HOST's side of a block, read off the law's state after the step the way rigplayer::RigPlayer reads it: a
+// two-model host hands every slot that is not cold its block (an empty stage passes it straight through; a slot whose
+// replacement is out plays its old model), a one-model host runs only a held, landed, awake model. `ran` is how many
+// samples IN A ROW of its present model the host has run: a model that changes, or a block it is not run, starts it
+// over — a network that missed audio has not heard its field. A slot is HEARD in a block when its weight is above zero
+// at either edge and so is the gain; heard, it must hold a model, not be in flight, and have run its field before.
+struct HostView {
+    long long    ran[kBlendSlots] { 0, 0 };
+    BlendModelId model[kBlendSlots] { 0, 0 };
+    int unsafe = 0, empty = 0, inFlight = 0, unfed = 0;
+    void block(const BlendState& before, const BlendState& after, const BlendStep& st, bool single, int n) {
+        const bool gain = st.beginGain > 0.0 || st.endGain > 0.0;
+        for (int i = 0; i < kBlendSlots; ++i) {
+            if (after.held[i] != model[i]) { model[i] = after.held[i]; ran[i] = 0; }
+            const bool runs = single ? after.held[i] != 0 && ! after.inFlight[i] && ! after.cold[i] : ! after.cold[i];
+            const double w = i == 0 ? std::max(1.0 - st.beginB, 1.0 - st.endB) : std::max(st.beginB, st.endB);
+            if (gain && w > 0.0) {
+                const bool e = after.held[i] == 0, f = before.inFlight[i], u = ! runs || ran[i] < after.need[i];
+                if (e) ++empty;
+                if (f) ++inFlight;
+                if (u) ++unfed;
+                if (e || f || u) ++unsafe;
+            }
+            ran[i] = runs && after.held[i] != 0 ? ran[i] + n : 0;
+        }
+    }
+    std::string why() const {
+        return std::to_string(unsafe) + " blocks: " + std::to_string(empty) + " empty, " + std::to_string(inFlight)
+             + " in flight, " + std::to_string(unfed) + " unfed";
+    }
+};
+
+// What a ONE-model host asks for at an angle: the capture nearest the hand, alone, in the slot its index's parity names
+// (as requestAt), the other slot asked for nothing.
+BlendRequest steppedAt(double deg) {
+    const int c = std::clamp((int) std::lround((deg - kFirst) / kStep), 0, kKnots - 1);
+    BlendRequest r;
+    r.want[c % 2] = (BlendModelId) (c + 1);
+    r.targetB = (double) (c % 2);
+    return r;
+}
+
 } // namespace
 
 int main() {
@@ -523,6 +565,216 @@ int main() {
                    && std::abs(s.x - 0.37) < 1e-12,
                "a restatement leaves the held model, a load in flight, a sleep, a refusal and the weight alone");
         }
+    }
+
+    group("ONE MODEL AT A TIME: one network, no step, nothing unfed heard, a swap only where silent — and it always arrives");
+    {
+        // A hand jumping between nine captures at random — one capture asked for, in its parity slot,
+        // the other slot asked for nothing — a load landing one to six blocks after it is asked, one in
+        // eight failing; from a cold start, in the single path. Every block is checked against the host's
+        // view of it: the slots the host RUNS are the ones held, not in flight and not cold.
+        BlendState s;
+        BlendPolicy p;
+        p.single = true;
+        p.dipDownSamples = p.dipUpSamples = 720;
+        std::uint32_t seed = 7;
+        const auto rnd = [&seed](int n) { seed = seed * 1664525u + 1013904223u; return (int) ((seed >> 8) % (std::uint32_t) n); };
+        BlendRequest r;
+        bool pend = false; int pendSlot = 0, pendLeft = 0; BlendModelId pendModel = 0;
+        int twoRan = 0, unfedHeard = 0, heardMix = 0, swapHeard = 0, twoAsked = 0, loads = 0;
+        double worstStep = 0.0;
+        BlendModelId lastWant = 0;
+        const auto runs = [&s](int i) { return s.held[i] != 0 && ! s.inFlight[i] && ! s.cold[i]; };
+        for (int k = 0; k < 30000; ++k) {
+            const bool tail = k >= 28000;                        // the last stretch: the hand still, no failure
+            if ((! tail && k % 53 == 0) || k == 28000) {
+                // …and at the tail a capture other than the last, so a refusal earlier cannot stand
+                const int c = k == 28000 ? (int) (lastWant % (BlendModelId) kKnots) + 1 : 1 + rnd(kKnots);
+                const int slot = (c - 1) % 2;
+                r = {};
+                r.want[slot] = (BlendModelId) c;
+                r.targetB = slot;
+                lastWant = (BlendModelId) c;
+            }
+            if (pend && --pendLeft <= 0) {
+                if (! tail && rnd(8) == 0) blendLoadFailed(s, pendSlot);
+                else blendLanded(s, pendSlot, pendModel, kPrewarm);
+                pend = false;
+            }
+            const BlendState before = s;
+            const auto st = blendStep(s, r, kBlock, p);
+            if (runs(0) && runs(1)) ++twoRan;
+            worstStep = std::max(worstStep, std::abs(st.endB - st.beginB));
+            if (st.beginGain > 0.0 || st.endGain > 0.0) {
+                // Heard: ONE slot alone, on its rail for the whole block, fed before it.
+                const bool rail0 = st.beginB <= 0.0 && st.endB <= 0.0, rail1 = st.beginB >= 1.0 && st.endB >= 1.0;
+                if (! rail0 && ! rail1) ++heardMix;
+                const int h = rail1 ? 1 : 0;
+                if (! runs(h) || s.fed[h] - kBlock < s.need[h]) ++unfedHeard;
+            }
+            if (st.load.wanted) {
+                ++loads;
+                if (pend) ++twoAsked;
+                const int i = st.load.slot;
+                const double w = i == 0 ? 1.0 - before.x : before.x;
+                const bool silent = before.gain <= 0.0 || (w <= 0.0 && (before.held[i] == 0 || before.cold[i]));
+                if (! silent) ++swapHeard;
+                pend = true; pendSlot = i; pendModel = st.load.model; pendLeft = 1 + rnd(6);
+            }
+        }
+        ok(twoRan == 0, "never two networks run in one block (" + std::to_string(twoRan) + ")");
+        ok(worstStep <= kMaxDelta + 1e-12, "the weight never moves more than the law's step (" + std::to_string(worstStep) + ")");
+        ok(heardMix == 0, "a block that is heard at all is ONE slot alone, on its rail (" + std::to_string(heardMix) + ")");
+        ok(unfedHeard == 0, "nothing unfed is ever heard (" + std::to_string(unfedHeard) + ")");
+        ok(swapHeard == 0, "a load is asked only where nothing of its slot is heard (" + std::to_string(swapHeard) + ")");
+        ok(twoAsked == 0 && loads > 100, "one load at a time (" + std::to_string(loads) + " loads)");
+        const int t = (int) ((lastWant - 1) % 2);
+        ok(s.held[t] == lastWant && s.gain >= 1.0 && (t == 1 ? s.x >= 1.0 : s.x <= 0.0) && s.cold[1 - t] == (s.held[1 - t] != 0),
+           "…and the dip always ends: the last capture asked for sounds, alone, at full gain");
+    }
+
+    group("ONE MODEL AT A TIME is a separate path: the two-slot law is untouched by its existence");
+    {
+        // The policy's default is the law as it was, and the new fields do not reach it: the same sweep
+        // with the dip lengths set to anything at all, single off, is the same run number for number.
+        BlendPolicy a, b;
+        b.dipDownSamples = 3; b.dipUpSamples = 99999;
+        Run ra, rb;
+        ra.policy = a; rb.policy = b;
+        for (int k = 0; k < 400; ++k) {
+            const double deg = 60.0 + 240.0 * (0.5 + 0.5 * std::sin(k * 0.05));
+            ra.block(requestAt(deg), 2); rb.block(requestAt(deg), 2);
+        }
+        ok(! (ra.s.x < rb.s.x) && ! (ra.s.x > rb.s.x) && ra.loads == rb.loads && ra.s.held[0] == rb.s.held[0] && ra.s.held[1] == rb.s.held[1],
+           "single off: the dip's numbers change nothing");
+    }
+
+    group("A COLD START: an EMPTY slot that still carries weight is never heard — its stage passes the raw DI");
+    {
+        // At 150 the pair's slot 0 is at full weight and cannot take its model until it is at zero, so slot 1 lands
+        // first and the weight travels to it. While it travels the gain must stay down: slot 0 is empty.
+        BlendState s;
+        HostView host;
+        int pend = -1; BlendModelId pendModel = 0; int pendSlot = 0;
+        for (int k = 0; k < 80; ++k) {
+            if (pend == k) blendLanded(s, pendSlot, pendModel, kPrewarm);
+            const BlendState before = s;
+            const auto st = blendStep(s, requestAt(150.0), kBlock);
+            host.block(before, s, st, false, kBlock);
+            if (st.load.wanted) { pend = k + 1; pendSlot = st.load.slot; pendModel = st.load.model; }
+        }
+        ok(host.unsafe == 0, "nothing empty, in flight or unfed is heard (" + host.why() + ")");
+        const auto r = requestAt(150.0);
+        ok(s.held[0] == r.want[0] && s.held[1] == r.want[1] && s.gain >= 1.0 && ! (s.x < r.targetB) && ! (s.x > r.targetB),
+           "…and the pair arrives, at full gain, where the dial stands");
+    }
+
+    group("ONE <-> TWO at any block: nothing empty, in flight or unfed is ever heard — and the dial's pair always arrives");
+    {
+        // A hand jumping to any angle, the host flipping between one model and two at random — the request then the
+        // nearest capture alone, or the pair either side — a load landing one to six blocks after it is asked, one in
+        // eight failing, models of three receptive fields (none, short, long). From a cold start; the last stretch two
+        // models, the hand still, nothing failing.
+        BlendState s;
+        BlendPolicy one;
+        one.single = true;
+        one.dipDownSamples = one.dipUpSamples = 720;
+        std::uint32_t seed = 11;
+        const auto rnd = [&seed](int n) { seed = seed * 1664525u + 1013904223u; return (int) ((seed >> 8) % (std::uint32_t) n); };
+        const auto needOf = [](BlendModelId m) { return m % 3 == 0 ? 0LL : m % 3 == 1 ? 300LL : kPrewarm; };
+        HostView host;
+        bool single = false, pend = false;
+        double deg = 150.0;
+        int pendSlot = 0, pendLeft = 0, flips = 0;
+        BlendModelId pendModel = 0;
+        for (int k = 0; k < 32000; ++k) {
+            const bool tail = k >= 30000;
+            if (! tail && k % 41 == 0) deg = kFirst + kStep * (kKnots - 1) * (double) rnd(1001) / 1000.0;
+            if (! tail && rnd(29) == 0) { single = ! single; ++flips; }
+            if (k == 30000) { single = false; deg = 200.0; }
+            if (pend && --pendLeft <= 0) {
+                if (! tail && rnd(8) == 0) blendLoadFailed(s, pendSlot);
+                else blendLanded(s, pendSlot, pendModel, needOf(pendModel));
+                pend = false;
+            }
+            const BlendState before = s;
+            const auto st = single ? blendStep(s, steppedAt(deg), kBlock, one) : blendStep(s, requestAt(deg), kBlock);
+            host.block(before, s, st, single, kBlock);
+            if (st.load.wanted) { pend = true; pendSlot = st.load.slot; pendModel = st.load.model; pendLeft = 1 + rnd(6); }
+        }
+        ok(flips > 500, "the host changed its mind " + std::to_string(flips) + " times");
+        ok(host.unsafe == 0, "nothing empty, in flight or unfed is heard (" + host.why() + ")");
+        const auto r = requestAt(200.0);
+        ok(s.held[0] == r.want[0] && s.held[1] == r.want[1] && s.gain >= 1.0 && ! (s.x < r.targetB) && ! (s.x > r.targetB),
+           "…and the dial's pair arrives, at full gain, at its blend");
+    }
+
+    group("ONE -> TWO in the middle of a dip: the incoming capture is not heard until it is fed");
+    {
+        // 150 (a 300-sample field) alone in slot 0; the hand goes to 240 (6332) in slot 1; the host turns two models
+        // on at the dip's 5th, 6th or 7th block — after the fall, with 240 landed or on its way and far from fed.
+        const int n = 256;
+        BlendPolicy one;
+        one.single = true;
+        one.dipDownSamples = one.dipUpSamples = 720;
+        BlendRequest r150, r240, pair;
+        r150.want[0] = 150;
+        r240.want[1] = 240; r240.targetB = 1.0;
+        pair.want[0] = 150; pair.want[1] = 240; pair.targetB = 1.0;
+        for (int F : { 5, 6, 7 }) {
+            BlendState s;
+            HostView host;
+            int land = -1, slot = 0; BlendModelId model = 0;
+            for (int k = 0; k < 160; ++k) {
+                const int dip = k - 60;
+                if (land == k) blendLanded(s, slot, model, model == 150 ? 300 : kPrewarm);
+                const BlendState before = s;
+                const bool two = dip >= F;
+                const auto st = blendStep(s, dip < 0 ? r150 : two ? pair : r240, n, two ? BlendPolicy {} : one);
+                host.block(before, s, st, ! two, n);
+                if (st.load.wanted) { land = k + 1; slot = st.load.slot; model = st.load.model; }
+            }
+            ok(host.unsafe == 0, "two models from dip block " + std::to_string(F) + ": nothing unfed heard (" + host.why() + ")");
+            ok(s.held[1] == 240 && s.gain >= 1.0 && s.x >= 1.0, "…and 240 sounds in the end");
+        }
+    }
+
+    group("ONE -> TWO while the sounding slot's replacement is out: it is not heard while in flight or unfed");
+    {
+        // 240 sounded first, in slot 1, then 150 in slot 0 — so slot 1 rests holding 240. Then 60, in slot 0 as well:
+        // replaced IN PLACE, under the dip. The host takes that job and, before delivering it, turns two models on; the
+        // delivery comes five blocks later.
+        const int n = 256;
+        BlendPolicy one;
+        one.single = true;
+        one.dipDownSamples = one.dipUpSamples = 720;
+        BlendRequest r240, r150, r60, pair;
+        r240.want[1] = 240; r240.targetB = 1.0;
+        r150.want[0] = 150;
+        r60.want[0] = 60;
+        pair.want[0] = 60; pair.want[1] = 240;
+        const auto needOf = [](BlendModelId m) { return m == 60 ? kPrewarm : 300LL; };
+        BlendState s;
+        HostView host;
+        int land = -1, slot = 0, asked = -1; BlendModelId model = 0;
+        double heard = 0.0;
+        for (int k = 0; k < 200; ++k) {
+            if (land == k) blendLanded(s, slot, model, needOf(model));
+            const BlendState before = s;
+            const bool two = asked >= 0;
+            const auto& r = k < 60 ? r240 : k < 120 ? r150 : two ? pair : r60;
+            const auto st = blendStep(s, r, n, two ? BlendPolicy {} : one);
+            host.block(before, s, st, ! two, n);
+            if (st.load.wanted) {
+                land = k + (st.load.model == 60 ? 5 : 1); slot = st.load.slot; model = st.load.model;
+                if (st.load.model == 60) asked = k;
+            }
+            if (two && (before.inFlight[0] || s.held[0] != 60 || s.fed[0] - n < s.need[0]))
+                heard = std::max(heard, std::max((1.0 - st.beginB) * st.beginGain, (1.0 - st.endB) * st.endGain));
+        }
+        ok(asked >= 0 && host.unsafe == 0 && ! (heard > 0.0),
+           "slot 0's weight times the gain is zero while 60 is out or unfed (" + std::to_string(heard) + "; " + host.why() + ")");
+        ok(s.held[0] == 60 && s.gain >= 1.0 && s.x <= 0.0, "…and 60 sounds in the end");
     }
 
     return felitronics::test::report();
