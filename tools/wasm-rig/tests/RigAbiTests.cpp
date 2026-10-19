@@ -72,10 +72,19 @@ struct Direct
     Files files;
     Counts refuse;
     long long fetched = 0, jobs = 0;
-    bool fed = false;      // the host's feed, stated as a host with a fader states it: the pack's own level plus it
+    bool fed = false;      // the host's feed…
     double feedDb = 0.0;
+    // …handed to the player as the feed (setFeedDb, what fc_rig does) — or, on v0.5.0's spelling, as the host's whole
+    // input level, the pack's own plus it, restated after every load: the PREVIOUS code path, which the sound of the
+    // new one is held to (the scope cannot be: only setFeedDb puts the dry between the feed and the pack's level).
+    bool previousFeed = false;
 
-    void feed() { if (fed) p.setHostInputDb (p.stageInputDb() + feedDb); }
+    void feed()
+    {
+        if (! fed) return;
+        if (previousFeed) p.setHostInputDb (p.stageInputDb() + feedDb);
+        else test::run (p.setFeedDb (feedDb));
+    }
     bool load (const std::string& manifest)
     {
         bool okParse = false;
@@ -177,10 +186,10 @@ struct Outcome
 
 /** `blocks` blocks of the input through both sides, the events applied before their block, pumped after each. */
 Outcome compare (const Files& files, int channels, int maxBeforeLoad, const std::vector<Event>& events, int blocks,
-                 const Counts& refuse = {})
+                 const Counts& refuse = {}, bool previousFeed = false)
 {
     const auto fixture = fc_rig_fixture::pack();
-    Direct d; d.files = files; d.refuse = refuse;
+    Direct d; d.files = files; d.refuse = refuse; d.previousFeed = previousFeed;
     Abi a; a.files = files; a.refuse = refuse;
     test::run (d.p.prepare (kFs, kBlock, channels));
     test::run (fc_rig_prepare (a.r, kFs, kBlock, channels) == 1);
@@ -229,7 +238,7 @@ Outcome compare (const Files& files, int channels, int maxBeforeLoad, const std:
             const bool scopeSame = an == dn && (double) d.p.scopeFrames() == fc_rig_scope_frames (a.r)
                 && std::memcmp (ad.data(), dd.data(), sizeof (float) * (std::size_t) an) == 0
                 && std::memcmp (aw.data(), dw.data(), sizeof (float) * (std::size_t) an) == 0;
-            if (! scopeSame) ++o.scopeDiffer;
+            if (! scopeSame && ! previousFeed) ++o.scopeDiffer;
             if (an > 0) ++o.scopeReads;
         }
         d.pump();
@@ -319,14 +328,29 @@ void bitIdentity()
                                { 1090, Kind::Gain, "", "", 60.0 }, { 1095, Kind::Dial, "Treble", "", 60.0 },
                                { 1100, Kind::Feed, "", "", -3.0 }, { 1120, Kind::Standby, "", "", 0.0 },
                                { 1140, Kind::Standby, "", "", 1.0 }, { 1142, Kind::Standby, "", "", 0.0 },
-                               { 1160, Kind::Reload }, { 1180, Kind::Feed, "", "", 0.0 } });
+                               { 1160, Kind::Reload }, { 1180, Kind::Feed, "", "", 0.0 },
+                               { 1200, Kind::Feed, "", "", 5.0 }, { 1220, Kind::Unload }, { 1250, Kind::Reload } });
     for (const int ch : { 1, 2 })
     {
         const auto o = compare (files, ch, 0, park, 1300);
         report (ch == 1 ? "PARK and the feed, mono" : "PARK and the feed, stereo", o, 1300);
         ok (o.differBlocks == 0 && o.scopeDiffer == 0 && o.energy > 1.0,
             std::string ("ABI 2, ") + (ch == 1 ? "mono" : "stereo") + ": stand-by, a fade cut short both ways, knobs and "
-            "the feed moved while stood by, a reload under a feed — output and scope identical");
+            "the feed moved while stood by, a reload and an unload under a feed — output and scope identical");
+        // …and the sound is v0.5.0's: the same scenario against the player driven on v0.5.0's spelling of the feed —
+        // up to the unload. v0.5.0's fc_rig restated the feed as the hand on the EMPTY player (fc_rig_unload →
+        // applyFeed → setHostInputDb(0 + feed)), and v0.5.0's player published that hand there: linOf(feed) in, unity
+        // out. This player publishes the feed alone on an empty player and keeps the hand for the next load
+        // (publishLevels), so the old spelling run on it no longer stands for v0.5.0 past an unload. The numbers it
+        // publishes there are v0.5.0 fc_rig's all the same — linOf(feed), unity — and fc_rig against the player is held
+        // through the unload just above.
+        auto parkLoaded = park;
+        parkLoaded.erase (std::remove_if (parkLoaded.begin(), parkLoaded.end(), [] (const Event& e) { return e.block >= 1220; }),
+                          parkLoaded.end());
+        const auto was = compare (files, ch, 0, parkLoaded, 1300, {}, true);
+        ok (was.differBlocks == 0 && was.energy > 1.0,
+            std::string ("ABI 2, ") + (ch == 1 ? "mono" : "stereo") + ": the same scenario up to the unload plays byte "
+            "for byte as the player fed on v0.5.0's spelling (the host's input level = the pack's plus the feed)");
     }
 }
 
@@ -393,18 +417,21 @@ void jobProtocol()
     }
 }
 
-/** The feed's MEANING, not its forwarding (bitIdentity drives both sides through the same sum, so it proves only that
-    the sum is carried): the device's input level is the pack's own plus the feed — read off the dry tap, which is the
-    input times exactly that level — and it follows the pack across a reload; a feed of 0 is no feed at all. */
+/** The feed's MEANING, not its forwarding (bitIdentity drives both sides through the same call, so it proves only that
+    the feed is carried). It is the app's block IN (PluginProcessor.cpp:1497), in front of the player: the scope's dry
+    stands after it and before the pack's own input level (CapturedBlock.h:543-544 copies the block's input behind that
+    trim and before player.process) — and the device is fed at the pack's level plus it, so a pack at -6 dB fed +6 plays
+    byte for byte as that pack at 0 dB unfed, and a reload follows the new pack's level. A feed of 0 is no feed at all. */
 void feedMeaning()
 {
-    group ("the feed: the pack's input level plus it, on the dry tap, across a reload; 0 is no feed");
+    group ("the feed: on the dry tap alone, in front of the pack's level; the sound at the pack's level plus it; 0 is none");
     const auto fixture = fc_rig_fixture::pack();
     bool okParse = false;
     auto rig = namz::rig::loadRigManifest (fixture.manifest, &okParse);
     test::run (okParse && rig.chain.size() == 1 && rig.chain[0].inputDb == -2.0);
-    rig.chain[0].inputDb = -6.0;
-    const std::string minus6 = namz::rig::writeManifest (rig);
+    const auto at = [&rig] (double db) { auto r = rig; r.chain[0].inputDb = db; return namz::rig::writeManifest (r); };
+    const std::string minus6 = at (-6.0), zero = at (0.0), plus4 = at (4.0);
+    const float six = (float) std::pow (10.0, 6.0 / 20.0);
 
     int clock = 0;
     const auto play = [&clock] (Abi& a, int blocks, std::vector<float>* out = nullptr) {
@@ -417,7 +444,7 @@ void feedMeaning()
             a.pump();
         }
     };
-    // The dry tap's last block against the input of that block times `g`, bit for bit (48 kHz: no hold).
+    // The dry tap's last block against the input of that block times `g`, bit for bit (48 kHz: no rate-match).
     const auto dryIs = [&clock] (Abi& a, float g) {
         std::vector<float> d (kBlock), w (kBlock);
         if (fc_rig_scope_read (a.r, d.data(), w.data(), kBlock) != kBlock || fc_rig_latency_samples (a.r) != 0) return false;
@@ -425,32 +452,59 @@ void feedMeaning()
             if (d[(std::size_t) i] != sample (clock - kBlock + i, 0) * g) return false;
         return true;
     };
+    const auto load = [] (Abi& a, const std::string& m) { test::run (fc_rig_load (a.r, m.c_str(), (int) m.size()) == 1); };
     {
         Abi a; a.files = fixture.files;
         test::run (fc_rig_prepare (a.r, kFs, kBlock, 1) == 1);
-        test::run (fc_rig_load (a.r, minus6.c_str(), (int) minus6.size()) == 1);
+        load (a, minus6);
         test::run (fc_rig_set_feed_db (a.r, 6.0) == 1);
         play (a, 60);
-        ok (dryIs (a, 1.0f), "a pack at -6 dB in, the feed +6: the dry tap is the input itself (linOf(0) = 1), bit for bit");
-        test::run (fc_rig_load (a.r, fixture.manifest.c_str(), (int) fixture.manifest.size()) == 1);
+        ok (dryIs (a, six), "a pack at -6 dB in, the feed +6: the dry tap is the input times the feed alone (+6 dB), "
+            "not the pack's level — bit for bit");
+        load (a, fixture.manifest);
         play (a, 60);
-        ok (dryIs (a, (float) std::pow (10.0, 4.0 / 20.0)),
-            "…reloaded to a pack at -2 dB, the feed still +6: the dry tap follows to the new level plus the feed (+4 dB)");
+        ok (dryIs (a, six), "…reloaded to a pack at -2 dB, the feed still +6: the dry tap still the input times the feed");
     }
     {
-        Abi none, zero;
-        none.files = zero.files = fixture.files;
-        for (Abi* a : { &none, &zero })
+        // The sound: the device is fed at the pack's level PLUS the feed — the same gain, the same bytes.
+        Abi fed, flat;
+        fed.files = flat.files = fixture.files;
+        test::run (fc_rig_prepare (fed.r, kFs, kBlock, 1) == 1 && fc_rig_prepare (flat.r, kFs, kBlock, 1) == 1);
+        load (fed, minus6);
+        test::run (fc_rig_set_feed_db (fed.r, 6.0) == 1);
+        load (flat, zero);
+        std::vector<float> outFed, outFlat;
+        int start = clock;
+        play (fed, 300, &outFed);
+        clock = start;
+        play (flat, 300, &outFlat);
+        double energy = 0.0;
+        for (const float v : outFed) energy += (double) v * v;
+        ok (energy > 1.0 && outFed == outFlat, "a pack at -6 dB fed +6 plays byte-identical to that pack at 0 dB unfed, 300 blocks");
+        load (fed, fixture.manifest);
+        load (flat, plus4);
+        outFed.clear(); outFlat.clear();
+        start = clock;
+        play (fed, 300, &outFed);
+        clock = start;
+        play (flat, 300, &outFlat);
+        ok (outFed == outFlat, "…reloaded to the pack at -2 dB under the same feed: byte-identical to that pack at +4 dB "
+            "unfed — the feed follows the pack");
+    }
+    {
+        Abi none, zeroFeed;
+        none.files = zeroFeed.files = fixture.files;
+        for (Abi* a : { &none, &zeroFeed })
         {
             test::run (fc_rig_prepare (a->r, kFs, kBlock, 1) == 1);
             test::run (fc_rig_load (a->r, fixture.manifest.c_str(), (int) fixture.manifest.size()) == 1);
         }
-        test::run (fc_rig_set_feed_db (zero.r, 0.0) == 1);
+        test::run (fc_rig_set_feed_db (zeroFeed.r, 0.0) == 1);
         std::vector<float> outNone, outZero;
         const int start = clock;
         play (none, 300, &outNone);
         clock = start;
-        play (zero, 300, &outZero);
+        play (zeroFeed, 300, &outZero);
         double energy = 0.0;
         for (const float v : outNone) energy += (double) v * v;
         ok (energy > 1.0 && outNone.size() == outZero.size()
@@ -488,7 +542,8 @@ void contract()
         ok (fc_rig_scope_frames (r) == frames, "stood by, the count stands still");
         fc_rig_destroy (r);
     }
-    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 2u, "abi_version answers the header's 2");
+    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 3u,
+        "abi_version answers the header's 3 (the scope draws the app's two points since v0.5.1)");
     fc_rig* r = fc_rig_create();
     float x[4] {};
     ok (fc_rig_process (r, x, nullptr, 4) == 0, "process before prepare is refused");

@@ -41,7 +41,7 @@
 //   node.port.postMessage({ set: { gain: 210, dial: { Bass: 120 }, switch: { Bright: 'Center' }, feed: 6 } });
 //   node.port.postMessage({ standby: true });                 // PARK; { standby: false } plays again (THE PARK below)
 //
-// THE SCOPE (ABI 2: fc_rig_scope_read — OrbitAmp's ScopeTap): the page owns ONE ArrayBuffer of 2·n floats and
+// THE SCOPE (ABI 2's fc_rig_scope_read, drawing ABI 3's points — OrbitAmp's ScopeTap): the page owns ONE ArrayBuffer of 2·n floats and
 // sends it ({ scope: buffer }, transferred); the processor copies the newest frame into it — the dry in floats
 // [0, n), the wet at the dry's RMS in [n, 2n), n ≤ 2048 — and sends the same buffer back, transferred:
 // { scope: buffer, n: <samples read, 0 = none yet>, frames: <the tap's count> }. `frames` moves only when the
@@ -50,12 +50,11 @@
 // AUDIO THREAD at 60 fps, and its collector runs there too; a transferred buffer is neither copied by the structured
 // clone nor allocated by either side — what each message costs is the message object and one view of the buffer,
 // a few dozen bytes, on the port, never in process(). One request in flight: the page asks again when it is back.
-// WHERE IT TAPS — not where OrbitAmp's own code taps. The dry is the DI after the pack's input level and the feed,
-// held back by the player's latency; the wet is the models' mix BEFORE the pack's post tone, its blend knob and its
-// output level. That is the app's web spec ("the model's, before the tone stack", src/core/Monitor.cpp:189-191) and
-// the site's tap around TONE3000's node; the app's code taps around its WHOLE player (src/core/CapturedBlock.h:544-556:
-// the dry before the input level, undelayed; the wet after the pack's tone stack and levels), so a pack with a post
-// tone or a blend draws another SHAPE there. A device handed no input channel writes no tap.
+// WHERE IT TAPS — where OrbitAmp's own code taps, around the WHOLE player (src/core/CapturedBlock.h:543-556). The dry
+// is the input times the feed and nothing else — before the pack's input level and its pre tone, undelayed; the wet is
+// the player's output — pre tone, models, post tone, blend knob, output level — before the PARK fade. As in the app,
+// the wet trails the dry by the player's latency when the context's rate is not the pack's. (ABI 2, v0.5.0, tapped around
+// the models, the app's web spec and the site's tap around TONE3000's node.) A device handed no input channel writes no tap.
 //
 // THE PARK ({ standby }) DOES NOT WAIT. Every other knob that arrives while the start decides is held until it has
 // decided; PARK is applied at once (before the module is up: as soon as it is), because a parked player runs no
@@ -107,7 +106,7 @@
 
 import createFcRig from './fcrig.mjs';
 
-const ABI = 2;              // the oldest fc_rig ABI this processor speaks (2: the scope, stand-by, the feed)
+const ABI = 3;              // the oldest fc_rig ABI this processor speaks (2: the scope, stand-by, the feed; 3: the scope at the app's points)
 const BLEND_SHARE = 0.25;   // the blend (two models) is turned on when ONE render costs at most this share of a quantum
 const CAL_MS = 30;          // the calibration burst lasts at least this long by Date.now
 const CAL_MAX = 20000;      // …and at most this many renders

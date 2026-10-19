@@ -25,7 +25,7 @@ keeps either set of flags from leaking into the other.
 ## The ABI
 
 ```c
-uint32_t fc_rig_abi_version (void);                                         // 2
+uint32_t fc_rig_abi_version (void);                                         // 3
 fc_rig*  fc_rig_create (void);   void fc_rig_destroy (fc_rig*);
 int      fc_rig_prepare (fc_rig*, double rate, int maxBlock, int channels);  // 1 ok, 0 refused (disarmed)
 float*   fc_rig_buffer (fc_rig*, int channel);                               // maxBlock floats in the module's memory
@@ -52,19 +52,22 @@ int      fc_rig_scope_read (fc_rig*, float* dry, float* wet, int n);   // the ne
 double   fc_rig_scope_frames (fc_rig*);                                // samples written to the tap: moves = fresh
 void     fc_rig_set_standby (fc_rig*, int on);                         // PARK: 15 ms to the wire, then not run
 int      fc_rig_set_feed_db (fc_rig*, double db);                      // the block's IN on top of the pack's level
+// ABI 3 — no entry point added: fc_rig_scope_read draws OrbitAmp's two points around the whole player (v0.5.1)
 ```
 
 The setters are the ones the app's block calls (`setDial`, `setSwitch`, `setBlendShape`, `setInputTrims`) plus
 `setMaxModels` and `setNormalize`; the read-outs are what a face shows (`soundingLoudness`) and what a host measures its
-budget by (`runBlocks`, `pairBlocks`). **Compatibility is append-only** exactly as `fc_guitar_fx`'s.
+budget by (`runBlocks`, `pairBlocks`). **Compatibility is append-only** exactly as `fc_guitar_fx`'s, and a change of
+what an existing entry point does moves the version as an addition does (ABI 3 changed only what `fc_rig_scope_read`
+draws).
 
 ### ABI 2 — what the site's demo needs that ABI 1 lacked (read off its `sound/chain.ts` and `sound/engine.ts`)
 
 | the site today | in the app | ABI 2 |
 |---|---|---|
-| SHAPE from a scope worklet around TONE3000's node (`readScope`, `ScopeRing`) | `ScopeTap`, written by the captured block (`CapturedBlock.h:556`), level-matched in its reader | `fc_rig_scope_read` + `fc_rig_scope_frames` (the points are `RigPlayer::scopeRead`'s: the DI as fed and the models' mix, aligned) |
+| SHAPE from a scope worklet around TONE3000's node (`readScope`, `ScopeRing`) | `ScopeTap`, written by the captured block (`CapturedBlock.h:556`), level-matched in its reader | `fc_rig_scope_read` + `fc_rig_scope_frames` (the app's points, `CapturedBlock.h:543-556`: the input times the feed, undelayed, and the player's output) |
 | PARK as GainNodes around the node, `setTargetAtTime` with τ = 10 ms (~40 ms to settle) | the captured block crossfaded to its wire over `BypassFade`'s 15 ms, then not run (`PluginProcessor.cpp:1397-1559`) | `fc_rig_set_standby` |
-| TURBO's push and the position's trim as one gain before the node (`setFeed`) | the push is the block's IN (`Channels.cpp` `blockIn`), applied after the wire and before the dry tap, only while the block runs, ARRIVING on the way back; the position's trim is the player's own (`files[].input_db`) | `fc_rig_set_feed_db` (the push only; the trim is already applied) |
+| TURBO's push and the position's trim as one gain before the node (`setFeed`) | the push is the block's IN (`Channels.cpp` `blockIn`), applied after the wire and before the dry tap, only while the block runs, ARRIVING on the way back; the position's trim is the player's own (`files[].input_db`) | `fc_rig_set_feed_db` (the push only; the trim is already applied) — `RigPlayer::setFeedDb` |
 
 Looked at and NOT added, because the page has them already or the app keeps them outside its block: the INPUT and
 OUTPUT trims, the cuts, the cabinet, the delay and the room (all around the node), the loudness lift (the player
@@ -139,7 +142,7 @@ for ever — a `{ load }` while parked was silence for good. It is applied at on
 it is); while parked the start pauses and the output is the player's own (the fade, then the input at the latency)
 whatever the start's state; `{ standby: false }` resumes the start, silent until it decides, as after any `{ load }`.
 
-**The scope (ABI 2).** The page owns one `ArrayBuffer` of `2·n` floats (`n` ≤ 2048) and sends it, transferred; the
+**The scope (ABI 2; its points ABI 3's).** The page owns one `ArrayBuffer` of `2·n` floats (`n` ≤ 2048) and sends it, transferred; the
 processor copies the newest frame into it — dry in `[0, n)`, wet at the dry's RMS in `[n, 2n)` — and sends the
 buffer back, transferred (the page's own memory again, a new `ArrayBuffer` object): `{ scope, n: <read; 0 = none yet>, frames: <the tap's count> }`. An unchanged `frames` is a
 frame already drawn (stood by, it does not move). Before the module is up, or after an error, the buffer still comes
@@ -216,7 +219,7 @@ felitronics-guitar-core <git describe>
 felitronics-core v0.61.1
 NeuralAmpModelerCore v0.5.4
 namz v4.1.0
-fc_rig ABI 2
+fc_rig ABI 3
 emscripten 6.0.9 (…)
 flags -fno-exceptions -fno-rtti -msimd128 -msse4.1; exceptions on the NAM objects only, wasm legacy EH
 wasm features sign-ext nontrapping-float-to-int simd exception-handling
@@ -291,9 +294,12 @@ audio thread (×4 read the same), so the slow-machine decision is tested with an
   input trims off and on, a blend shape, a reset, a pack loaded again and unloaded; the jobs and the bytes handed in
   where the source was asked (each file once, revisits from the kept bytes); ABI 2: the scope frame and its count
   bit for bit after every block of every scenario, and PARK — stood by mid-sweep, a fade cut short both ways, knobs and
-  the feed moved while stood by, a reload under a feed — mono and stereo, output and scope bit for bit; the feed's
-  MEANING, not only its forwarding (a pack at -6 dB fed +6 taps the input itself, a reload follows the new level plus
-  the feed, a feed of 0 is byte-identical to none); a missing file and garbage — failures,
+  the feed moved while stood by, a reload and an unload under a feed — mono and stereo, output and scope bit for bit,
+  and the output byte for byte as the player fed on v0.5.0's spelling (the host's input level = the pack's plus the
+  feed) up to the unload (v0.5.0's player heard a hand stated on an empty player; this one publishes the feed alone
+  there, the numbers v0.5.0's fc_rig left); the feed's MEANING, not only its forwarding (a pack at -6 dB fed +6 taps the input times +6 dB alone and
+  plays byte for byte as that pack at 0 dB unfed; reloaded, the tap stays the feed's and the sound follows the new
+  level plus the feed; a feed of 0 is byte-identical to none); a missing file and garbage — failures,
   still bit for bit; a fetch that failed once is asked for again on a later visit and lands, still bit for bit; a job out across a load is dropped and jobs flow again; the contract; no allocation in
   `process()`/`reset()` through loads and dips.
 - `felitronics_rig_wasm_parity` (ctest when `FELITRONICS_GUITAR_RIG_WASM_DIR` names `build.sh`'s output; real packs

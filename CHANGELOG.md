@@ -29,6 +29,16 @@
   alone in, unity out, the host's hand kept for the next load), so a hand or a feed set while nothing is loaded no
   longer adds the hand back in — the next pack's levels glided in from the wrong place.
 
+### fcrig — ABI 3, the same shape, another picture
+
+- `fc_rig_scope_read` keeps its arguments, its count and its level match; WHAT IT DRAWS is the app's (above), not
+  v0.5.0's tap around the models. No entry point is added or changed in shape, but the meaning of one is, so
+  `FC_RIG_ABI_VERSION` is 3 and the worklet asks for 3; `fc_rig_abi.h`'s compatibility rule now says a change of
+  meaning moves the version as an addition does (it said a meaning never changes).
+- `fc_rig_set_feed_db` hands the feed to `RigPlayer::setFeedDb` instead of restating the host's input level after every
+  load; the output is v0.5.0's byte for byte (the ABI suite runs the PARK-and-feed scenario against the player driven
+  on v0.5.0's spelling too, up to the unload: an empty player now publishes the feed alone whatever hand it is given).
+
 ## v0.5.0 — 2026-10-19
 
 ### rigplayer — the scope tap and stand-by (OrbitAmp's ScopeTap and PARK)
