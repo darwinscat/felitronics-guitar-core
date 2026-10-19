@@ -5,7 +5,7 @@
 # architectures through static initialisers, and plain static linking silently drops them), so poweramp
 # alone (FELITRONICS_GUITAR_WITH_NAM=OFF) still configures on 3.22.
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_guitar_core VERSION 0.1.0 LANGUAGES CXX)
+project(felitronics_guitar_core VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -18,6 +18,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #   rigplayer felitronics::rigplayer   one device of a .orbitrig pack, playing               nam, convolution, lineareq, eq
 #   poweramp  felitronics::poweramp    the white-box tube power-amp trunk                    core, eq, oversampling, saturation
 #
+# And one C ABI over core's own stages, for the browser: tools/wasm — fc_guitar_fx, the amp's echo and room
+# (core's delay::TapeDelay + reverb::AmpReverb driven by the app's knobs), compiled to wasm by tools/wasm/build.sh.
+#
 # Consume — felitronics-core FIRST, then this; ONE core is resolved by the product that owns the graph:
 #   FetchContent_Declare(felitronics_core GIT_REPOSITORY <url> GIT_TAG <tag>)
 #   FetchContent_MakeAvailable(felitronics_core)
@@ -29,6 +32,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(FELITRONICS_GUITAR_BUILD_TESTS "Build felitronics-guitar-core self-tests" "${PROJECT_IS_TOP_LEVEL}")
 option(FELITRONICS_GUITAR_WITH_NAM
        "Build felitronics::nam and felitronics::rigplayer (fetches the pinned NeuralAmpModelerCore + namz)" ON)
+# The browser module is this repository's own product, not a module a plugin links: built when this repository is the
+# top level, opt-in for a consumer — whose core may predate the delay and reverb this needs.
+option(FELITRONICS_GUITAR_WITH_FX
+       "Build the fc_guitar_fx C ABI (tools/wasm) over core's delay + reverb (felitronics-core v0.61.0+)"
+       "${PROJECT_IS_TOP_LEVEL}")
 
 # --- felitronics-core, resolved by whoever owns the graph ---------------------------------------------
 # Top-level: this repository IS the owner, so it resolves core itself — a sibling checkout when there is
@@ -38,7 +46,7 @@ if(PROJECT_IS_TOP_LEVEL)
     include(FetchContent)
     set(FELITRONICS_GUITAR_FCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../felitronics-core" CACHE PATH
         "Local felitronics-core checkout (used if present); else the pinned release is fetched")
-    set(FELITRONICS_GUITAR_FCORE_TAG "v0.51.0" CACHE STRING
+    set(FELITRONICS_GUITAR_FCORE_TAG "v0.61.0" CACHE STRING
         "felitronics-core git tag to fetch when no local checkout is present")
     if(FELITRONICS_GUITAR_FCORE_DIR AND EXISTS "${FELITRONICS_GUITAR_FCORE_DIR}/CMakeLists.txt")
         message(STATUS "felitronics-core: local checkout — ${FELITRONICS_GUITAR_FCORE_DIR}")
@@ -86,6 +94,16 @@ endif()
 add_subdirectory(modules/nam)         # compiled NAM backend; self-gates on FELITRONICS_WITH_NAM
 add_subdirectory(modules/rigplayer)   # header-only pack player over nam; same gate
 add_subdirectory(modules/poweramp)    # header-only; core + eq + oversampling + saturation
+
+# The browser's echo and room. Core's delay and reverb modules first shipped in v0.61.0; an older core has
+# neither target, and that is a refusal here, not a silently smaller build.
+if(FELITRONICS_GUITAR_WITH_FX)
+    if(NOT TARGET felitronics::delay OR NOT TARGET felitronics::reverb)
+        message(FATAL_ERROR "FELITRONICS_GUITAR_WITH_FX needs felitronics-core v0.61.0 or later (felitronics::delay "
+                            "and felitronics::reverb); this core has neither. Use a newer core or set it OFF.")
+    endif()
+    add_subdirectory(tools/wasm)
+endif()
 
 if(FELITRONICS_GUITAR_BUILD_TESTS)
     add_subdirectory(tests)           # the law-11 suites for poweramp, header hygiene, the no-exceptions probe

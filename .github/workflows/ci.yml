@@ -5,7 +5,7 @@ name: ci
 # and ASan + UBSan; plus core's lints, which compile nothing. Nightly, and only if this repository or
 # felitronics-core changed in the last day: the suite against core's current main, arm64 Linux (poweramp
 # alone — the row that once found poweramp reading 1.26e-08 out of silence under gcc's FP contraction), and
-# poweramp under wasm. felitronics-core is fetched at FELITRONICS_GUITAR_FCORE_TAG (CMakeLists.txt).
+# poweramp and the fcguitarfx module under wasm. felitronics-core is fetched at FELITRONICS_GUITAR_FCORE_TAG (CMakeLists.txt).
 on:
   push:
     branches: [main]
@@ -89,9 +89,9 @@ jobs:
       - name: det-math manifest
         run: node build/_deps/felitronics_core-src/tools/lint/check-det-math.mjs --satellite
       - name: One allocation counter
-        run: node build/_deps/felitronics_core-src/tools/lint/check-alloc-counter.mjs modules tests
+        run: node build/_deps/felitronics_core-src/tools/lint/check-alloc-counter.mjs modules tests tools/wasm
       - name: No long double
-        run: node build/_deps/felitronics_core-src/tools/lint/check-no-long-double.mjs modules tests
+        run: node build/_deps/felitronics_core-src/tools/lint/check-no-long-double.mjs modules tests tools/wasm
 
   # ---- nightly -------------------------------------------------------------------------------------------
   changed:
@@ -152,9 +152,9 @@ jobs:
   wasm-audio:
     needs: changed
     if: needs.changed.outputs.any == 'true'
-    name: wasm-audio (poweramp)
-    # NAM is outside the wasm tier (its upstream sources throw), so this builds poweramp alone, with core's
-    # wasm-audio preset flags and toolchain pin.
+    name: wasm-audio (poweramp, fcguitarfx)
+    # NAM is outside the wasm tier (its upstream sources throw), so this builds poweramp and the fc_guitar_fx ABI
+    # suite, with core's wasm-audio preset flags and toolchain pin — and then the shipped fcguitarfx module.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -198,3 +198,12 @@ jobs:
                 -DFELITRONICS_WASM_ASSERTIONS=2 -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
           cmake --build build-wasm-checked -j "$(nproc)"
           ctest --test-dir build-wasm-checked --output-on-failure --no-tests=error -j "$(nproc)"
+      - name: fcguitarfx — the shipped module in a worklet-shaped scope, against the native render
+        run: |
+          CORE="$PWD/build-wasm/_deps/felitronics_core-src"
+          FELITRONICS_CORE_DIR="$CORE" tools/wasm/build.sh
+          cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_GUITAR_WITH_NAM=OFF \
+                -DFELITRONICS_GUITAR_BUILD_TESTS=ON -DFELITRONICS_GUITAR_FCORE_DIR="$CORE" \
+                -DFELITRONICS_GUITAR_FX_WASM_DIR="$PWD/tools/wasm/build"
+          cmake --build build-native --target fc_guitar_fx_render -j "$(nproc)"
+          ctest --test-dir build-native -R felitronics_guitar_fx_wasm_parity --output-on-failure --no-tests=error
