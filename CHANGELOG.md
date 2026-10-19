@@ -2,7 +2,7 @@
 
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-10-19
 
 ### fcrig — the pack player for a browser AudioWorklet
 
