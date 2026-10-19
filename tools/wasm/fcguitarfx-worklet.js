@@ -17,9 +17,16 @@
 //   node.port.onmessage = (e) => { if (e.data.error) console.error(e.data.error); };   // { ready, abi } or { error }
 //   node.port.postMessage({ set: { delay_mix: 40 } });     // any knobs, any time
 //   node.port.postMessage({ reset: true });                // a stream restart
+//   node.port.postMessage({ dispose: true });              // the end: the instance is freed, the processor finishes
 //
-// A browser that cannot clone a WebAssembly.Module into the worklet can send the bytes instead —
-// processorOptions: { wasmBytes: <ArrayBuffer> } — and the processor compiles them once, at construction.
+// THE BYTES PATH. WebKit does not throw on a WebAssembly.Module it cannot clone into the worklet: the option arrives
+// as null, and the processor answers { error, retry: 'wasmBytes' }. The page then drops that node and makes another
+// with processorOptions: { wasmBytes: <ArrayBuffer of fcguitarfx.wasm> }; that processor compiles the 32 KB itself,
+// SYNCHRONOUSLY, on the audio thread, once, at construction.
+//
+// EVERY END IS FINAL. An { error } posted, a { dispose } received: the instance is destroyed, the module and the views
+// are dropped, the port is closed, and process() answers false from then on, so the node and its ~25 MB of wasm
+// memory can be collected without waiting for the context to close. Until the module is up, the dry passes through.
 //
 // KNOBS ARE MESSAGES, NOT AudioParams. Every knob here is a setting a hand moves, not a signal: two are switches, two
 // are choices, and the stages already glide what must glide (the delay's head, the room's parameters). An AudioParam
@@ -38,6 +45,12 @@ const KNOBS = [
     'delay_offset_ms', 'delay_mix',
     'reverb_on', 'reverb_character', 'reverb_mix', 'reverb_decay', 'reverb_predelay_ms', 'reverb_hpf_hz',
 ];
+// The integer knobs, settled HERE: a wasm i32 parameter takes ToInt32 of the number, which turns NaN into 0 (a
+// switch off, the first character) and wraps 2^32 to 0. So, as the float knobs are treated in the module: a
+// non-finite value is ignored, a switch is any non-zero, and a choice is rounded (the app's roundToInt) and clamped
+// onto its range. The float knobs need nothing: the module ignores a non-finite one and clamps a finite one.
+const SWITCHES = new Set(['delay_on', 'delay_sync', 'reverb_on']);
+const CHOICES = { delay_division: 12, reverb_character: 5 };
 
 class FcGuitarFxProcessor extends AudioWorkletProcessor {
     constructor(options) {
@@ -45,15 +58,24 @@ class FcGuitarFxProcessor extends AudioWorkletProcessor {
         const o = (options && options.processorOptions) || {};
         this.m = null;
         this.fx = 0;
+        this.done = false;
+        this.L = this.R = null;
         this.block = 128;
         this.queued = Object.assign({}, o.knobs);   // knobs that arrive before the module is up
         this.port.onmessage = (e) => this.onMessage(e.data);
 
         let module;
-        try {
-            module = o.module instanceof WebAssembly.Module ? o.module : new WebAssembly.Module(o.wasmBytes);
-        } catch (e) {
-            this.port.postMessage({ error: 'fc-guitar-fx: no WebAssembly.Module in processorOptions (module or wasmBytes)' });
+        if (o.module instanceof WebAssembly.Module) {
+            module = o.module;
+        } else if (o.wasmBytes) {
+            try {
+                module = new WebAssembly.Module(o.wasmBytes);
+            } catch (e) {
+                this.end('fc-guitar-fx: the wasmBytes do not compile: ' + e);
+                return;
+            }
+        } else {
+            this.end('fc-guitar-fx: no WebAssembly.Module arrived in processorOptions.module', 'wasmBytes');
             return;
         }
         createFcGuitarFx({
@@ -62,13 +84,27 @@ class FcGuitarFxProcessor extends AudioWorkletProcessor {
                 done(instance, module);
                 return instance.exports;
             },
-        }).then((m) => this.start(m), (e) => this.port.postMessage({ error: 'fc-guitar-fx: ' + e }));
+        }).then((m) => this.start(m), (e) => this.end('fc-guitar-fx: ' + e));
+    }
+
+    /** The end, whatever brought it: the instance destroyed, every reference dropped, the port closed, and process()
+        false from now on. With a message, one { error } goes out first (and `retry` names what to send instead). */
+    end(error, retry) {
+        if (this.done) return;
+        if (error) this.port.postMessage(retry ? { error, retry } : { error });
+        if (this.m && this.fx) this.m._fc_guitar_fx_destroy(this.fx);
+        this.done = true;
+        this.fx = 0;
+        this.m = this.setters = this.queued = this.L = this.R = null;
+        this.port.onmessage = null;
+        this.port.close();
     }
 
     start(m) {
+        if (this.done) return;   // disposed while the module was coming up
         const abi = m._fc_guitar_fx_abi_version();
         if (abi < ABI) {
-            this.port.postMessage({ error: `fc-guitar-fx: the module speaks ABI ${abi}, this processor needs ${ABI}` });
+            this.end(`fc-guitar-fx: the module speaks ABI ${abi}, this processor needs ${ABI}`);
             return;
         }
         const fx = m._fc_guitar_fx_create();
@@ -83,8 +119,7 @@ class FcGuitarFxProcessor extends AudioWorkletProcessor {
         // The render quantum: 128 frames everywhere today; a context that renders more announces it.
         this.block = globalThis.renderQuantumSize || 128;
         if (!fx || !m._fc_guitar_fx_prepare(fx, sampleRate, this.block)) {
-            this.fx = 0;
-            this.port.postMessage({ error: `fc-guitar-fx: prepare refused (${sampleRate} Hz, ${this.block})` });
+            this.end(`fc-guitar-fx: prepare refused (${sampleRate} Hz, ${this.block})`);   // and the instance freed
             return;
         }
         // Views onto the module's own two buffers, made AFTER prepare (its allocation may grow the memory, which
@@ -99,24 +134,26 @@ class FcGuitarFxProcessor extends AudioWorkletProcessor {
     applyKnobs(knobs) {
         for (const k in knobs) {
             const set = this.setters[k];
-            if (set) set(this.fx, +knobs[k]);
+            let v = +knobs[k];
+            if (!set || !Number.isFinite(v)) continue;
+            if (SWITCHES.has(k)) v = v !== 0 ? 1 : 0;
+            else if (k in CHOICES) v = Math.min(CHOICES[k], Math.max(0, Math.round(v)));
+            set(this.fx, v);
         }
     }
 
     onMessage(d) {
-        if (!d) return;
+        if (!d || this.done) return;
         if (d.set) {
             if (this.fx) this.applyKnobs(d.set);
             else if (this.queued) Object.assign(this.queued, d.set);
         }
         if (d.reset && this.fx) this.m._fc_guitar_fx_reset(this.fx);
-        if (d.dispose && this.fx) {
-            this.m._fc_guitar_fx_destroy(this.fx);
-            this.fx = 0;
-        }
+        if (d.dispose) this.end();
     }
 
     process(inputs, outputs) {
+        if (this.done) return false;
         const out = outputs[0];
         const oL = out[0];
         const oR = out.length > 1 ? out[1] : null;
@@ -125,10 +162,13 @@ class FcGuitarFxProcessor extends AudioWorkletProcessor {
         const inR = input.length > 1 ? input[1] : inL;
 
         if (this.fx === 0 || oL.length !== this.block) {
-            // Not up yet (or gone): pass the dry through, as the links do when they stand by.
+            // Not up yet: pass the dry through, as the links do when they stand by. A quantum of another size than
+            // the one prepared (a context rendering more, with no renderQuantumSize to say so) is the end, said once.
             if (inL) { oL.set(inL); if (oR) oR.set(inR); }
             else { oL.fill(0); if (oR) oR.fill(0); }
-            return true;
+            if (this.fx !== 0)
+                this.end(`fc-guitar-fx: a ${oL.length}-frame render quantum; prepared for ${this.block}`);
+            return !this.done;
         }
 
         const L = this.L, R = this.R;

@@ -18,6 +18,9 @@
 //      garbage collection and move the JS heap by less than 16 KB more, where one 16-byte object per quantum would
 //      be 960 KB.
 //   5. THE COST of one 128-frame stereo quantum at 48 kHz under the heaviest settings — reported, not gated.
+//   And around those: the glue may not name toResizableBuffer, and every processor runs with it deleted (the browser
+//   floor); a non-finite sample fails a comparison for good; the integer knobs' NaN and out-of-range values; the
+//   bytes path against the module path; and every end of a processor — dispose, an error — final and freeing.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -221,6 +224,100 @@ group('the glue runs without growable ArrayBuffers (the browser floor)');
 ok(!/toResizableBuffer/.test(GLUE),
    'the glue never calls WebAssembly.Memory.toResizableBuffer — Chrome 144, Firefox 145 and Safari 26.2 have it, nothing older');
 // ...and every processor in this file runs with the method deleted (loadWorklet), as on those older engines.
+
+/** One quantum through `proc` with silence or `inL/inR`; answers what process() returned. */
+function quantum(proc, n = Q) {
+    const i = [new Float32Array(n), new Float32Array(n)], o = [new Float32Array(n), new Float32Array(n)];
+    return proc.process([i], [o], {});
+}
+
+/** `frames` of the fixed input through a processor made with `options`, the knob moves posted at their frames. */
+async function renderWith(w, frames, knobs, moves, options) {
+    const proc = await newProcessor(w, knobs, options);
+    const inL = makeInput(frames, 48000, 0), inR = makeInput(frames, 48000, 1);
+    const iL = new Float32Array(Q), iR = new Float32Array(Q), oL = new Float32Array(Q), oR = new Float32Array(Q);
+    const out = [new Float32Array(frames), new Float32Array(frames)];
+    let next = 0;
+    for (let at = 0; at < frames; at += Q) {
+        while (next < moves.length && moves[next].frame <= at) proc.port.onmessage({ data: { set: moves[next++].set } });
+        iL.set(inL.subarray(at, at + Q)); iR.set(inR.subarray(at, at + Q));
+        proc.process([[iL, iR]], [[oL, oR]], {});
+        out[0].set(oL, at); out[1].set(oR, at);
+    }
+    return out;
+}
+
+group('integer knobs: non-finite ignored, finite clamped onto the range — as the float knobs');
+{
+    const base = { reverb_character: 2, delay_mix: 40, delay_division: 6, reverb_mix: 50 };
+    const frames = Q * 400;
+    const dirty = await renderWith(w0, frames, base, [
+        { frame: Q * 100, set: { reverb_on: NaN, reverb_character: NaN, delay_on: -Infinity, delay_sync: 2 ** 32,
+                                 delay_division: 2 ** 32 + 3 } },
+        { frame: Q * 200, set: { reverb_character: 99, delay_division: -7 } },
+    ], { module: w0.module });
+    const clean = await renderWith(w0, frames, base, [
+        { frame: Q * 100, set: { delay_division: 12 } },
+        { frame: Q * 200, set: { reverb_character: 5, delay_division: 0 } },
+    ], { module: w0.module });
+    const c = compare(dirty, clean);
+    ok(c.within(0), `NaN and ±Infinity leave a switch or a choice where it stood, 2^32 is no 0, 99 and -7 clamp `
+                    + `(${c.differ} samples differ, worst ${c.worst})`);
+}
+
+group('the bytes path: a processor that compiles the posted bytes itself renders the same bits');
+{
+    const knobs = { ...BUSY, reverb_character: 2 };
+    const viaModule = await renderWith(w0, Q * 300, knobs, [], { module: w0.module });
+    const viaBytes = await renderWith(w0, Q * 300, knobs, [], { module: null, wasmBytes: w0.wasmBytes });
+    const c = compare(viaBytes, viaModule);
+    ok(c.within(0), `wasmBytes against module: ${c.differ} samples differ`);
+
+    // What WebKit does with a Module it cannot clone into the worklet: the option arrives as null.
+    const proc = new w0.cls({ numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+                              processorOptions: { module: null, knobs } });
+    const first = await settle(proc);
+    ok(first && first.error && first.retry === 'wasmBytes',
+       `a null module answers { error, retry: 'wasmBytes' } (got ${JSON.stringify(first)})`);
+    ok(quantum(proc) === false && proc.port.closed, 'and the processor is finished: process() false, port closed');
+}
+
+group('the processor\'s end: dispose, a refused prepare and a foreign render quantum are terminal, and free the instance');
+{
+    const destroyed = [];
+    w0.ctx.__onFxModule = (m) => {
+        const destroy = m._fc_guitar_fx_destroy;
+        m._fc_guitar_fx_destroy = (fx) => { destroyed.push(fx); return destroy(fx); };
+    };
+
+    const proc = await newProcessor(w0, {});
+    const fx = proc.fx;
+    ok(quantum(proc) === true, 'a live processor keeps its node alive');
+    proc.port.onmessage({ data: { dispose: true } });
+    ok(destroyed.length === 1 && destroyed[0] === fx, `dispose destroys the instance (${destroyed})`);
+    ok(quantum(proc) === false && proc.port.closed && proc.m === null && proc.L === null,
+       'after dispose: process() false, port closed, module and views dropped');
+
+    destroyed.length = 0;
+    const wLow = await loadWorklet(500);   // below the stages' 1 kHz floor: prepare refuses
+    wLow.ctx.__onFxModule = w0.ctx.__onFxModule;
+    const low = new wLow.cls({ numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+                               processorOptions: { module: wLow.module } });
+    const said = await settle(low);
+    ok(said && said.error && destroyed.length === 1, `a refused prepare posts an error and destroys the instance `
+                                                     + `(${JSON.stringify(said)}, ${destroyed.length} destroyed)`);
+    ok(quantum(low) === false && low.port.closed && low.m === null, 'and the processor is finished');
+
+    destroyed.length = 0;
+    const odd = await newProcessor(w0, {});
+    const outL = new Float32Array(256), outR = new Float32Array(256), inL = makeInput(256, 48000, 0);
+    const alive = odd.process([[inL, inL]], [[outL, outR]], {});
+    const errors = odd.port.posted.filter((m) => m.error);
+    ok(alive === false && errors.length === 1 && destroyed.length === 1 && outL[255] === inL[255],
+       `a 256-frame quantum with no renderQuantumSize in scope: one error, the dry passed, terminal `
+       + `(${alive}, ${errors.length} errors, ${destroyed.length} destroyed)`);
+    w0.ctx.__onFxModule = undefined;
+}
 
 group(`the wasm render against the native render, within ${TOLERANCE} (law 10)`);
 for (const s of SCENARIOS) {
