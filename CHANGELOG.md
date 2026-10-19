@@ -38,6 +38,21 @@
 - `fc_rig_set_feed_db` hands the feed to `RigPlayer::setFeedDb` instead of restating the host's input level after every
   load; the output is v0.5.0's byte for byte (the ABI suite runs the PARK-and-feed scenario against the player driven
   on v0.5.0's spelling too, up to the unload: an empty player now publishes the feed alone whatever hand it is given).
+- `BUILD-INFO` names the Eigen it was built against.
+
+### Eigen from our own mirror (v0.1.1's change, ported)
+
+NeuralAmpModelerCore's Eigen submodule points at gitlab.com, and every build cloned it from there; on a day GitLab
+turned requests away under load, every build failed at that clone. `nam` now fetches NeuralAmpModelerCore without its
+submodules (`GIT_SUBMODULES ""`, CMP0097) and Eigen from github.com/darwinscat/eigen — a mirror of the same repository,
+untouched — at the very commit v0.5.4's submodule pins (Eigen 5.0.1, `bc3b398`). The sources built are the same, byte
+for byte (1913 files; the same commit and tree as the submodule checkout). A NeuralAmpModelerCore whose submodule is
+already on disk (`FELITRONICS_NAM_CORE_SRC`, CMake's own `FETCHCONTENT_SOURCE_DIR_NAM_CORE_SRC`, a parent project's
+declaration) brings its own; one whose submodule was never initialised now takes the mirror's instead of failing at
+`Eigen/Dense`. The configure stops when NeuralAmpModelerCore's tree pins another Eigen than `FELITRONICS_EIGEN_COMMIT`
+(v0.4.0 to v0.5.3 pin `87300c9`, so another `FELITRONICS_NAM_CORE_TAG` can no longer build against this Eigen
+silently), and when the Eigen used is any other commit; git runs as `find_package(Git)` found it, and a git that fails
+stops the configure with its own error. A source that is not a git checkout is said so, not passed in silence.
 
 ## v0.5.0 — 2026-10-19
 

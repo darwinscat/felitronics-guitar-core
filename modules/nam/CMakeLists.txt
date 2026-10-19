@@ -11,7 +11,8 @@ endif()
 include(FetchContent)
 
 # NeuralAmpModelerCore ships no usable library target. Populate the pinned sources without entering
-# its own project, then compile the same source set used by OrbitCab. Only Eigen's submodule is needed.
+# its own project, then compile the same source set used by OrbitCab. Its one submodule we need, Eigen, comes
+# from our own mirror below, not from where the submodule points.
 # A RELEASE, not a commit somebody caught mid-air. The pin was `b5a68c3` — upstream's "Revert A2 fast
 # optimizations (#295)" — which was the tip of main when OrbitCab first pinned it and stopped being so
 # forty-five minutes later, when v0.5.4 was published. It was inherited here with the NAM path and
@@ -35,11 +36,79 @@ else()
     FetchContent_Declare(nam_core_src
         GIT_REPOSITORY https://github.com/sdatkinson/NeuralAmpModelerCore.git
         GIT_TAG        ${FELITRONICS_NAM_CORE_TAG}
-        GIT_SUBMODULES "Dependencies/eigen"
+        GIT_SUBMODULES ""                    # none at all (an empty list means none under CMP0097, NEW since 3.16)
         GIT_SHALLOW    FALSE
         SOURCE_SUBDIR  Dependencies/nlohmann)
 endif()
 FetchContent_MakeAvailable(nam_core_src)
+
+# EIGEN, the matrices NAM's networks are computed with — header-only. NeuralAmpModelerCore's submodule points
+# at gitlab.com/libeigen/eigen, and every build cloned it from there: on a day GitLab turned requests away
+# under load, every build of every product failed at that clone. So it comes from Darwin's Cat's own mirror,
+# github.com/darwinscat/eigen — the same repository, untouched — at the very commit v0.5.4's submodule pins
+# (Eigen 5.0.1), checked after the fetch. A NeuralAmpModelerCore whose submodule is already on disk (a local
+# checkout, FETCHCONTENT_SOURCE_DIR_NAM_CORE_SRC, a parent project's own declaration) brings its own.
+# Either way the Eigen built against is held to the commit NeuralAmpModelerCore's own tree pins: v0.4.0 to v0.5.3
+# pin another (87300c9), and another tag must not build against this one silently.
+find_package(Git REQUIRED)
+set(FELITRONICS_EIGEN_TAG "5.0.1" CACHE STRING "Eigen release, as NeuralAmpModelerCore's pin")
+set(FELITRONICS_EIGEN_COMMIT "bc3b39870ecb690a623a3f49149a358b95c5781d" CACHE STRING
+    "The commit that release must be: NeuralAmpModelerCore v0.5.4's submodule pin")
+
+# git at configure time; a git that fails stops the configure with git's own words, never with an empty answer.
+function(felitronics_nam_git out dir)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${dir}" ${ARGN}
+                    RESULT_VARIABLE rc OUTPUT_VARIABLE text ERROR_VARIABLE err
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
+    if(NOT rc EQUAL 0)
+        string(REPLACE ";" " " args "${ARGN}")
+        message(FATAL_ERROR "${GIT_EXECUTABLE} -C ${dir} ${args} failed (${rc}): ${err}")
+    endif()
+    set(${out} "${text}" PARENT_SCOPE)
+endfunction()
+
+# The commit NeuralAmpModelerCore pins Eigen at: its gitlink, which its tree records whether or not the submodule
+# was ever cloned (GIT_SUBMODULES "" skips the clone, not the entry).
+if(EXISTS "${nam_core_src_SOURCE_DIR}/.git")
+    felitronics_nam_git(nam_eigen_entry "${nam_core_src_SOURCE_DIR}" ls-tree HEAD Dependencies/eigen)
+    if(NOT nam_eigen_entry MATCHES "^160000 commit ([0-9a-f]+)\t")
+        message(FATAL_ERROR "NeuralAmpModelerCore at ${nam_core_src_SOURCE_DIR} pins no Eigen submodule "
+                            "(git ls-tree HEAD Dependencies/eigen: '${nam_eigen_entry}')")
+    endif()
+    set(nam_eigen_pin "${CMAKE_MATCH_1}")
+    if(NOT nam_eigen_pin STREQUAL FELITRONICS_EIGEN_COMMIT)
+        message(FATAL_ERROR "NeuralAmpModelerCore at ${nam_core_src_SOURCE_DIR} pins Eigen ${nam_eigen_pin}, "
+                            "but this build is held to ${FELITRONICS_EIGEN_COMMIT} (FELITRONICS_EIGEN_COMMIT, Eigen "
+                            "${FELITRONICS_EIGEN_TAG}). Build a NeuralAmpModelerCore that pins this Eigen (v0.5.4, "
+                            "this module's default, does), or state the Eigen yours pins in FELITRONICS_EIGEN_TAG and "
+                            "FELITRONICS_EIGEN_COMMIT.")
+    endif()
+else()
+    message(STATUS "NeuralAmpModelerCore at ${nam_core_src_SOURCE_DIR} is not a git checkout — its Eigen pin is not checked")
+endif()
+
+if(EXISTS "${nam_core_src_SOURCE_DIR}/Dependencies/eigen/Eigen/Dense")
+    set(FELITRONICS_EIGEN_DIR "${nam_core_src_SOURCE_DIR}/Dependencies/eigen")
+    message(STATUS "Eigen: NeuralAmpModelerCore's own — ${FELITRONICS_EIGEN_DIR}")
+else()
+    message(STATUS "Eigen: fetching ${FELITRONICS_EIGEN_TAG} from github.com/darwinscat/eigen")
+    FetchContent_Declare(eigen_src
+        GIT_REPOSITORY https://github.com/darwinscat/eigen.git
+        GIT_TAG        ${FELITRONICS_EIGEN_TAG}
+        GIT_SHALLOW    TRUE
+        SOURCE_SUBDIR  no-cmake-here)       # headers only: Eigen's own CMake project is never entered
+    FetchContent_MakeAvailable(eigen_src)
+    set(FELITRONICS_EIGEN_DIR "${eigen_src_SOURCE_DIR}")
+endif()
+if(EXISTS "${FELITRONICS_EIGEN_DIR}/.git")
+    felitronics_nam_git(eigen_head "${FELITRONICS_EIGEN_DIR}" rev-parse HEAD)
+    if(NOT eigen_head STREQUAL FELITRONICS_EIGEN_COMMIT)
+        message(FATAL_ERROR "Eigen at ${FELITRONICS_EIGEN_DIR} is ${eigen_head}, not ${FELITRONICS_EIGEN_COMMIT} "
+                            "(FELITRONICS_EIGEN_COMMIT, Eigen ${FELITRONICS_EIGEN_TAG})")
+    endif()
+else()
+    message(STATUS "Eigen at ${FELITRONICS_EIGEN_DIR} is not a git checkout — its commit is not checked")
+endif()
 
 # namz is a header-only, lossless .nam codec and the .orbitrig rig model (namz_rig*.h — schema 4 with
 # `tone`, `lag_samples` and the pack's own two levels, all of which felitronics::rigplayer reads).
@@ -88,7 +157,7 @@ target_include_directories(nam_core SYSTEM PUBLIC
     ${nam_core_src_SOURCE_DIR}
     ${nam_core_src_SOURCE_DIR}/NAM
     ${nam_core_src_SOURCE_DIR}/NAM/wavenet
-    ${nam_core_src_SOURCE_DIR}/Dependencies/eigen
+    ${FELITRONICS_EIGEN_DIR}
     ${nam_core_src_SOURCE_DIR}/Dependencies/nlohmann
     ${nam_core_src_SOURCE_DIR}/Dependencies
     ${namz_src_SOURCE_DIR}/include)
@@ -151,7 +220,7 @@ if(FELITRONICS_BUILD_TESTS)
     target_link_libraries(felitronics_nam_rtalloc_tests PRIVATE felitronics::nam)
     target_link_libraries(felitronics_nam_rtalloc_tests PRIVATE felitronics::test_support)
     target_include_directories(felitronics_nam_rtalloc_tests SYSTEM PRIVATE
-        ${nam_core_src_SOURCE_DIR}/Dependencies/eigen)
+        ${FELITRONICS_EIGEN_DIR})
     target_compile_definitions(felitronics_nam_rtalloc_tests PRIVATE EIGEN_RUNTIME_NO_MALLOC)
     target_compile_features(felitronics_nam_rtalloc_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_nam_rtalloc_tests COMMAND felitronics_nam_rtalloc_tests)

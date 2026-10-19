@@ -9,7 +9,7 @@
 #   fcrig.wasm         the module: RigPlayer, NamStage and NeuralAmpModelerCore behind the fc_rig ABI.
 #   fcrig-worklet.js   the AudioWorklet processor ('fc-rig'), copied as it is; it imports ./fcrig.mjs, so the two
 #                      travel together under these names (README.md).
-#   BUILD-INFO         what it was built from: this repository, felitronics-core, NeuralAmpModelerCore, namz, the
+#   BUILD-INFO         what it was built from: this repository, felitronics-core, NeuralAmpModelerCore, Eigen, namz, the
 #                      ABI version, the toolchain and the flags.
 #
 #   tools/wasm-rig/build.sh [out-dir]          (default tools/wasm-rig/build)
@@ -66,13 +66,14 @@ emcmake cmake -S "$ROOT" -B "$BUILD" "${GEN[@]}" \
     -DFELITRONICS_WASM_ASSERTIONS=0 \
     "-DCMAKE_CXX_FLAGS=$FLAGS" \
     "${CORE_ARG[@]}" "${DEPS_ARG[@]}" > "$OUT/configure.log" || { cat "$OUT/configure.log"; exit 1; }
-grep -E "felitronics-core:|NeuralAmpModelerCore:|namz:" "$OUT/configure.log" || true
+grep -E "felitronics-core:|NeuralAmpModelerCore:|Eigen:|namz:" "$OUT/configure.log" || true
 cmake --build "$BUILD" --target fcrig
 
 cp "$BUILD/tools/wasm-rig/fcrig.mjs" "$BUILD/tools/wasm-rig/fcrig.wasm" "$HERE/fcrig-worklet.js" "$OUT/"
 CORE="$(sed -n 1p "$BUILD/fc-rig-deps.txt")"
 NAM="$(sed -n 2p "$BUILD/fc-rig-deps.txt")"
 NAMZ="$(sed -n 3p "$BUILD/fc-rig-deps.txt")"
+EIGEN="$(sed -n 4p "$BUILD/fc-rig-deps.txt")"
 
 echo
 echo "=== no threads, proven from the artifact (felitronics-core's tools/wasm/check-no-threads.mjs)"
@@ -119,6 +120,7 @@ ABI=$(sed -n 's/^#define FC_RIG_ABI_VERSION \([0-9][0-9]*\)u$/\1/p' "$ROOT/tools
     echo "felitronics-guitar-core $(describe "$ROOT")"
     echo "felitronics-core $(describe "$CORE")"
     echo "NeuralAmpModelerCore $(describe "$NAM")"
+    echo "Eigen $(describe "$EIGEN")"
     echo "namz $(describe "$NAMZ")"
     echo "fc_rig ABI $ABI"
     echo "emscripten ${EMVER##*) }"

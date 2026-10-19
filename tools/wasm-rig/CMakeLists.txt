@@ -78,13 +78,18 @@ if(EMSCRIPTEN)
         -sDYNAMIC_EXECUTION=0 -sFILESYSTEM=0
         "-sEXPORTED_FUNCTIONS=${_rig_exports}"
         "-sEXPORTED_RUNTIME_METHODS=HEAPF32,HEAPU8")
-    # What this module was compiled against, for build.sh's BUILD-INFO (modules/nam fetched the last two; their
-    # variables live in that directory's scope, the FetchContent properties are global).
+    # What this module was compiled against, for build.sh's BUILD-INFO (modules/nam fetched the last three; their
+    # variables live in that directory's scope, the FetchContent properties are global). Eigen is fetched on its own
+    # from the mirror — unless the NeuralAmpModelerCore on disk brought its own (modules/nam, FELITRONICS_EIGEN_DIR).
     include(FetchContent)
     FetchContent_GetProperties(nam_core_src SOURCE_DIR _rig_nam_src)
     FetchContent_GetProperties(namz_src SOURCE_DIR _rig_namz_src)
+    FetchContent_GetProperties(eigen_src SOURCE_DIR _rig_eigen_src)
+    if(NOT _rig_eigen_src)
+        set(_rig_eigen_src "${_rig_nam_src}/Dependencies/eigen")
+    endif()
     file(WRITE "${CMAKE_BINARY_DIR}/fc-rig-deps.txt"
-         "${felitronics_core_SOURCE_DIR}\n${_rig_nam_src}\n${_rig_namz_src}\n")
+         "${felitronics_core_SOURCE_DIR}\n${_rig_nam_src}\n${_rig_namz_src}\n${_rig_eigen_src}\n")
 endif()
 
 

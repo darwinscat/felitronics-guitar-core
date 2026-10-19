@@ -208,9 +208,10 @@ Configured with `emcmake` like `fcguitarfx`: core's `FelitronicsPolicy.cmake` is
 `-fno-exceptions -fno-rtti -msimd128 -msse4.1` (SIMD128, and Eigen's SSE packet path lowered onto it); the NAM objects
 get exceptions back (below); `-O3`; linked `-sENVIRONMENT=worklet -sGROWABLE_ARRAYBUFFERS=0`, ES6 factory
 `createFcRig`, no eval, no file system, dlmalloc. Core is the PINNED tag, v0.61.1 (the first whose `FlushToZero.h`
-compiles for wasm under `-msse4.1`), unless `FELITRONICS_CORE_DIR` names another; NeuralAmpModelerCore v0.5.4 and namz
-v4.1.0 are `modules/nam`'s pins (`FELITRONICS_NAM_CORE_SRC` / `FELITRONICS_NAMZ_SRC` point at local checkouts of them for
-an offline build). It proves the artefact single-threaded (core's `check-no-threads.mjs`), reads the wasm features the
+compiles for wasm under `-msse4.1`), unless `FELITRONICS_CORE_DIR` names another; NeuralAmpModelerCore v0.5.4, Eigen
+5.0.1 (from the mirror github.com/darwinscat/eigen, at the commit v0.5.4's submodule pins — no build asks gitlab.com) and
+namz v4.1.0 are `modules/nam`'s pins (`FELITRONICS_NAM_CORE_SRC` / `FELITRONICS_NAMZ_SRC` point at local checkouts of
+them for an offline build; a local NeuralAmpModelerCore brings its own Eigen). It proves the artefact single-threaded (core's `check-no-threads.mjs`), reads the wasm features the
 module needs off the module (binaryen validation against MVP plus each candidate), refuses a glue that names
 `toResizableBuffer`, and writes `BUILD-INFO`:
 
@@ -218,6 +219,7 @@ module needs off the module (binaryen validation against MVP plus each candidate
 felitronics-guitar-core <git describe>
 felitronics-core v0.61.1
 NeuralAmpModelerCore v0.5.4
+Eigen 5.0.1
 namz v4.1.0
 fc_rig ABI 3
 emscripten 6.0.9 (…)
