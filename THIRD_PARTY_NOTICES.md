@@ -9,7 +9,7 @@ local checkouts via `FELITRONICS_NAM_CORE_SRC` / `FELITRONICS_NAMZ_SRC`); nothin
 | Module | Third-party code | Licence | AGPL-compatible |
 |---|---|---|---|
 | `nam` | **NeuralAmpModelerCore** `v0.5.4` at `1f42f88535884450104b8711d7595019afa0495b` (`https://github.com/sdatkinson/NeuralAmpModelerCore`) | MIT | yes |
-| `nam` | **Eigen**, supplied by NeuralAmpModelerCore's `Dependencies/eigen` submodule at that pin | MPL-2.0 | yes |
+| `nam` | **Eigen** 5.0.1, the commit NeuralAmpModelerCore's `Dependencies/eigen` submodule pins at that release, fetched from the mirror github.com/darwinscat/eigen | MPL-2.0 | yes |
 | `nam` | **nlohmann/json**, vendored inside NeuralAmpModelerCore at that pin | MIT | yes |
 | `nam` | **namz** `v4.1.0` at `7bacfcb2a1beb48a5d95a5aa43c3b25092f0537a` (`https://github.com/darwinscat/namz`) | MIT | yes |
 

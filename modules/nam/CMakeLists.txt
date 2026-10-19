@@ -11,7 +11,8 @@ endif()
 include(FetchContent)
 
 # NeuralAmpModelerCore ships no usable library target. Populate the pinned sources without entering
-# its own project, then compile the same source set used by OrbitCab. Only Eigen's submodule is needed.
+# its own project, then compile the same source set used by OrbitCab. Its one submodule we need, Eigen, comes
+# from our own mirror below, not from where the submodule points.
 # A RELEASE, not a commit somebody caught mid-air. The pin was `b5a68c3` — upstream's "Revert A2 fast
 # optimizations (#295)" — which was the tip of main when OrbitCab first pinned it and stopped being so
 # forty-five minutes later, when v0.5.4 was published. It was inherited here with the NAM path and
@@ -35,11 +36,39 @@ else()
     FetchContent_Declare(nam_core_src
         GIT_REPOSITORY https://github.com/sdatkinson/NeuralAmpModelerCore.git
         GIT_TAG        ${FELITRONICS_NAM_CORE_TAG}
-        GIT_SUBMODULES "Dependencies/eigen"
+        GIT_SUBMODULES ""
         GIT_SHALLOW    FALSE
         SOURCE_SUBDIR  Dependencies/nlohmann)
 endif()
 FetchContent_MakeAvailable(nam_core_src)
+
+# EIGEN, the matrices NAM's networks are computed with — header-only. NeuralAmpModelerCore's submodule points
+# at gitlab.com/libeigen/eigen, and every build cloned it from there: on a day GitLab turned requests away
+# under load, every build of every product failed at that clone. So it comes from Darwin's Cat's own mirror,
+# github.com/darwinscat/eigen — the same repository, untouched — at the very commit v0.5.4's submodule pins
+# (Eigen 5.0.1), checked after the fetch. A local NeuralAmpModelerCore checkout brings its own.
+set(FELITRONICS_EIGEN_TAG "5.0.1" CACHE STRING "Eigen release, as NeuralAmpModelerCore's pin")
+set(FELITRONICS_EIGEN_COMMIT "bc3b39870ecb690a623a3f49149a358b95c5781d" CACHE STRING
+    "The commit that release must be: NeuralAmpModelerCore v0.5.4's submodule pin")
+if(FELITRONICS_NAM_CORE_SRC)
+    set(FELITRONICS_EIGEN_DIR "${nam_core_src_SOURCE_DIR}/Dependencies/eigen")
+else()
+    message(STATUS "Eigen: fetching ${FELITRONICS_EIGEN_TAG} from github.com/darwinscat/eigen")
+    FetchContent_Declare(eigen_src
+        GIT_REPOSITORY https://github.com/darwinscat/eigen.git
+        GIT_TAG        ${FELITRONICS_EIGEN_TAG}
+        GIT_SHALLOW    TRUE
+        SOURCE_SUBDIR  no-cmake-here)       # headers only: Eigen's own CMake project is never entered
+    FetchContent_MakeAvailable(eigen_src)
+    set(FELITRONICS_EIGEN_DIR "${eigen_src_SOURCE_DIR}")
+    if(EXISTS "${eigen_src_SOURCE_DIR}/.git")
+        execute_process(COMMAND git -C "${eigen_src_SOURCE_DIR}" rev-parse HEAD
+                        OUTPUT_VARIABLE eigen_head OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT eigen_head STREQUAL FELITRONICS_EIGEN_COMMIT)
+            message(FATAL_ERROR "Eigen ${FELITRONICS_EIGEN_TAG} is ${eigen_head}, not ${FELITRONICS_EIGEN_COMMIT}")
+        endif()
+    endif()
+endif()
 
 # namz is a header-only, lossless .nam codec and the .orbitrig rig model (namz_rig*.h — schema 4 with
 # `tone`, `lag_samples` and the pack's own two levels, all of which felitronics::rigplayer reads).
@@ -88,7 +117,7 @@ target_include_directories(nam_core SYSTEM PUBLIC
     ${nam_core_src_SOURCE_DIR}
     ${nam_core_src_SOURCE_DIR}/NAM
     ${nam_core_src_SOURCE_DIR}/NAM/wavenet
-    ${nam_core_src_SOURCE_DIR}/Dependencies/eigen
+    ${FELITRONICS_EIGEN_DIR}
     ${nam_core_src_SOURCE_DIR}/Dependencies/nlohmann
     ${nam_core_src_SOURCE_DIR}/Dependencies
     ${namz_src_SOURCE_DIR}/include)
@@ -151,7 +180,7 @@ if(FELITRONICS_BUILD_TESTS)
     target_link_libraries(felitronics_nam_rtalloc_tests PRIVATE felitronics::nam)
     target_link_libraries(felitronics_nam_rtalloc_tests PRIVATE felitronics::test_support)
     target_include_directories(felitronics_nam_rtalloc_tests SYSTEM PRIVATE
-        ${nam_core_src_SOURCE_DIR}/Dependencies/eigen)
+        ${FELITRONICS_EIGEN_DIR})
     target_compile_definitions(felitronics_nam_rtalloc_tests PRIVATE EIGEN_RUNTIME_NO_MALLOC)
     target_compile_features(felitronics_nam_rtalloc_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_nam_rtalloc_tests COMMAND felitronics_nam_rtalloc_tests)
