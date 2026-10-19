@@ -26,7 +26,7 @@ Signal order, per block:
 |---|---|
 | `prepare(rate, maxBlock, channels ≤ 2, scopeSamples = 2048)` | message, never while `process()` runs |
 | `load(rig, source)` / `unload()` | message |
-| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setStandby` | message |
+| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setStandby` / `setFeedDb` | message |
 | `service()` then `takeLoadJob()` | message, from a timer — a few times a second at least |
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
@@ -99,20 +99,28 @@ as it owns the weight.
 
 ## The scope tap — OrbitAmp's ScopeTap, inside the player
 
-The pictures of a device (the app's SHAPE) want what went in and what came out, sample beside sample. With the player
-those points are inside it, so it keeps the tap: a ring of the newest `kScopeSize` (2048 — `ScopeTap::size`; another
-length at `prepare()`, 0 = none) samples of channel 0, written once per block the device runs:
+The pictures of a device (the app's SHAPE) want what went in and what came out, sample beside sample. The app taps
+around its whole player (`CapturedBlock.h:543-556`: the block's input copied before the drive and before
+`player.process`, the scope written after it), and so does this — a ring of the newest `kScopeSize` (2048 —
+`ScopeTap::size`; another length at `prepare()`, 0 = none) samples of channel 0, written once per block the device runs:
 
-- **dry** — the DI as fed: after the pack's input level (or the host's), before the pre tone — the dry copy the blend
-  knob mixes, held back by `latencySamples()` exactly as that copy is;
-- **wet** — the models' mix: both slots aligned, weighed, through the law's gain — before the post tone, the blend
-  knob and the pack's output level.
+- **dry** — the input as the block was handed it, times the feed (`setFeedDb`, the app's block IN,
+  `PluginProcessor.cpp:1497`) and nothing else: before the pack's input level and the pre tone, UNDELAYED;
+- **wet** — the player's output: the pre tone, the models, the post tone, the blend knob, the pack's output level —
+  before the stand-by fade, which the app blends after the block has tapped (`PluginProcessor.cpp:1538`).
 
-So the two stand sample for sample as far as the player aligns anything: the rate-match is taken out, a capture's own
-lag is not (the player never takes it out of the sound either). In the app the tap sits around the whole block
-(`CapturedBlock.h:544-556`: the dry copied before the drive and the player, the wet the player's output); here it sits
-around the models, which is where the site's tap sat around TONE3000's node — a pack's tone knobs and output level do
-not move the picture, its input level and pre tone do.
+So the two stand as they do in the app, and no closer: the wet trails the dry by a capture's own lag (the player never
+takes it out of the sound either) and, at a host rate other than the pack's, by `latencySamples()` — the app's picture
+is misaligned by the rate-match exactly so, and this follows it. Every knob of the pack moves the picture; the input
+level and the output level only as far as they change its shape, since the reader matches levels (below).
+(v0.5.0 tapped around the models — the dry after the input level and held back by `latencySamples()`, the wet before
+the post tone, the blend knob and the output level — where the site's tap sat around TONE3000's node.)
+
+**The feed.** `setFeedDb(db)` is the bench's drive ON TOP of the device's input level — the app's block IN, which the
+app applies outside its player. A host that has no such stage of its own hands it here (fc_rig does), so the stand-by
+wire is taken before it and the scope's dry after it; the sound is one gain, the input level plus the feed — the same
+bytes as stating the feed as the host's hand (`setHostInputDb(stageInputDb() + db)`). Kept across `load()` and
+`unload()`; a non-finite dB is refused; message thread.
 
 `scopeRead(dry, wet, n)` copies the newest `min(n, size, written)` of both, oldest first, with the wet scaled to the
 dry's RMS — the app's `ScopeTap::read` (`ScopeTap.h:42-72`), which matches in the reader: "a boost that is merely
@@ -124,7 +132,7 @@ published end and the claim and throws the copy away if the writer may have reac
 so they then hold a copy the writer may have torn, not a frame: a reader that wants to keep its previous frame reads
 into scratch of its own and copies out on a non-zero answer (the worklet does). `scopeFrames()` is the count when it
 is read, not tied to the snapshot a concurrent reader got. A block processed with no input channel writes no tap. The
-audio side pays one fence and two stores a block.
+audio side pays one fence and two stores a block, and a copy of channel 0's block for the dry.
 
 ## Stand-by — OrbitAmp's PARK
 

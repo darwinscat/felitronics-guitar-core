@@ -2,6 +2,33 @@
 
 # Changelog
 
+## v0.5.1 — unreleased
+
+### rigplayer — the scope taps where the app taps
+
+- `RigPlayer::scopeRead` now draws OrbitAmp's own two points, around the whole player (`CapturedBlock.h:543-556`: the
+  block's input copied before the drive and `player.process`, the scope written after it). **dry** = the input as the
+  block was handed it, times the feed and nothing else — before the pack's input level and the pre tone, UNDELAYED;
+  **wet** = the player's output — pre tone, models, post tone, blend knob, output level — before the stand-by fade (the
+  app's `BypassFade` blends after the block has tapped, `PluginProcessor.cpp:1538`). A pack's post tone and blend knob
+  now move the picture; its input level no longer reaches the dry. As in the app, the wet trails the dry by a capture's
+  own lag and, at a host rate other than the pack's, by `latencySamples()` (61 samples at 44.1 kHz against 48 kHz
+  captures) — v0.5.0 held the dry back to align them; the app does not, and this follows the app. Kept: written only
+  while the device runs (frozen while it stands by), the torn-read guard, the reader's level match, no allocation.
+- `RigPlayer::setFeedDb(db)` / `feedDb()`: the bench's drive on top of the device's input level — the app's block IN
+  (`PluginProcessor.cpp:1497`), which the app applies outside its player. The stand-by wire is taken before it, the
+  scope's dry after it, the pack's input level after that; the sound is one gain, the input level plus the feed, summed
+  in that order — the bytes of stating the feed as the host's hand (`setHostInputDb(stageInputDb() + db)`). Kept across
+  `load()` and `unload()`, non-finite refused, arrives (not ramps) on the way back from stand-by as the input level does.
+- The sound is untouched. Checked once while building this change (not a suite in the tree): 24 renders through
+  `fc_rig_render` — every pack of the site (X88-IR ×4, IR-X ×2, V4 ×6) at 48 kHz mono and 44.1 kHz stereo, with the
+  feed, PARK both ways and cut short, the gain dial, every tone and blend knob, one model and two, normalisation off
+  and a reset — byte-identical to v0.5.0's. The standing guard is the ABI suite, which plays the PARK-and-feed
+  scenario against the player driven on v0.5.0's spelling, up to the unload.
+- An empty player is a wire behind the feed whichever setter ran last: `publishLevels()` says so itself (the feed
+  alone in, unity out, the host's hand kept for the next load), so a hand or a feed set while nothing is loaded no
+  longer adds the hand back in — the next pack's levels glided in from the wrong place.
+
 ## v0.5.0 — 2026-10-19
 
 ### rigplayer — the scope tap and stand-by (OrbitAmp's ScopeTap and PARK)
