@@ -45,7 +45,8 @@ if ! command -v em++ > /dev/null; then
 fi
 echo "emcc: $(emcc --version | head -1)"
 
-CORE_ARG=()
+# Stated on every run, so a build directory configured once with another core cannot keep it from its cache.
+CORE_ARG=(-DFELITRONICS_GUITAR_FCORE_DIR="$ROOT/../felitronics-core")
 if [ -n "${FELITRONICS_CORE_DIR:-}" ]; then
     [ -f "$FELITRONICS_CORE_DIR/modules/delay/include/felitronics/delay/TapeDelay.h" ] \
         || { echo "no felitronics-core v0.61.0+ at $FELITRONICS_CORE_DIR (no modules/delay)"; exit 1; }
