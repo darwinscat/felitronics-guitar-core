@@ -14,12 +14,18 @@
 // ====================================================================================
 // One instance is the amp's last two additive links, in the app's order: the DELAY, then the REVERB (OrbitAmp's
 // processBlock: gate -> preamp -> EQ -> delay -> reverb). Both only ADD: the dry passes at unity whatever the
-// knobs say. Stereo in place; a NULL right channel runs the one channel the stages' mono path takes.
+// knobs say. Stereo in place; a NULL right channel runs the one channel the stages' mono path takes — and that call
+// STOPS channel 1 (law 11a): its delay line, room and filters are dropped, so a stream that alternates mono and
+// stereo calls loses the right-hand tail at every mono call. A caller that may go stereo again passes two channels.
+// The stages' clock-only call (law 11c: no channels, n frames — the glides and the chorus run on through a gap) has
+// no spelling here: a NULL left channel is refused. Feed silence for a gap.
 //
 // The KNOBS are the app's parameters, in the app's units — percent where the face reads percent — and they reach
-// the stages through the app's own mapping (OrbitAmp's updateDelaySettings / updateReverbSettings), with the
-// knob law felitronics-core carries for it (delay/DelayLaw.h, reverb::Character). A fresh instance stands at the
-// app's parameter defaults. A knob is clamped onto the app parameter's range; a non-finite value is ignored.
+// the stages through the app's mapping (OrbitAmp's updateDelaySettings / updateReverbSettings) under core's laws:
+// the knob law felitronics-core carries for it (delay/DelayLaw.h, reverb::Character), where DARK's curve is
+// core::det::pow and the app's is the system's powf. The app itself still runs its own copies of the stages, so a
+// render here sits ulp-level from the app's, not bit-identical to it. A fresh instance stands at the app's parameter
+// defaults. A knob is clamped onto the app parameter's range; a non-finite value is ignored.
 //
 // WHEN A KNOB LANDS. A setter only records the value. The next process() call hands every knob to the stages,
 // in the app's order, before it runs them — as the app does at the top of every block — so a knob moved between
@@ -39,7 +45,8 @@
 //   · process() answers 1 when it processed all n frames and 0 when it refused (unprepared, n < 0, left NULL)
 //     without touching a sample. n == 0 is a no-op that answers 1. Any n is processed in full; the module's own
 //     buffers (fc_guitar_fx_buffer) hold maxBlock frames, so a caller using them keeps n <= maxBlock.
-//   · reset() is a stream restart: the delay line and the room cleared, the knobs kept.
+//   · reset() is a stream restart: the delay line and the room cleared, the knobs kept — knobs set since the last
+//     process() reach the stages first, so what follows a reset does not depend on what came before it.
 //   · Denormals are flushed in software inside the stages (law 8), so nothing here depends on the FPU's mode.
 //
 // ====================================================================================
@@ -82,7 +89,8 @@ int fc_guitar_fx_prepare (fc_guitar_fx* fx, double sampleRate, int maxBlock);
     the two pointers to process() and reads the result from the same place. NULL when unprepared. */
 float* fc_guitar_fx_buffer (fc_guitar_fx* fx, int channel);
 
-/** Delay, then reverb, over `n` frames of `left` and `right`, in place. `right` NULL = one channel. */
+/** Delay, then reverb, over `n` frames of `left` and `right`, in place. `right` NULL = one channel, and channel 1's
+    memory dropped (law 11a). `left` NULL is refused: there is no clock-only call. */
 int fc_guitar_fx_process (fc_guitar_fx* fx, float* left, float* right, int n);
 
 /** A stream restart: the delay line and the room cleared; knobs and preparation kept. */
