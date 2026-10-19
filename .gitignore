@@ -4,6 +4,7 @@
 /build32/
 /cmake-build-*/
 /out/
+/tools/wasm/build/
 *.o
 *.obj
 *.a
