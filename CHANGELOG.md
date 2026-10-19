@@ -2,7 +2,7 @@
 
 # Changelog
 
-## Unreleased
+## v0.2.0 — 2026-10-19
 
 ### fcguitarfx — the amp's echo and room for a browser AudioWorklet
 
