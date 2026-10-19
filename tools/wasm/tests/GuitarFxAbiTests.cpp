@@ -18,6 +18,7 @@
 #include <felitronics/delay/TapeDelay.h>
 #include <felitronics/reverb/AmpReverb.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -289,10 +290,16 @@ void contract()
     ok (fc_guitar_fx_abi_version() == FC_GUITAR_FX_ABI_VERSION && FC_GUITAR_FX_ABI_VERSION == 1u, "abi_version answers 1");
 
     fc_guitar_fx* fx = fc_guitar_fx_create();
-    float l[64] = {}, r[64] = {};
+    // Long enough for every call below, the 1000-frame one included: the stages read and write all n frames.
+    std::vector<float> lv (1000, 0.25f), rv (1000, -0.25f);
+    float* const l = lv.data();
+    float* const r = rv.data();
     ok (fc_guitar_fx_buffer (fx, 0) == nullptr, "no buffer before prepare");
     ok (fc_guitar_fx_process (fx, l, r, 64) == 0, "process before prepare is refused");
 
+    fc_guitar_fx_set_delay_sync (fx, 0);   // an echo 20 ms (960 frames) on: the 1000-frame call's tail hears it
+    fc_guitar_fx_set_delay_time_ms (fx, 20.0f);
+    fc_guitar_fx_set_delay_mix (fx, 50.0f);
     ok (fc_guitar_fx_prepare (fx, 48000.0, 128) == 1, "prepare 48k/128");
     ok (fc_guitar_fx_buffer (fx, 0) != nullptr && fc_guitar_fx_buffer (fx, 1) != nullptr
             && fc_guitar_fx_buffer (fx, 0) != fc_guitar_fx_buffer (fx, 1), "two distinct channel buffers");
@@ -302,6 +309,12 @@ void contract()
     ok (fc_guitar_fx_process (fx, nullptr, r, 64) == 0, "a NULL left channel is refused");
     ok (fc_guitar_fx_process (fx, l, nullptr, 64) == 1, "a NULL right channel is one channel");
     ok (fc_guitar_fx_process (fx, l, r, 1000) == 1, "n above maxBlock is processed in full (own pointers)");
+    {
+        bool finite = true;
+        for (std::size_t i = 0; i < lv.size(); ++i)
+            finite = finite && std::isfinite (lv[i]) && std::isfinite (rv[i]);
+        ok (finite && lv[999] != 0.25f, "...all 1000 frames of both channels, finite and processed");
+    }
 
     const struct { double sr; int block; const char* what; } bad[] = {
         { 999.0, 128, "a rate below 1 kHz" }, { 768001.0, 128, "a rate above 768 kHz" },
