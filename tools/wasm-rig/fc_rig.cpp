@@ -280,3 +280,22 @@ FC_EXPORT int fc_rig_set_feed_db (fc_rig* rig, double db)
     // same order, so the sound is that spelling's byte for byte, and only the player can put the scope's dry between.
     return rig != nullptr && rig->player.setFeedDb (db) ? 1 : 0;
 }
+
+// ---- ABI 4 -----------------------------------------------------------------------------------------------------------
+FC_EXPORT int fc_rig_set_preload (fc_rig* rig, int maxModels)
+{
+    if (rig == nullptr || maxModels < 0) return 0;
+    return rig->player.setPreload (maxModels > 0, maxModels) ? 1 : 0;
+}
+FC_EXPORT int fc_rig_preload_pending (fc_rig* rig)
+{
+    if (rig == nullptr) return 0;
+    const auto p = rig->player.preloadProgress();
+    return p.total - p.settled;
+}
+FC_EXPORT int fc_rig_preload_total (fc_rig* rig) { return rig != nullptr ? rig->player.preloadProgress().total : 0; }
+FC_EXPORT int fc_rig_preload_failed (fc_rig* rig) { return rig != nullptr ? rig->player.preloadProgress().failed : 0; }
+FC_EXPORT int fc_rig_is_gain_dial (fc_rig* rig, const char* name)
+{
+    return rig != nullptr && name != nullptr && ! rig->player.dialName().empty() && rig->player.dialName() == name ? 1 : 0;
+}

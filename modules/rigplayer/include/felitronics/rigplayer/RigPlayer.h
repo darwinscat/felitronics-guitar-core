@@ -81,6 +81,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace felitronics::rigplayer {
@@ -326,6 +327,8 @@ public:
         coldAfter_.store(coldSamples(coldSeconds_), std::memory_order_release);
         dipSamples_ = std::max(1LL, (long long) std::llround(kDipSeconds * fs_));
         for (auto& n : nam_) n.prepare(fs_, maxBlock_);
+        retiredStages_.clear();                                   // never concurrent with process(): nothing runs them
+        for (auto& n : poolStages_) n->prepare(fs_, maxBlock_);   // the preload's captures, re-prepared in place
         // Not normalised: a tone curve's broadband level is part of what the pack says, and a dry path's
         // level rides in its gain. Reference-unity RMS is for cabinets, which these are not.
         // AND THE TAPS ARE DESIGNED AT `fs_`, WHICH IS WHY THAT IS ENOUGH. The other half of an
@@ -479,6 +482,11 @@ public:
         // the state, not the counter). A slot whose re-prepare was REFUSED writes nothing, and needs no
         // parked intent: the next prepare() that CAN honour it restarts of its own accord.
         for (auto& n : nam_) n.reset();
+        // …and a preloaded capture a slot runs (setPreload). An audio-thread entry as process() is: the clock ticks
+        // BEFORE the slots are read (audioClock_), so a copy unload() or an eviction retires is never freed under it.
+        audioClock_.fetch_add(1, std::memory_order_seq_cst);
+        for (int i = 0; i < 2; ++i)
+            if (auto* st = slotStage_[i].load(std::memory_order_seq_cst); st != &nam_[i]) st->reset();
         // …AND THE FILTERS' HISTORY. When this was written, `reset()` on these also dropped an IR
         // published a block ago and still fading in — a tone-knob move lost for good, because the retry
         // flag is already clear after a successful publish — and clearAudioState() was added for this
@@ -592,6 +600,9 @@ public:
         // A pack without them leaves the table empty; the host may measure and setAlignment().
         align_ = AlignmentTable::fromDevice(d);
         loaded_ = true;
+        preloadCap_ = preloadNext_;                      // the set is made by the apply() below
+        preloadStale_ = true;
+        preloadBuilt_ = false;                           // …and is free to fill until it is first ready
         if (prepared_) {
             for (int s = 0; s < 2; ++s) { rebuildCurves(s); rebuildBands(s); }
             rebuildDry();
@@ -611,6 +622,12 @@ public:
         // just wiped and a stage that was just emptied, and an empty stage carried is the raw DI.
         landFlag_.store(false, std::memory_order_release);
         landFail_.store(0, std::memory_order_release);
+        // The slots go back to their own stages BEFORE the forget is posted (a block that takes the forget runs these),
+        // and every preloaded copy is retired whole (retireStage): one no slot ever ran is freed here, one a slot ran by
+        // the first service() after the audio thread has entered process() again.
+        for (int i = 0; i < 2; ++i) slotStage_[i].store(&nam_[i], std::memory_order_seq_cst);
+        for (auto& e : pool_) retireStage(e);
+        pool_.clear(); preloadPanel_.clear(); preloadAxes_.clear(); preloadCap_ = 0; preloadBuilt_ = false;
         forget_.store(true, std::memory_order_release);
         loadAsk_.store(0, std::memory_order_release);    // …and an ask for it is void with it
         // …and so is what the law last said it holds. held_ is written by the law alone, and a device that stands by
@@ -872,6 +889,66 @@ public:
     }
     int maxModels() const { return maxModels_; }
 
+    // THE PRELOAD — every capture of the pack, prepared before it is asked for, for a host whose loads stall its audio
+    // (a browser AudioWorklet runs the load job on the audio thread: 24 – 49 ms per capture in Chromium, so a turn of
+    // DRIVE across captures underran at every capture it reached). Off by default: the player above, bit for bit.
+    //
+    // On, from the next load(): the player hands out jobs (the same LoadJob, run and delivered as ever) for the SET, one
+    // at a time, until every copy in it is prepared — preloadProgress() counts them — and from then on neither a turn of
+    // the gain dial nor a switch within the set hands out one: a slot that wants a capture takes its prepared copy at
+    // the next service(), the instant a delivered job would have landed it, and the law warms and crossfades it as
+    // before (BlendLaw, the dip, the rest — all unchanged). THE SET is, in order: the panel sounding (the files of the
+    // gain axis at the other controls' current settings) — every capture the dial can put in either slot, one copy per
+    // (capture, slot), since the two slots hold the same file at once at the dial's ends and across a link (eleven
+    // copies for a pack of eleven positions and nine files); then the other panels of the pack (every captured
+    // combination of the other controls), nearest first, while the set stays within `maxModels` copies. The default,
+    // kPreloadWholePack, is the whole pack: every panel. The sounding panel is always whole, whatever the cap.
+    //
+    // Under a cap, a switch to a panel outside the set makes the set again around it: copies it still holds stay, the
+    // rest are freed (a copy a slot is running once the slot moves off it), and the copies it lacks are handed out only
+    // as the law asks for them — as many jobs as the player without the preload runs there, never more — unless the
+    // host says its jobs cost nothing now (setPreloadIdle). The same holds for a file that could not be fetched: it is
+    // fetched again when the law asks for it. Those two are the only jobs after the set is ready.
+    //
+    // Memory: one copy is one NamStage with its capture — measured 2.8 MB natively for the site's WaveNets (both NAM
+    // instances: NamStage builds two, stereo). The whole pack is 11 copies (~31 MB) for X88-IR Crunch and V4 Sheriff
+    // Ch1, 44 (~123 MB) for IR-X Ch2, 66 (~185 MB) for IR-X Ch1 PowerAmp. A copy is freed whole when it leaves the set
+    // or the pack goes (retireStage): at once if no slot ever ran it, otherwise by the first service() after the audio
+    // thread has entered process() again.
+    // A job that cannot fetch its file ("unfetched") or whose bytes are not a capture ("failed") settles its copy: the
+    // set is ready without it, and the law is told the load failed when it asks.
+    // Message thread. False = a negative cap.
+    static constexpr int kPreloadWholePack = std::numeric_limits<int>::max();
+    bool setPreload(bool on, int maxModels = kPreloadWholePack) {
+        if (maxModels < 0) return false;
+        preloadNext_ = on ? std::max(1, maxModels) : 0;
+        return true;
+    }
+    // The host's word that a job costs its sound nothing now — it is silent, or it runs jobs on a worker thread. While
+    // it is set, the copies the set lacks are handed out after ready too, as they are before; off (the default), after
+    // ready only the law's own ask is. Message thread; read by the next takeLoadJob().
+    void setPreloadIdle(bool idle) { preloadIdle_ = idle; }
+    bool preload() const { return preloadNext_ > 0; }
+    struct PreloadProgress {
+        int total = 0;       // copies in the set; 0 = the pack loaded is not preloading
+        int settled = 0;     // …of them prepared, or settled as failed or unfetched
+        int failed = 0;      // …of the settled, the failed and the unfetched
+        int held = 0;        // copies the pool holds prepared, the set's and those a slot still runs
+        bool ready() const { return total > 0 && settled == total; }
+    };
+    PreloadProgress preloadProgress() const {
+        PreloadProgress p;
+        if (preloadCap_ <= 0 || ! loaded_) return p;
+        for (const auto& e : pool_) {
+            if (e.state == Pre::Ready) ++p.held;
+            if (! e.wanted) continue;
+            ++p.total;
+            if (e.state == Pre::Ready) ++p.settled;
+            if (e.state == Pre::Failed || e.state == Pre::Unfetched) { ++p.settled; ++p.failed; }
+        }
+        return p;
+    }
+
     // The models' measured offsets (AlignmentTable.h), for a pack that does not carry its own. A delay
     // travels with a model and is applied at the one instant its slot is silent — weight exactly zero
     // — never as a splice on a live signal. So a table handed in BEFORE playing lands with the first
@@ -890,6 +967,8 @@ public:
     // ask for the load job after it (takeLoadJob), because the law waits for that.
     void service() {
         for (auto& n : nam_) n.collectGarbage();
+        freeRetired();                                       // the preload's copies unload() and an eviction retired
+        servePreloadAsk();
         for (auto& f : fir_) f.flushPending();
         dry_.flushPending();
     }
@@ -910,6 +989,7 @@ public:
         double        sampleRate = 48000.0;
         int           maxBlock = 512;
         std::uint64_t generation = 0;                              // the load() it belongs to
+        bool          preload = false;                             // a copy for the preload (setPreload), not the slot
     };
     struct Loaded {
         LoadJob job;
@@ -920,6 +1000,7 @@ public:
 
     std::optional<LoadJob> takeLoadJob() {
         if (jobOut_ || ! loaded_) return std::nullopt;
+        if (preloadCap_ > 0) return takePreloadJob();
         const auto ask = loadAsk_.load(std::memory_order_acquire);
         if (ask == 0) return std::nullopt;
         const auto id = ask >> 1;
@@ -966,6 +1047,7 @@ public:
             auto& m = models_[(std::size_t) job.model - 1];
             if (m.bytes == nullptr) { m.bytes = loaded.bytes; ++loads_; }
         }
+        if (job.preload) { deliverPreload(std::move(loaded)); return; }
         loadSlot(job.slot, std::move(loaded.model), job.model);
     }
 
@@ -977,9 +1059,12 @@ public:
     }
 
     // Host-rate latency: the models' own rate-matching (the filters are minimum-phase, the alignment
-    // delays are relative and the reference model carries none).
+    // delays are relative and the reference model carries none). Message thread, or inside process(): it reads the
+    // stages the slots run, which only those two may (a copy the preload retires is freed by the message thread once
+    // the audio thread has entered process() again — a third thread reading here could outlive it).
     int latencySamples() const {
-        return std::max(nam_[0].latencySamples(), nam_[1].latencySamples());
+        return std::max(slotStage_[0].load(std::memory_order_seq_cst)->latencySamples(),
+                        slotStage_[1].load(std::memory_order_seq_cst)->latencySamples());
     }
 
     // ---- read-outs of the audio thread, for a strip or a dump ----
@@ -1027,7 +1112,8 @@ public:
         const auto  h0  = held_[0].load(std::memory_order_relaxed);
         const auto  h1  = held_[1].load(std::memory_order_relaxed);
         const int   s   = mix > 0.5f ? 1 : 0;
-        return { nam_[s].modelLoudness(), nam_[s].modelHasLoudness(),
+        const auto& st = *slotStage_[s].load(std::memory_order_acquire);
+        return { st.modelLoudness(), st.modelHasLoudness(),
                  mix > 0.0f && mix < 1.0f && h0 != 0 && h1 != 0 && h0 != h1, s };
     }
     // Instrumentation, for a bench's dump: blocks in which a slot was still warming, weight moves of
@@ -1176,6 +1262,10 @@ public:
     // (the convolvers take the prepared width and REFUSE any other — law 11c), and the spare planes stay
     // zeroed for them; only the expensive part — the two models — shrinks to what is playing.
     [[nodiscard]] bool process(float* const* io, int numChannels, int numSamples) {
+        // THE AUDIO CLOCK ticks first, before anything below reads a slot's stage (latencySamples() for the wire, the
+        // stand-by path, the models): the preload frees a retired copy only once this has moved past the moment the
+        // slots let go of it (retireStage). One atomic add a block.
+        audioClock_.fetch_add(1, std::memory_order_seq_cst);
         if (numChannels < 0 || numSamples < 0) return false;         // malformed — law 11
         if (! prepared_ || io == nullptr) return false;
         if (numChannels > channels_) return false;                   // width is a LIMIT — law 11(b)
@@ -1266,11 +1356,13 @@ public:
                 // drains what each still owes once and is free after that — counted like any other drain.
                 if (! parkedRt_) park();
                 for (int c = 0; c < nch; ++c) std::copy_n(wire_.delayed(c), count, a[c]);
-                const long long drained[2] { nam_[0].drainedSamples(), nam_[1].drainedSamples() };
-                ok = nam_[0].process(a, 0, count, norm) && ok;
-                ok = nam_[1].process(b, 0, count, norm) && ok;
-                const bool ran0 = nam_[0].drainedSamples() != drained[0];
-                const bool ran1 = nam_[1].drainedSamples() != drained[1];
+                auto& s0 = *slotStage_[0].load(std::memory_order_seq_cst);
+                auto& s1 = *slotStage_[1].load(std::memory_order_seq_cst);
+                const long long drained[2] { s0.drainedSamples(), s1.drainedSamples() };
+                ok = s0.process(a, 0, count, norm) && ok;
+                ok = s1.process(b, 0, count, norm) && ok;
+                const bool ran0 = s0.drainedSamples() != drained[0];
+                const bool ran1 = s1.drainedSamples() != drained[1];
                 if (ran0) runBlocks_[0].fetch_add(1, std::memory_order_relaxed);
                 if (ran1) runBlocks_[1].fetch_add(1, std::memory_order_relaxed);
                 if (ran0 && ran1) pairBlocks_.fetch_add(1, std::memory_order_relaxed);
@@ -1443,16 +1535,20 @@ public:
             // while it slept and now fails every block instead. That is law 11's answer — a call that
             // cannot be honoured says so — and it is not constructible in a test without exhausting
             // memory, so it is written here rather than gated.
-            const long long drained[2] { nam_[0].drainedSamples(), nam_[1].drainedSamples() };
-            ok = nam_[0].process(a, run[0] ? nch : 0, count, norm) && ok;
-            ok = nam_[1].process(b, run[1] ? nch : 0, count, norm) && ok;
+            // The stage each slot runs is read HERE, after the law: a landing's stage is published before its flag, and an
+            // unload() resets these before its forget — so a block that took the landing or the forget runs its stage.
+            auto& s0 = *slotStage_[0].load(std::memory_order_seq_cst);
+            auto& s1 = *slotStage_[1].load(std::memory_order_seq_cst);
+            const long long drained[2] { s0.drainedSamples(), s1.drainedSamples() };
+            ok = s0.process(a, run[0] ? nch : 0, count, norm) && ok;
+            ok = s1.process(b, run[1] ? nch : 0, count, norm) && ok;
             // WHAT THE CPU PAID — a slot's network ran if it was handed the audio holding a model, OR if its stage
             // spent part of a drain on it (a slot put to rest is fed its field of silence once, width-zero call
             // above): one network on audio in one-model mode, plus the outgoing capture's bounded drain. Two relaxed
             // loads of the stage's own odometer, which it keeps on this thread.
             {
-                const bool ran0 = (run[0] && blend_.held[0] != 0) || nam_[0].drainedSamples() != drained[0];
-                const bool ran1 = (run[1] && blend_.held[1] != 0) || nam_[1].drainedSamples() != drained[1];
+                const bool ran0 = (run[0] && blend_.held[0] != 0) || s0.drainedSamples() != drained[0];
+                const bool ran1 = (run[1] && blend_.held[1] != 0) || s1.drainedSamples() != drained[1];
                 if (ran0) runBlocks_[0].fetch_add(1, std::memory_order_relaxed);
                 if (ran1) runBlocks_[1].fetch_add(1, std::memory_order_relaxed);
                 if (ran0 && ran1) pairBlocks_.fetch_add(1, std::memory_order_relaxed);
@@ -1737,6 +1833,9 @@ private:
             sel_ = steppedSelection(sel_, stay, kStepDeadband);
             stayFile_ = sel_.pick.lo >= 0 ? sel_.knots[(std::size_t) sel_.pick.lo].file : -1;
         }
+        // THE PRELOAD'S SET follows the PANEL, never the dial: the knots' files are compared in place (no allocation, a
+        // dozen ints), and only another panel — a switch, a pack — makes the set again.
+        if (preloadCap_ > 0 && (preloadStale_ || ! samePanel())) rebuildPreload();
         plan_ = slotPlan(sel_, d);
         if (plan_.file[0] < 0) { setRequest(0, 0, 0.0f); return; }
         std::uint64_t want[2] { modelIdOf(plan_.file[0]), modelIdOf(plan_.file[1]) };
@@ -1756,7 +1855,7 @@ private:
     // For the slots as loaded now; a model still to come brings its own delay when it lands.
     void stageDelays() {
         for (int i = 0; i < 2; ++i)
-            pendDelay_[(std::size_t) i].store(delayOfModel(modelIdOf(plan_.file[i]), nam_[i]), std::memory_order_release);
+            pendDelay_[(std::size_t) i].store(delayOfModel(modelIdOf(plan_.file[i]), slotStageOf(i)), std::memory_order_release);
     }
 
     // 🔴 EVERY NUMBER THIS PLAYER HOLDS IN HOST SAMPLES, RESTATED AT THE RATE IT NOW RUNS AT. This is
@@ -1828,15 +1927,15 @@ private:
             // `blend_` is the audio thread's, read here under the contract that says the two never run
             // at once — the same licence prepare() already uses to zero `bandRt_[s].count`.
             if (blend_.held[i] == 0) continue;
-            felitronics::nam::blendRestated(blend_, i, warmFor(nam_[(std::size_t) i]), timeScale);
-            const int d = std::clamp(delayOfModel(blend_.held[i], nam_[(std::size_t) i]), 0, kMaxDelay);
+            felitronics::nam::blendRestated(blend_, i, warmFor(slotStageOf(i)), timeScale);
+            const int d = std::clamp(delayOfModel(blend_.held[i], slotStageOf(i)), 0, kMaxDelay);
             slotDelay_[(std::size_t) i].store(d, std::memory_order_relaxed);
         }
         if (landFlag_.load(std::memory_order_acquire)) {
             const int ls = landSlot_.load(std::memory_order_relaxed) & 1;
-            landWarm_ .store(warmFor(nam_[(std::size_t) ls]), std::memory_order_relaxed);
+            landWarm_ .store(warmFor(slotStageOf(ls)), std::memory_order_relaxed);
             landDelay_.store(std::clamp(delayOfModel(landModel_.load(std::memory_order_relaxed),
-                                                     nam_[(std::size_t) ls]), 0, kMaxDelay),
+                                                     slotStageOf(ls)), 0, kMaxDelay),
                              std::memory_order_relaxed);
         }
     }
@@ -1854,16 +1953,310 @@ private:
     bool loadSlot(int slot, felitronics::nam::NamStage::PreparedModel prepared, std::uint64_t model) {
         auto& stage = nam_[(std::size_t) (slot & 1)];
         const bool ok = prepared != nullptr && stage.install(std::move(prepared));
-        const int delay = ok ? delayOfModel(model, stage) : 0;    // after the load: the rate is the model's
+        return ok ? land(slot, stage, model) : failSlot(slot);
+    }
+
+    void clearAsk(int slot) {
         if (const auto ask = loadAsk_.load(std::memory_order_acquire); ask != 0 && (int) (ask & 1u) == slot)
             loadAsk_.store(0, std::memory_order_release);
-        if (! ok) { landFail_.store(slot + 1, std::memory_order_release); return false; }
+    }
+    bool failSlot(int slot) {
+        clearAsk(slot);
+        landFail_.store(slot + 1, std::memory_order_release);
+        return false;
+    }
+
+    // The slot runs `stage` from its next block — its own, where a model was just installed, or a preloaded copy — and
+    // the law is told the model landed. The stage is published BEFORE the flag, so the block that takes the landing
+    // runs it (process() reads the slot's stage after the law).
+    bool land(int slot, felitronics::nam::NamStage& stage, std::uint64_t model) {
+        slotStage_[(std::size_t) (slot & 1)].store(&stage, std::memory_order_seq_cst);
+        const int delay = delayOfModel(model, stage);             // after the load: the rate is the model's
+        clearAsk(slot);
         landSlot_.store(slot, std::memory_order_relaxed);
         landModel_.store(model, std::memory_order_relaxed);
         landWarm_.store(warmFor(stage), std::memory_order_relaxed);
         landDelay_.store(std::clamp(delay, 0, kMaxDelay), std::memory_order_relaxed);
         landFlag_.store(true, std::memory_order_release);
         return true;
+    }
+
+    // ------------------------------------------------------------------------- the preload ----
+
+    enum class Pre : std::uint8_t { Empty, InFlight, Ready, Failed, Unfetched };
+    struct PoolEntry {
+        std::uint64_t model = 0;                       // BlendModelId
+        int  slot = 0;                                 // the slot this copy plays in: one copy per (capture, slot)
+        bool wanted = true;                            // in the set; false = kept only while a slot runs it or its job is out
+        bool ran = false;                              // a slot has run it: the audio thread may still hold its address
+        Pre  state = Pre::Empty;
+        felitronics::nam::NamStage* stage = nullptr;   // holds the prepared capture once Ready; owned by poolStages_
+    };
+    struct RetiredStage {
+        std::unique_ptr<felitronics::nam::NamStage> stage;
+        std::uint64_t at = 0;                          // audioClock_ once no slot named it: freed when the clock is past it
+    };
+
+    felitronics::nam::NamStage& slotStageOf(int slot) const {
+        return *slotStage_[(std::size_t) (slot & 1)].load(std::memory_order_seq_cst);
+    }
+
+    // THE PANEL the set was made for: the knots' files AND the other controls' settings. The files alone cannot tell
+    // the panels of a pack with no gain dial apart (it has no knots, so every panel read "the same"): the set was never
+    // made again, and the law's asks joined it one by one past the cap. Compared in place, no allocation.
+    bool samePanel() const {
+        if (sel_.knots.size() != preloadPanel_.size()) return false;
+        for (std::size_t i = 0; i < sel_.knots.size(); ++i) if (sel_.knots[i].file != preloadPanel_[i]) return false;
+        std::size_t i = 0;
+        for (const auto& c : stage_.device.controls) {
+            if (c.name == dial_) continue;
+            if (i >= preloadAxes_.size()) return false;
+            const auto v = axes_.find(c.name);
+            if (v == axes_.end() ? ! preloadAxes_[i].empty() : v->second != preloadAxes_[i]) return false;
+            ++i;
+        }
+        return i == preloadAxes_.size();
+    }
+
+    int findEntry(std::uint64_t model, int slot) const {
+        for (std::size_t i = 0; i < pool_.size(); ++i)
+            if (pool_[i].model == model && pool_[i].slot == slot) return (int) i;
+        return -1;
+    }
+
+    // A COPY GOES WHOLE — its NamStage with its capture — and is never cleared into a list for reuse. NamStage frees a
+    // capture it retires only once its OWN process() has stepped past it (NeuralStage::collectGarbage), and a pool stage
+    // no slot runs is never processed again: a cleared copy was never freed (unload() kept 0.26 % of the set), and a
+    // stage reused 64 times parked its next install while it went on playing the old capture. So: a copy no slot ever
+    // ran is freed here and now — the audio thread never had its address. One a slot ran is tagged with the audio clock
+    // read AFTER the slots were moved off it, and service() frees it once the clock is past the tag: process() ticks the
+    // clock before it reads a slot's stage (both sequentially consistent, as the slots' stores are), so a block that
+    // began after the tag runs the new stage, and every block that might have read this one has returned — the audio
+    // thread runs one block at a time. Message thread.
+    void retireStage(PoolEntry& e) {
+        if (e.stage == nullptr) return;
+        const auto it = std::find_if(poolStages_.begin(), poolStages_.end(),
+                                     [&e] (const auto& st) { return st.get() == e.stage; });
+        if (it != poolStages_.end()) {
+            if (e.ran) retiredStages_.push_back({ std::move(*it), audioClock_.load(std::memory_order_seq_cst) });
+            poolStages_.erase(it);                     // not ran: freed here
+        }
+        e.stage = nullptr;
+    }
+
+    void freeRetired() {
+        const auto now = audioClock_.load(std::memory_order_seq_cst);
+        std::erase_if(retiredStages_, [now] (const RetiredStage& r) { return now > r.at; });
+    }
+
+    // A fresh stage for every copy (retireStage says why none is reused), at the player's numbers.
+    std::unique_ptr<felitronics::nam::NamStage> freshStage() const {
+        auto st = std::make_unique<felitronics::nam::NamStage>();
+        if (prepared_) st->prepare(fs_, maxBlock_);
+        return st;
+    }
+
+    bool runBySlot(const PoolEntry& e) const {
+        return e.stage != nullptr && (slotStage_[0].load(std::memory_order_seq_cst) == e.stage
+                                      || slotStage_[1].load(std::memory_order_seq_cst) == e.stage);
+    }
+
+    // Copies out of the set go — but not one a slot is running (it goes when the slot moves off it), nor one whose job
+    // is out (its delivery decides: it lands if the law still asks for it, and goes if not).
+    void dropUnwanted() {
+        std::size_t w = 0;
+        for (std::size_t i = 0; i < pool_.size(); ++i) {
+            if (! pool_[i].wanted && ! runBySlot(pool_[i]) && pool_[i].state != Pre::InFlight) {
+                retireStage(pool_[i]);
+                continue;
+            }
+            if (w != i) pool_[w] = pool_[i];
+            ++w;
+        }
+        pool_.resize(w);
+    }
+
+    // The set was ready once since load(): from here a copy it lacks waits for the law's ask (takePreloadJob).
+    void noteBuilt() {
+        if (! preloadBuilt_ && preloadProgress().ready()) preloadBuilt_ = true;
+    }
+
+    // THE SET, made again: for the panel sounding and then the others nearest first (setPreload). Every (capture, slot)
+    // the plan can name is found by asking the plan itself — at every knot, between every two, at both ends, with two
+    // models and with one (stepped) — so the set is the law's own reach, not a second account of it.
+    void rebuildPreload() {
+        noteBuilt();                                   // a set that was ready stays "built" across the change
+        preloadStale_ = false;
+        const auto& d = stage_.device;
+        preloadPanel_.clear();
+        for (const auto& k : sel_.knots) preloadPanel_.push_back(k.file);
+        preloadAxes_.clear();
+        for (const auto& c : d.controls)
+            if (c.name != dial_) {
+                const auto v = axes_.find(c.name);
+                preloadAxes_.push_back(v == axes_.end() ? std::string() : v->second);
+            }
+        std::vector<std::pair<std::uint64_t, int>> want;
+        const auto reach = [&] (const Settings& ax) {
+            std::vector<std::pair<std::uint64_t, int>> got;
+            const auto put = [&] (const Selection& sl, bool one) {
+                const auto pl = slotPlan(sl, d);
+                for (int i = 0; i < 2; ++i) {
+                    if (pl.file[i] < 0 || (one && i == (pl.targetB >= 0.5 ? 0 : 1))) continue;
+                    const std::pair<std::uint64_t, int> c { modelIdOf(pl.file[i]), i };
+                    if (c.first != 0 && std::find(got.begin(), got.end(), c) == got.end()) got.push_back(c);
+                }
+            };
+            const auto base = select(d, ax, dial_, dialDeg_, shape_, topExtend_);
+            std::vector<double> at { dialDeg_, 0.0, (double) dialSweep_ };
+            for (std::size_t k = 0; k < base.knots.size(); ++k) {
+                at.push_back(base.knots[k].deg);
+                if (k + 1 < base.knots.size()) at.push_back(0.5 * (base.knots[k].deg + base.knots[k + 1].deg));
+            }
+            for (const double deg : at) {
+                const auto sl = select(d, ax, dial_, deg, shape_, topExtend_);
+                put(sl, false);
+                put(steppedSelection(sl, -1, kStepDeadband), true);
+            }
+            return got;
+        };
+        const auto merge = [&] (const std::vector<std::pair<std::uint64_t, int>>& got) {
+            for (const auto& c : got) if (std::find(want.begin(), want.end(), c) == want.end()) want.push_back(c);
+        };
+        merge(reach(axes_));                                           // the panel sounding: always whole
+        // …then the other panels: the captured combinations of the other controls, nearest first.
+        std::vector<std::pair<int, Settings>> panels;
+        for (const auto& f : d.files) {
+            Settings ax = axes_;
+            int far = 0;
+            for (const auto& [name, value] : f.settings) {
+                if (name == dial_) continue;
+                if (ax[name] != value) { ax[name] = value; ++far; }
+            }
+            if (far == 0) continue;
+            bool seen = false;
+            for (const auto& p : panels) if (p.second == ax) { seen = true; break; }
+            if (! seen) panels.emplace_back(far, std::move(ax));
+        }
+        std::stable_sort(panels.begin(), panels.end(), [] (const auto& x, const auto& y) { return x.first < y.first; });
+        for (const auto& p : panels) {
+            const auto got = reach(p.second);
+            std::size_t fresh = 0;
+            for (const auto& c : got) if (std::find(want.begin(), want.end(), c) == want.end()) ++fresh;
+            if (want.size() + fresh <= (std::size_t) preloadCap_) merge(got);
+        }
+        // The pool follows: copies in the set keep their state, in the set's order; the rest are dropped.
+        std::vector<PoolEntry> next;
+        next.reserve(want.size() + pool_.size());
+        for (const auto& c : want) {
+            const int k = findEntry(c.first, c.second);
+            PoolEntry e;
+            if (k >= 0) { e = pool_[(std::size_t) k]; pool_[(std::size_t) k].stage = nullptr; pool_[(std::size_t) k].model = 0; }
+            else { e.model = c.first; e.slot = c.second; }
+            e.wanted = true;
+            next.push_back(e);
+        }
+        for (auto& e : pool_) if (e.model != 0) { e.wanted = false; next.push_back(e); }
+        pool_ = std::move(next);
+        dropUnwanted();
+    }
+
+    // The law's ask, answered from the pool where it can be: a prepared copy lands now, a copy that failed is reported.
+    // Neither is a job. (An ask for a copy still to be prepared is takePreloadJob's.)
+    void servePreloadAsk() {
+        if (preloadCap_ <= 0 || ! loaded_) return;
+        const auto ask = loadAsk_.load(std::memory_order_acquire);
+        if (ask == 0) return;
+        const auto id = ask >> 1;
+        const int slot = (int) (ask & 1u);
+        const int k = id == 0 || id > models_.size() ? -1 : findEntry(id, slot);
+        if (k < 0) return;
+        if (pool_[(std::size_t) k].state == Pre::Ready) landFromPool((std::size_t) k);
+        else if (pool_[(std::size_t) k].state == Pre::Failed) failSlot(slot);
+    }
+
+    void landFromPool(std::size_t k) {
+        auto& e = pool_[k];
+        // A COPY TAKEN AGAIN HOLDS ITS LAST VISIT — the network's lanes and the rate-matcher's — where a load starts clean.
+        // A capture with a field owes the law a warm-up, which feeds that whole memory out before it is heard. One with
+        // none is heard at once, and off the model rate its matcher would replay the tail of its last visit (measured
+        // 0.0139 at 44.1 kHz on the fixture) — so it is drained to the silence state here first (NamStage::reset: a
+        // memoryless capture's drain is its matcher's few samples). Here, because nothing runs it: it left its slot at an
+        // earlier landing, and the slot has run a block since — the law asked again after it.
+        if (e.stage->prewarmSamples() <= 0) e.stage->reset();
+        e.ran = true;                         // from the store in land() on, the audio thread may hold its address
+        land(e.slot, *e.stage, e.model);
+        dropUnwanted();                       // the copy the slot ran before, if the set has moved on without it
+    }
+
+    // A JOB FOR THE SET: the law's ask first; then — only while a job costs the sound nothing — the next copy the set
+    // lacks. That is so until the set is first ready after a load (the host is silent then: the worklet is, and a host
+    // that plays through its first build opted into it), and while the host says so (setPreloadIdle). After that a copy
+    // the set lacks — a panel past the cap, a file to fetch again — waits for the law to ask for it, as it would without
+    // the preload: a switch while playing never runs more jobs than the player without it. Never before prepare():
+    // there are no numbers to prepare a copy at.
+    std::optional<LoadJob> takePreloadJob() {
+        servePreloadAsk();
+        if (! prepared_) return std::nullopt;
+        noteBuilt();
+        int k = -1;
+        if (const auto ask = loadAsk_.load(std::memory_order_acquire); ask != 0) {   // the law's ask first
+            const auto id = ask >> 1;
+            const int slot = (int) (ask & 1u);
+            if (id == 0 || id > models_.size()) {                  // an ask that outlived its pack
+                loadAsk_.store(0, std::memory_order_release);
+                landFail_.store(slot + 1, std::memory_order_release);
+                return std::nullopt;
+            }
+            k = findEntry(id, slot);
+            if (k < 0) {                                           // outside the set: a copy for this ask alone
+                PoolEntry e; e.model = id; e.slot = slot; e.wanted = false;
+                pool_.push_back(e);
+                k = (int) pool_.size() - 1;
+            }
+            const auto st = pool_[(std::size_t) k].state;
+            if (st != Pre::Empty && st != Pre::Unfetched) k = -1;   // ready or failed: answered above; in flight: out
+        }
+        if (k < 0 && (! preloadBuilt_ || preloadIdle_))
+            for (std::size_t i = 0; i < pool_.size(); ++i)
+                if (pool_[i].wanted && pool_[i].state == Pre::Empty) { k = (int) i; break; }
+        if (k < 0) return std::nullopt;
+        auto& e = pool_[(std::size_t) k];
+        e.state = Pre::InFlight;
+        const auto& m = models_[(std::size_t) e.model - 1];
+        LoadJob job;
+        job.slot = e.slot; job.model = e.model; job.fileId = m.id; job.bytes = m.bytes;
+        job.source = source_; job.sampleRate = fs_; job.maxBlock = maxBlock_; job.generation = gen_;
+        job.preload = true;
+        jobOut_ = true;
+        return job;
+    }
+
+    void deliverPreload(Loaded loaded) {
+        const auto& job = loaded.job;
+        const int k = findEntry(job.model, job.slot);
+        if (k < 0 || pool_[(std::size_t) k].state != Pre::InFlight) return;   // the set moved on without it
+        auto& e = pool_[(std::size_t) k];
+        if (loaded.model != nullptr) {
+            auto st = freshStage();
+            if (st->install(std::move(loaded.model))) {
+                e.stage = st.get();
+                poolStages_.push_back(std::move(st));
+                e.state = Pre::Ready;
+            } else {
+                e.state = Pre::Failed;                                         // the fresh stage goes with `st`
+            }
+        } else {
+            e.state = loaded.bytes == nullptr || loaded.bytes->empty() ? Pre::Unfetched : Pre::Failed;
+        }
+        // The law's ask, if this is it, is answered now — where a slot's own job lands, on its deliver().
+        const auto ask = loadAsk_.load(std::memory_order_acquire);
+        if (ask != 0 && (ask >> 1) == job.model && (int) (ask & 1u) == job.slot) {
+            if (e.state == Pre::Ready) landFromPool((std::size_t) k);
+            else failSlot(job.slot);
+        }
+        dropUnwanted();                       // a copy outside the set the law no longer asks for (a slot's is kept)
+        noteBuilt();
     }
 
     // How many samples this model owes before it may be heard, in THIS rate: its receptive field,
@@ -2211,6 +2604,26 @@ private:
 
     // the mailboxes (message → audio, audio → message)
     felitronics::nam::NamStage nam_[2];
+    // WHICH STAGE EACH SLOT RUNS: its own nam_[i], or — preloading (setPreload) — a stage of the pool that holds the
+    // capture prepared for that slot. Written on the message thread at a landing (the instant an install would be) and
+    // by unload(); read by the audio thread, which runs whatever it names, and by latencySamples().
+    std::atomic<felitronics::nam::NamStage*> slotStage_[2] { &nam_[0], &nam_[1] };
+
+    // THE AUDIO CLOCK: process() and reset() tick it before they read slotStage_; the preload frees a copy a slot ran
+    // only once it has moved past the copy's retirement (retireStage).
+    std::atomic<std::uint64_t> audioClock_ { 0 };
+
+    // ---- the preload (setPreload), message thread ----
+    std::vector<std::unique_ptr<felitronics::nam::NamStage>> poolStages_;   // the copies held; the audio thread reads two
+    std::vector<RetiredStage> retiredStages_;                               // copies a slot ran, freed past their tag
+    std::vector<PoolEntry>   pool_;                                         // the set first, in order, then the unwanted
+    std::vector<int>         preloadPanel_;                                 // the knots' file entries the set was made for
+    std::vector<std::string> preloadAxes_;                                  // …and the other controls' settings (samePanel)
+    int                      preloadNext_ = 0;                              // setPreload: taken by the next load()
+    int                      preloadCap_ = 0;                               // the pack's: 0 = not preloading
+    bool                     preloadStale_ = false;                         // load(): the set is to be made
+    bool                     preloadBuilt_ = false;                         // ready once since load() (takePreloadJob)
+    bool                     preloadIdle_ = false;                          // setPreloadIdle
     std::atomic<std::uint64_t> reqWant_[2] { 0, 0 };
     std::atomic<float>         reqTarget_ { 0.0f };
     std::atomic<std::uint64_t> loadAsk_ { 0 };          // (model << 1) | slot; 0 = nothing asked

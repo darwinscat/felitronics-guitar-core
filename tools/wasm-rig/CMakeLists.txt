@@ -99,6 +99,10 @@ if(FELITRONICS_GUITAR_BUILD_TESTS AND NOT EMSCRIPTEN)
     target_include_directories(felitronics_rig_abi_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(felitronics_rig_abi_tests PRIVATE felitronics::rig_abi felitronics::test_support)
     add_test(NAME felitronics_rig_abi_tests COMMAND felitronics_rig_abi_tests)
+    add_executable(felitronics_rig_preload_tests tests/RigPreloadTests.cpp)
+    target_include_directories(felitronics_rig_preload_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    target_link_libraries(felitronics_rig_preload_tests PRIVATE felitronics::rig_abi felitronics::test_support)
+    add_test(NAME felitronics_rig_preload_tests COMMAND felitronics_rig_preload_tests)
 
     # The native half of the node suite: a pack through this same ABI on the processor's schedule.
     add_executable(fc_rig_render fc_rig_render.cpp)

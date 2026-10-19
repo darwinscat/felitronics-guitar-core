@@ -26,7 +26,7 @@ Signal order, per block:
 |---|---|
 | `prepare(rate, maxBlock, channels ≤ 2, scopeSamples = 2048)` | message, never while `process()` runs |
 | `load(rig, source)` / `unload()` | message |
-| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setStandby` / `setFeedDb` | message |
+| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setPreload` / `setPreloadIdle` / `setStandby` / `setFeedDb` | message |
 | `service()` then `takeLoadJob()` | message, from a timer — a few times a second at least |
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
@@ -96,6 +96,62 @@ machine, which starts with one and turns the blend on only once it has measured 
 
 The order, the invariants and the one exception are `nam::blendStepSingle`'s; the law owns the dip
 as it owns the weight.
+
+## The preload — every capture of the pack, prepared before it is asked for
+
+For a host whose loads stall its audio: a browser AudioWorklet runs the load job ON the audio thread (24 – 49 ms a
+capture in Chromium), so a turn of the gain dial across captures underran at every capture it reached.
+`setPreload(true, maxModels = kPreloadWholePack)` — off by default, and off the player is the one above, bit for bit —
+takes effect at the next `load()`:
+
+- the player hands out jobs for its SET — the same `LoadJob`, run and delivered as ever, one at a time — until every
+  copy in it is prepared (`preloadProgress()`: `total`, `settled`, `failed`, `held`, `ready()`); a job the law asks
+  for meanwhile goes first. No job before `prepare()`: there are no numbers to prepare a copy at;
+- from then on neither a turn of the gain dial nor a switch within the set hands out a job: a slot that wants a
+  capture takes its prepared copy at the next `service()` — the instant a delivered job would have landed it — and
+  the law warms and crossfades it, or dips to it with one model, as before. The slot runs the copy's own `NamStage`;
+  the two slots' own stages stay empty;
+- THE SET is the panel sounding — every (capture, slot) the plan can name along the dial, asked of the plan itself
+  at every knot, between every two and at both ends, with two models and with one — whole, whatever the cap; then
+  the pack's other panels (the captured combinations of the other controls), nearest first (one control away, then
+  two; ties in the manifest's order), while the set stays within `maxModels`. The default, `kPreloadWholePack`, is
+  every panel. One copy per (capture, slot): the two slots hold one file at once at the dial's ends and across a
+  link. The site's packs: eleven positions, nine files, **eleven copies** a panel. A panel is told apart by its
+  knots' files and the other controls' settings, so a pack with no gain dial has panels too;
+- UNDER A CAP, a switch to a panel outside the set makes the set again around it: copies it keeps stay, the rest
+  are freed (one a slot runs, once the slot moves off it), and the copies it lacks are handed out only as the law
+  asks for them — as many jobs as the player without the preload runs there, never more; they load while it plays.
+  `setPreloadIdle(true)` — the host's word that a job costs its sound nothing now (silent, or jobs on a worker) —
+  hands out the rest as before ready;
+- a copy settles prepared, failed (not a capture) or unfetched (the source answered nothing): the set is ready without
+  the last two, the law is told the load failed when it asks, and an unfetched file is a job again then — as without
+  the preload. That and a panel past the cap are the only jobs after ready;
+- A COPY IS FREED WHOLE — its `NamStage` with its capture — when it leaves the set or `unload()` takes the pack: at
+  once if no slot ever ran it; otherwise by the first `service()` after the audio thread has entered `process()`
+  again (`process()` ticks an audio clock before it reads a slot's stage, and a retired copy is freed once the clock
+  has passed the moment the slots let go of it). A pool stage is never cleared and reused: `NamStage` frees what it
+  retires only from its own `process()`, which a copy no slot runs never gets. Measured on the fixture: unload,
+  two blocks and `service()` leave 0.3 % of what the pack and its set held; 200 evicting switches grow the heap by
+  16 KB (a set is 509 KB);
+- `latencySamples()` and the `sounding*` read-outs dereference the slots' stages: message thread (or inside
+  `process()`), never a third thread;
+- stand-by, `setMaxModels`, the cold rest, `reset()`, a re-prepare at another rate (the copies are re-prepared in
+  place: no job), the scope are untouched.
+
+Memory: one copy is one capture prepared — **2.8 MB** natively and in the wasm module for the site's WaveNets
+(`NamStage` builds two NAM instances, stereo, whatever the host plays). The whole pack: **11 copies (~31 MB)** for
+X88-IR Crunch and V4 Sheriff Ch1, **44 (~123 MB)** for IR-X Ch2, **66 (~185 MB)** for IR-X Ch1 PowerAmp (the wasm
+module read 179.4 MiB with it, against 24.1 MiB without a preload). A cap trades that for loads while playing.
+
+A copy taken again holds what its last visit left in it, where a load starts clean. A capture with a field owes the law
+its warm-up, which feeds that memory out before it is heard — so at the model rate the preloaded player is bit for bit
+the plain one on the same dial path for WaveNets and direct Linears, with two exceptions: a dense `Linear` on NAM's
+partitioned FFT keeps its engine's clock, which nothing rewinds (`NamStage.h`) — about 1e-7 against a fresh load
+(8.1e-8 on a 2001-tap fixture, guarded at 1e-6) — and an LSTM's cell is not emptied by anything finite: a recurrent
+copy taken again starts from its last visit (0.054 on the decaying-cell fixture). A capture with no field is heard at
+once, and off the model rate its rate-matcher would replay the tail of its last visit (0.0139 at 44.1 kHz on the
+fixture): it is drained to the silence state (`NamStage::reset` — its matcher's few samples) at the landing, which
+leaves the matcher's resumption floor (5.5e-6).
 
 ## The scope tap — OrbitAmp's ScopeTap, inside the player
 
