@@ -2,6 +2,47 @@
 
 # Changelog
 
+## Unreleased
+
+### rigplayer — the scope tap and stand-by (OrbitAmp's ScopeTap and PARK)
+
+- `RigPlayer::scopeRead(dry, wet, n)` / `scopeFrames()` / `scopeSize()`: the newest `kScopeSize` (2048, OrbitAmp's
+  `ScopeTap::size`; `prepare()`'s new fourth argument, 0 = no tap) samples of channel 0 at two points — the DI as fed
+  (after the pack's input level, held back by `latencySamples()` as the blend's dry is) and the models' mix (aligned,
+  weighed, through the law's gain; before the post tone, the blend knob and the output level) — written once per
+  block on the audio thread, read on any thread with the wet at the dry's RMS, as `ScopeTap::read` does. Lock-free:
+  the writer claims, fences, writes atomic floats and publishes; a read the writer may have reached is thrown away and
+  retried (`kScopeTries`), never handed out torn.
+- `RigPlayer::setStandby(on)` / `standingBy()`: PARK as the app's captured block plays it — the output crossfades over
+  BypassFade's 15 ms (linear, both ways, its own arithmetic) to a wire (the input at the latency, unity), and then
+  nothing runs: no models on audio, no tone, no law, no scope. Knobs moved meanwhile are taken on the way back; the
+  input level arrives rather than ramps. Stricter than the app on one point: a pause is silence (law 11c) — the filters,
+  convolvers, the dry ring and the slot delay lines are stopped when the fade ends and both stages are handed the
+  width-zero call, so nothing played before PARK is heard after it (the app's freeze replays 0.399 out of digital
+  silence on a 1500-sample capture).
+- `RigPlayer::unload()` clears what the law last said it holds: a device that stands by runs no law, and the old
+  pack's model ids named the new pack's models after a reload while parked.
+- The stand-by fade ends where `BypassFade`'s does — `approximatelyEqual` at JUCE's defaults, not `>= 1` (48 kHz in
+  60-sample blocks the walk up stops at 0.99999988; the player blended one sample more).
+- Never set, both are free and inaudible: four renders (the fixture at 48 kHz with a 1 → 2 → 1 switch and at 44.1 kHz
+  stereo with a reset, X88-IR Crunch, V4 Sheriff Ch1 at one model) are byte-identical to v0.4.0's.
+
+### fcrig — ABI 2
+
+- `fc_rig_scope_read`, `fc_rig_scope_frames`, `fc_rig_set_standby`, `fc_rig_set_feed_db` (the app's block IN — how hard
+  the captures are fed, on top of the pack's own input level, applied after the stand-by wire and before the dry tap,
+  restated against the pack held after every load; a change glides over about 10 ms like the player's other levels,
+  where the app ramps its IN over one host block). `FC_RIG_ABI_VERSION` 2; the processor needs 2.
+- The tap's points are the app's web spec (`Monitor.cpp:189-191`) and the site's tap around TONE3000's node, NOT the
+  app's own code, which taps around its whole player (`CapturedBlock.h:544-556`: the dry before the input level and
+  undelayed, the wet after the pack's tone stack and levels) — a pack with a post tone, a blend knob or an output level
+  draws another SHAPE there. A block processed with no input channel writes no tap.
+- `fcrig-worklet.js`: `{ scope: ArrayBuffer }` answered with the buffer, transferred back, holding the newest frame
+  (`{ scope, n, frames }`); `{ set: { feed } }` queued like any knob while the start decides; `{ standby }` (or
+  `{ set: { standby } }`) never queued — applied at once, the start paused while parked (no burst: a parked player
+  runs no network), the output the player's own while parked whatever the start's state, the start resumed on the
+  return. Queued like a knob, a `{ load }` while parked was silent for good.
+
 ## v0.4.0 — 2026-10-19
 
 ### fcrig — the pack player for a browser AudioWorklet
