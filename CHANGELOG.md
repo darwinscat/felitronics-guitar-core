@@ -2,6 +2,41 @@
 
 # Changelog
 
+## Unreleased
+
+### rigplayer — one model at a time
+
+`RigPlayer::setMaxModels(n)`, n 1 or 2 (message thread; anything else is refused). 2, the default, is the player as it
+was, bit for bit, except the first blocks after a load (below). 1 is for a host that can afford one network and not
+two — the browser demo on a slow machine: the gain dial steps to the nearest capture, with a deadband of a tenth of the
+gap around the capture sounding (`kStepDeadband`); the other slot is asked for nothing (no neighbour load job; one
+network on audio, plus the outgoing capture's bounded drain as it rests); and a change of capture is a dip instead of a
+crossfade — the gain falls over `kDipSeconds` (15 ms, OrbitAmp's `BypassFade` length), the outgoing capture rests, the
+incoming one is loaded (one job) or woken and fed its receptive field while nothing is heard, and the gain rises over
+the same 15 ms. A capture that lived in the resting slot comes back with a warm-up, not a load; crossing a link (one
+file at two angles of different parity) is a dip and a load. Either way while playing: 1 → 2 asks for the neighbour at
+weight zero and nothing of it is heard until it is fed — then, between two captures, the weight glides to the dial's
+blend; 2 → 1 on a capture rests the neighbour without a change, between two captures it dips to the nearer. New
+read-outs `runBlocks(slot)` and `pairBlocks()` count the blocks a slot's network ran, a resting capture's drain
+included. In `nam::BlendLaw`: `BlendPolicy::single` and the dip lengths, `blendStepSingle`, and `BlendStep::gainRamp`
+(a gain ramp that ends inside a block).
+
+### nam::BlendLaw — the gain waits for every weighted slot to be safe
+
+The two-slot law raised its gain as soon as either slot was safe to hear, while the weight still stood partly on the
+other. At a cold start the weight leaves the empty slot 0 while the neighbour loads first, and an empty `NamStage`
+passes its input through: v0.2.0 played the raw DI for the first four blocks of the travel, under a rising gain. The
+gain now rises only once no slot that is empty, in flight or unfed carries weight in the block, so those blocks are
+silent and the sound fades in once the weight has arrived. This is the one change to the default output; from there
+on it is v0.2.0's, sample for sample. The same rule makes a turn from one model to two silent until the slot the
+weight stands on is fed.
+
+### rigplayer — a load is offered to the host only after the block that asked has run
+
+The law's ask for a model used to be published before the two stages ran the block; a job thread pre-empting the
+audio thread could deliver the model in between, and the new, unfed capture played at the weight the block began
+with. The ask is now published after both stages. Nothing changes for a single-threaded host such as an AudioWorklet.
+
 ## v0.2.0 — 2026-10-19
 
 ### fcguitarfx — the amp's echo and room for a browser AudioWorklet
