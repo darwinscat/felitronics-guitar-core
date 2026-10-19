@@ -18,8 +18,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #   rigplayer felitronics::rigplayer   one device of a .orbitrig pack, playing               nam, convolution, lineareq, eq
 #   poweramp  felitronics::poweramp    the white-box tube power-amp trunk                    core, eq, oversampling, saturation
 #
-# And one C ABI over core's own stages, for the browser: tools/wasm — fc_guitar_fx, the amp's echo and room
-# (core's delay::TapeDelay + reverb::AmpReverb driven by the app's knobs), compiled to wasm by tools/wasm/build.sh.
+# And two C ABIs for the browser: tools/wasm — fc_guitar_fx, the amp's echo and room (core's delay::TapeDelay +
+# reverb::AmpReverb driven by the app's knobs), compiled to wasm by tools/wasm/build.sh; tools/wasm-rig — fc_rig, the
+# pack player (rigplayer) the app plays, compiled to wasm by tools/wasm-rig/build.sh.
 #
 # Consume — felitronics-core FIRST, then this; ONE core is resolved by the product that owns the graph:
 #   FetchContent_Declare(felitronics_core GIT_REPOSITORY <url> GIT_TAG <tag>)
@@ -37,6 +38,11 @@ option(FELITRONICS_GUITAR_WITH_NAM
 option(FELITRONICS_GUITAR_WITH_FX
        "Build the fc_guitar_fx C ABI (tools/wasm) over core's delay + reverb (felitronics-core v0.61.0+)"
        "${PROJECT_IS_TOP_LEVEL}")
+# The browser's pack player, the same way: this repository's own product, built when it is the top level and NAM is
+# on (it plays NAM captures); opt-in for a consumer.
+option(FELITRONICS_GUITAR_WITH_RIG
+       "Build the fc_rig C ABI (tools/wasm-rig) over felitronics::rigplayer (needs FELITRONICS_GUITAR_WITH_NAM)"
+       "${PROJECT_IS_TOP_LEVEL}")
 
 # --- felitronics-core, resolved by whoever owns the graph ---------------------------------------------
 # Top-level: this repository IS the owner, so it resolves core itself — a sibling checkout when there is
@@ -46,7 +52,7 @@ if(PROJECT_IS_TOP_LEVEL)
     include(FetchContent)
     set(FELITRONICS_GUITAR_FCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../felitronics-core" CACHE PATH
         "Local felitronics-core checkout (used if present); else the pinned release is fetched")
-    set(FELITRONICS_GUITAR_FCORE_TAG "v0.61.0" CACHE STRING
+    set(FELITRONICS_GUITAR_FCORE_TAG "v0.61.1" CACHE STRING
         "felitronics-core git tag to fetch when no local checkout is present")
     if(FELITRONICS_GUITAR_FCORE_DIR AND EXISTS "${FELITRONICS_GUITAR_FCORE_DIR}/CMakeLists.txt")
         message(STATUS "felitronics-core: local checkout — ${FELITRONICS_GUITAR_FCORE_DIR}")
@@ -103,6 +109,11 @@ if(FELITRONICS_GUITAR_WITH_FX)
                             "and felitronics::reverb); this core has neither. Use a newer core or set it OFF.")
     endif()
     add_subdirectory(tools/wasm)
+endif()
+
+# The browser's pack player: RigPlayer behind the fc_rig C ABI, and under emscripten the fcrig module.
+if(FELITRONICS_GUITAR_WITH_RIG AND FELITRONICS_GUITAR_WITH_NAM)
+    add_subdirectory(tools/wasm-rig)
 endif()
 
 if(FELITRONICS_GUITAR_BUILD_TESTS)

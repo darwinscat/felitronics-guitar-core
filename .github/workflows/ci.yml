@@ -89,9 +89,35 @@ jobs:
       - name: det-math manifest
         run: node build/_deps/felitronics_core-src/tools/lint/check-det-math.mjs --satellite
       - name: One allocation counter
-        run: node build/_deps/felitronics_core-src/tools/lint/check-alloc-counter.mjs modules tests tools/wasm
+        run: node build/_deps/felitronics_core-src/tools/lint/check-alloc-counter.mjs modules tests tools/wasm tools/wasm-rig
       - name: No long double
-        run: node build/_deps/felitronics_core-src/tools/lint/check-no-long-double.mjs modules tests tools/wasm
+        run: node build/_deps/felitronics_core-src/tools/lint/check-no-long-double.mjs modules tests tools/wasm tools/wasm-rig
+
+  wasm-rig:
+    name: wasm-rig (fcrig)
+    # The shipped pack player: NAM with exceptions on its own objects, SIMD128 — its own build.sh, its own job. Then
+    # the module in a worklet-shaped scope against the native render, on the fixture pack (the real packs are not
+    # public; FELITRONICS_GUITAR_RIG_PACKS adds them on a machine that has them).
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install emsdk 6.0.9
+        run: |
+          git clone --depth 1 --branch 6.0.9 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          "$HOME/emsdk/emsdk" install 6.0.9
+          "$HOME/emsdk/emsdk" activate 6.0.9
+          source "$HOME/emsdk/emsdk_env.sh"
+          echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
+          echo "PATH=$PATH"   >> "$GITHUB_ENV"
+      - name: fcrig — build (pinned core, NAM, namz)
+        run: tools/wasm-rig/build.sh
+      - name: fcrig — the shipped module in a worklet-shaped scope, against the native render
+        run: |
+          cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_GUITAR_BUILD_TESTS=ON \
+                -DFELITRONICS_GUITAR_RIG_WASM_DIR="$PWD/tools/wasm-rig/build"
+          cmake --build build-native --target fc_rig_render -j "$(nproc)"
+          ctest --test-dir build-native -R felitronics_rig_wasm_parity --output-on-failure --no-tests=error
 
   # ---- nightly -------------------------------------------------------------------------------------------
   changed:

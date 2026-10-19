@@ -2,6 +2,29 @@
 
 # Changelog
 
+## Unreleased
+
+### fcrig — the pack player for a browser AudioWorklet
+
+`tools/wasm-rig`: `felitronics::rigplayer` behind a C ABI (`tools/fc_rig_abi.h`, ABI 1) — the manifest in, the knobs by
+the pack's names, the load job carried across the boundary (taken, the capture's bytes handed in, run, delivered),
+audio in place — compiled to wasm with SIMD128 and Eigen's SSE path, and `fcrig-worklet.js`, a processor that asks the
+page for each capture over its port and, at its start and again at every `{ load }`, times one capture on the audio
+thread and turns the blend of two on only when that burst is valid evidence and one render costs at most a quarter of
+the quantum; a first capture that fails to load ends the start at one model, and a `{ need }` the page leaves
+unanswered is answered by the processor itself after `needTimeoutMs` (10 s). C++ exceptions only on the NAM objects (Oleh,
+19.10.2026), in wasm's legacy encoding. The ABI renders bit for bit as RigPlayer driven directly; the module within
+2e-5 of the native render on real packs. felitronics-core pinned to v0.61.1.
+
+### Fixed
+
+- `RigPlayer::deliver` no longer keeps an EMPTY answer of the `ModelSource` as the file's bytes. An empty answer is
+  the host's "could not fetch it"; kept, it made every later visit run on nothing without asking, so one failed fetch
+  left the capture dead until the pack was loaded again. Now the file is asked for again on its next visit (bytes
+  that are not a model are still kept: they are the file).
+- The allocation promise of `RigPlayer::process()` is stated as it is: nothing with Linear and WaveNet captures; an
+  LSTM or ConvNet capture allocates inside the pinned NAM.
+
 ## v0.3.0 — 2026-10-19
 
 ### rigplayer — one model at a time
