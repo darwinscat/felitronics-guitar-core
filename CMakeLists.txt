@@ -5,7 +5,7 @@
 # architectures through static initialisers, and plain static linking silently drops them), so poweramp
 # alone (FELITRONICS_GUITAR_WITH_NAM=OFF) still configures on 3.22.
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_guitar_core VERSION 0.5.0 LANGUAGES CXX)
+project(felitronics_guitar_core VERSION 0.5.1 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

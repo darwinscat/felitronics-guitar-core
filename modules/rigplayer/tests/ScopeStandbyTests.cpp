@@ -2,9 +2,10 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-guitar-core — see LICENSE.
 
 // The scope tap and stand-by (RigPlayer::scopeRead, RigPlayer::setStandby) — OrbitAmp's ScopeTap and its PARK.
-//   · the tap's two points, against the player's own stages: the pack's input level reaches both sides, the pre tone
-//     only the wet, the post tone and the output level neither;
-//   · the alignment: the dry is held back by the rate-match exactly as the blend's dry is, a capture's own lag stays;
+//   · the tap's two points are the app's (CapturedBlock.h:543-556), against the player's own stages, bit for bit: the
+//     dry is the input as handed in (undelayed, before the pack's input level and the pre tone), the wet is the
+//     player's output (pre tone, models, post tone, blend knob, output level) — the stand-by fade is not in it;
+//   · the alignment, the app's: the dry undelayed, the wet trailing it by a capture's own lag and by the rate-match;
 //   · the RMS match in the reader (ScopeTap::read);
 //   · stand-by: the fade's length both ways (BypassFade's arithmetic), the wire while stood by, the tap frozen, the
 //     stages not run, no job asked, a pause that is silence, knobs taken on the way back, the input level arriving;
@@ -72,6 +73,7 @@ struct Spec {
     std::string early, mid, late;   // the captures at 60, 150, 240
     double inDb = 0.0, outDb = 0.0;
     bool tone = false;              // a post high shelf "treble" and a pre curve "bass"
+    bool blend = false;             // a blend knob "mix": full wet at 300 (the default), half and half at 150
 };
 
 namz::rig::Rig rigOf(const Spec& s) {
@@ -102,6 +104,18 @@ namz::rig::Rig rigOf(const Spec& s) {
             p1.db.push_back(f <= 200.0 ? 6.0 : f >= 2000.0 ? 0.0 : 6.0 * (1.0 - std::log(f / 200.0) / std::log(10.0)));
         bass.positions = { p0, p1 };
         st.tone = { treble, bass };
+    }
+    if (s.blend) {
+        namz::rig::Blend mix;
+        mix.name = "mix"; mix.sweep = 300; mix.reference = "300"; mix.dryEnd = "0"; mix.defaultValue = "300";
+        mix.dryLevelDb = -6.0;
+        mix.grid.fLo = 20.0; mix.grid.fHi = 20000.0; mix.grid.points = 25;
+        mix.dryDb.assign(25, 0.0);
+        namz::rig::BlendPosition dry;  dry.value  = "0";   dry.norm  = 0.0; dry.dryDb  = 0.0;    dry.wetDb  = -120.0;
+        namz::rig::BlendPosition half; half.value = "150"; half.norm = 0.5; half.dryDb = 0.0;    half.wetDb = 0.0;
+        namz::rig::BlendPosition wet;  wet.value  = "300"; wet.norm  = 1.0; wet.dryDb  = -120.0; wet.wetDb  = 0.0;
+        mix.positions = { dry, half, wet };
+        st.blend = { mix };
     }
     r.chain = { st };
     return r;
@@ -154,52 +168,127 @@ Frame read(const RigPlayer& p, int n) {
 }
 bool same(const std::vector<float>& a, const std::vector<float>& b) { return a == b; }
 
+/** The frame scopeRead must hand out for a raw dry and wet: ScopeTap::read's level match as RigPlayer::scopeRead spells
+    it — sums in double, the same floor, one float factor — so a frame can be held to its two raw sides bit for bit. */
+Frame expected(const std::vector<float>& dry, const std::vector<float>& wet) {
+    Frame f; f.dry = dry; f.wet = wet; f.n = (int) dry.size();
+    double dr = 0.0, wr = 0.0;
+    for (std::size_t i = 0; i < dry.size(); ++i) { dr += (double) dry[i] * dry[i]; wr += (double) wet[i] * wet[i]; }
+    if (wr > 1.0e-12 && dr > 1.0e-12) {
+        const float k = (float) std::sqrt(dr / wr);
+        for (auto& v : f.wet) v *= k;
+    }
+    return f;
+}
+
+/** The last `blocks` blocks of a bench, played now: what went in and what came out. */
+std::pair<std::vector<float>, std::vector<float>> history(Bench& b, int blocks) {
+    std::vector<float> in, out;
+    for (int k = 0; k < blocks; ++k) {
+        b.settle(1);
+        in.insert(in.end(), b.x.begin(), b.x.end());
+        out.insert(out.end(), b.y.begin(), b.y.end());
+    }
+    return { in, out };
+}
+
+/** juce::approximatelyEqual at its defaults (absolute FLT_MIN, relative FLT_EPSILON) — BypassFade's end test. */
+bool fadeEnd(float g, float want) {
+    const float d = std::abs(g - want);
+    return d <= std::numeric_limits<float>::min() || d <= std::numeric_limits<float>::epsilon() * std::max(std::abs(g), std::abs(want));
+}
+
+/** BypassFade::advance and BypassFade::blend (BypassFade.h:58-108), transcribed: the gain of every sample of a block —
+    or none, when the block sits at the walk's end and nothing is blended (the device alone up, the wire alone down). */
+struct Walk {
+    float g, per;
+    std::vector<float> block(int n, bool up) {
+        const float want = up ? 1.0f : 0.0f;
+        if (fadeEnd(g, want)) return {};
+        const float from = g;
+        const float needed = std::abs(want - g) / std::max(1.0e-9f, per);
+        const int ramp = std::clamp((int) std::ceil(needed), 1, n);
+        const float step = per * (float) ramp;
+        g = up ? std::min(want, g + step) : std::max(want, g - step);
+        const float st = (g - from) / (float) ramp;
+        std::vector<float> out((std::size_t) n);
+        for (int i = 0; i < n; ++i) out[(std::size_t) i] = i < ramp ? from + st * (float) i : g;
+        return out;
+    }
+};
+
 // ---------------------------------------------------------------------------------------------------------------------
 
 void tapPoints() {
-    group("the tap's points, against the player's own stages");
+    group("the tap's points are the app's (CapturedBlock.h:543-556): the input as handed in, the player's output");
+    // CapturedBlock::process copies the block's input before the drive and before player.process (:543-544) and writes
+    // the scope after it (:554-556): the dry is what the player is HANDED — undelayed, before the pack's input level and
+    // the pre tone — and the wet is everything the player does. Held to both raw sides bit for bit, at 48 kHz and at
+    // 44.1 kHz against 48 kHz captures (a rate-match, latencySamples() > 0), with every stage of the player in use.
     const Spec base { gainModel(0.5), gainModel(0.8), gainModel(1.5), -6.0, 4.5, true };
+    for (const double fs : { 48000.0, 44100.0 }) {
+        Bench b(base, fs);
+        (void) b.p.setDial("treble", 240.0);
+        (void) b.p.setDial("bass", 200.0);
+        b.settle(120);
+        const auto [in, out] = history(b, 16);
+        const Frame f = read(b.p, 2048), want = expected(in, out);
+        const std::string at = fs == 48000.0 ? std::string("48 kHz")
+            : "44.1 kHz against 48 kHz captures (latencySamples() = " + std::to_string(b.p.latencySamples()) + ")";
+        ok(f.n == 2048 && same(f.dry, in), at + ": the dry is the input as handed in — undelayed, before the pack's "
+           "input level (-6 dB) and the pre tone — bit for bit");
+        ok(f.n == 2048 && same(f.wet, want.wet), at + ": the wet is the player's output — pre tone, models, post tone, "
+           "output level (+4.5 dB) — bit for bit (at the dry's RMS, as read)");
+    }
+
     const auto frameOf = [](const Spec& s, const char* knob, double deg) {
         Bench b(s, 48000.0);
         if (knob != nullptr) (void) b.p.setDial(knob, deg);
         b.settle(80);
-        return std::pair<Frame, std::vector<float>> { read(b.p, 2048), b.y };
+        return read(b.p, 2048);
     };
-    const auto [ref, refOut] = frameOf(base, nullptr, 0.0);
+    const Frame ref = frameOf(base, nullptr, 0.0);
     ok(ref.n == 2048, "a full tap after 80 blocks (" + std::to_string(ref.n) + ")");
-
-    const auto [post, postOut] = frameOf(base, "treble", 300.0);
-    ok(same(post.dry, ref.dry) && same(post.wet, ref.wet) && ! same(postOut, refOut),
-       "the post tone moves the output and neither side of the tap");
-    Spec louder = base; louder.outDb = -3.0;
-    const auto [outL, outLOut] = frameOf(louder, nullptr, 0.0);
-    ok(same(outL.dry, ref.dry) && same(outL.wet, ref.wet) && ! same(outLOut, refOut),
-       "the pack's output level moves the output and neither side of the tap");
-    const auto [pre, preOut] = frameOf(base, "bass", 300.0);
+    const Frame post = frameOf(base, "treble", 300.0);
+    ok(same(post.dry, ref.dry) && ! same(post.wet, ref.wet), "the post tone moves the wet and not the dry");
+    const Frame pre = frameOf(base, "bass", 300.0);
     ok(same(pre.dry, ref.dry) && ! same(pre.wet, ref.wet), "the pre tone moves the wet and not the dry");
     Spec hotter = base; hotter.inDb = 0.0;
-    const auto [inL, inLOut] = frameOf(hotter, nullptr, 0.0);
-    double worst = 0.0;
-    const double k = std::pow(10.0, 6.0 / 20.0);
-    for (std::size_t i = 0; i < 2048; ++i) worst = std::max(worst, std::abs((double) inL.dry[i] - k * ref.dry[i]));
-    ok(worst < 1e-6, "the pack's input level reaches the dry (6 dB more in, 6 dB more on the dry; worst " + std::to_string(worst) + ")");
+    ok(same(frameOf(hotter, nullptr, 0.0).dry, ref.dry),
+       "the pack's input level does not reach the dry: it is the player's, and the dry is taken before the player");
+    const Spec mixed { delayModel(5, 0.5), delayModel(5, 0.5), delayModel(5, 0.5), 0.0, 0.0, false, true };
+    const Frame wetEnd = frameOf(mixed, nullptr, 0.0), halfway = frameOf(mixed, "mix", 150.0);
+    ok(wetEnd.n == 2048 && same(halfway.dry, wetEnd.dry) && ! same(halfway.wet, wetEnd.wet),
+       "the blend knob moves the wet and not the dry (half the DI beside a capture that lags 5 samples: a comb)");
 
-    // The dry IS the DI as fed: the input times the pack's input level, sample for sample.
+    // The stand-by fade is the app's BypassFade, which blends AFTER the block has tapped (PluginProcessor.cpp:1538,
+    // behind blk.process at :1516): a device fading out draws what the same device not fading draws.
+    {
+        Bench fading(base, 48000.0), steady(base, 48000.0);
+        fading.settle(40);
+        steady.settle(40);
+        fading.p.setStandby(true);
+        fading.settle(3);                     // 384 of the fade's 720 samples
+        steady.settle(3);
+        const Frame a = read(fading.p, 2048), c = read(steady.p, 2048);
+        ok(a.n == 2048 && same(a.dry, c.dry) && same(a.wet, c.wet) && ! same(fading.y, steady.y),
+           "a fade under way is heard and not drawn: the tap is the device's, the fade comes after it");
+    }
+
+    // The dry IS the input, sample for sample, and ScopeTap::read's level match brings a gain capture back as the dry.
     Bench b(Spec { gainModel(0.5), gainModel(0.5), gainModel(0.5), -6.0, 0.0, false }, 48000.0);
     b.settle(80);
     const Frame f = read(b.p, kBlock);
-    const float g = (float) std::pow(10.0, -6.0 / 20.0);
-    bool dryIsFed = f.n == kBlock;
-    for (int i = 0; i < kBlock && dryIsFed; ++i) dryIsFed = f.dry[(std::size_t) i] == b.x[(std::size_t) i] * g;
-    ok(dryIsFed, "the dry tap is the last block's input times the pack's input level, bit for bit");
-    // ScopeTap::read's level match: a 0.5 capture comes back at the dry's level.
+    bool dryIsIn = f.n == kBlock;
+    for (int i = 0; i < kBlock && dryIsIn; ++i) dryIsIn = f.dry[(std::size_t) i] == b.x[(std::size_t) i];
+    ok(dryIsIn, "the dry tap is the last block's input itself, bit for bit");
     double wd = 0.0;
     for (int i = 0; i < kBlock; ++i) wd = std::max(wd, (double) std::abs(f.wet[(std::size_t) i] - f.dry[(std::size_t) i]));
     ok(wd < 1e-6, "the wet is read at the dry's RMS — a gain capture reads back as the dry (worst " + std::to_string(wd) + ")");
 }
 
 void alignment() {
-    group("aligned sample for sample — the rate-match taken out, a capture's own lag kept");
+    group("aligned as the app aligns it: the dry undelayed, the wet trailing by a capture's own lag and the rate-match");
     {
         Bench b(Spec { delayModel(5, 0.5), delayModel(5, 0.5), delayModel(5, 0.5), 0.0, 0.0, false }, 48000.0);
         b.settle(80);
@@ -213,25 +302,69 @@ void alignment() {
         ok(f.n == 2048 && worst < 1e-6, "48 kHz, a capture that lags 5 samples: the wet is the dry 5 samples later "
            "(one factor " + std::to_string(c) + ", worst " + std::to_string(worst) + ")");
     }
+    // At a host rate other than the pack's the player's output is late by its rate-match, and the app's picture shows
+    // it so: CapturedBlock.h:544 copies the dry undelayed, :556 writes the wet as the player hands it out.
     Bench b(Spec { gainModel(0.5), gainModel(0.5), gainModel(0.5), 0.0, 0.0, false }, 44100.0);
     b.settle(120);
     const int lat = b.p.latencySamples();
-    std::vector<float> history;   // the last 2048 inputs, to place the dry against
-    for (int k = 0; k < 16; ++k) {
-        b.settle(1);
-        history.insert(history.end(), b.x.begin(), b.x.end());
-    }
+    const auto [in, out] = history(b, 16);
     const Frame f = read(b.p, 2048);
-    bool held = f.n == 2048 && lat > 0;
-    for (int i = lat; i < 2048 && held; ++i) held = f.dry[(std::size_t) i] == history[(std::size_t) (i - lat)];
-    ok(held, "44.1 kHz against 48 kHz captures: the dry is the input held back by latencySamples() = " + std::to_string(lat));
-    int best = 99; double top = -1.0;
-    for (int lag = -4; lag <= 4; ++lag) {
+    ok(f.n == 2048 && lat > 0 && same(f.dry, in),
+       "44.1 kHz against 48 kHz captures: the dry is the input itself, not held back by latencySamples() = " + std::to_string(lat));
+    int best = -99; double top = -1.0;
+    for (int lag = -8; lag <= lat + 8; ++lag) {
         double c = 0.0;
-        for (int i = 8; i < 2040; ++i) c += (double) f.dry[(std::size_t) i] * f.wet[(std::size_t) (i + lag)];
+        for (int i = 8; i + lat + 8 < 2048; ++i) c += (double) f.dry[(std::size_t) i] * f.wet[(std::size_t) (i + lag)];
         if (c > top) { top = c; best = lag; }
     }
-    ok(best == 0, "…and the wet stands beside it: the cross-correlation peaks at lag " + std::to_string(best));
+    ok(best == lat, "…and the wet trails it by exactly that: the cross-correlation peaks at lag " + std::to_string(best));
+}
+
+/** The feed (setFeedDb, the app's block IN): the dry stands behind it, the stand-by wire in front of it. */
+void feed() {
+    group("the feed: the dry tap behind it, the wire in front of it, a non-finite one refused");
+    Bench b(Spec { gainModel(0.5), gainModel(0.5), gainModel(0.5), -6.0, 0.0, false }, 48000.0);
+    ok(! b.p.setFeedDb(std::numeric_limits<double>::quiet_NaN()) && ! b.p.setFeedDb(std::numeric_limits<double>::infinity())
+       && b.p.feedDb() == 0.0, "a non-finite feed is refused and changes nothing");
+    ok(b.p.setFeedDb(6.0) && b.p.feedDb() == 6.0, "a finite one is taken");
+    b.settle(80);
+    const Frame f = read(b.p, kBlock);
+    const float g = (float) std::pow(10.0, 6.0 / 20.0);
+    bool dryIsFed = f.n == kBlock;
+    for (int i = 0; i < kBlock && dryIsFed; ++i) dryIsFed = f.dry[(std::size_t) i] == b.x[(std::size_t) i] * g;
+    ok(dryIsFed, "the dry tap is the input times the feed (+6 dB) and nothing of the pack's level (-6 dB), bit for bit");
+    b.p.setStandby(true);
+    b.settle(12);
+    ok(b.p.standingBy() && same(b.y, b.x), "stood by under a feed: the wire is the input itself — taken before the feed");
+}
+
+void feedGlide() {
+    group("a feed that glides: the dry tap and the sound ride one ramp — their ratio is the pack's levels, every sample");
+    // The dry is the input times the feed's own ramp; the sound is the input times the input level's ramp (the pack's
+    // level plus the feed, one gain). Both walk rampInto's law toward targets one constant apart, so in real numbers the
+    // ratio of the two never moves: y / (0.5 · dry) = linOf(inDb) · linOf(outDb) through the glide, not only after it.
+    const double inDb = -6.0, outDb = 3.0;
+    Bench b(Spec { gainModel(0.5), gainModel(0.5), gainModel(0.5), inDb, outDb, false }, 48000.0);
+    b.settle(80);
+    const double want = std::pow(10.0, inDb / 20.0) * std::pow(10.0, outDb / 20.0);
+    double worst = 0.0;
+    long checked = 0;
+    for (const double feedDb : { 9.0, -3.0, 0.0 }) {
+        test::run(b.p.setFeedDb(feedDb));
+        for (int k = 0; k < 12; ++k) {
+            b.settle(1);
+            const Frame f = read(b.p, kBlock);
+            if (f.n != kBlock) { worst = 1.0; break; }
+            for (int i = 0; i < kBlock; ++i) {
+                const double dry = f.dry[(std::size_t) i], y = b.y[(std::size_t) i];
+                if (std::abs(dry) < 1e-3) continue;
+                worst = std::max(worst, std::abs(y / (0.5 * dry) / want - 1.0));
+                ++checked;
+            }
+        }
+    }
+    ok(checked > 3000 && worst < 2e-5, "through three glides, " + std::to_string(checked) + " samples: y / (0.5 · dry) = "
+       "linOf(-6) · linOf(+3) within " + std::to_string(worst) + " relative");
 }
 
 /** Samples from the request until `y == target(i)` holds and keeps holding, over `blocks` blocks of DC. */
@@ -300,17 +433,55 @@ void standby() {
     ok(b.p.runBlocks(0) == 0 && b.p.runBlocks(1) == 0, "no network runs once the drain is spent");
     ok(! asked, "the dial moved to a capture nobody holds: no job is asked while it stands by");
 
-    group("back: knobs taken on the way, the input level arriving");
+    group("back: knobs taken on the way, the feed and the input level arriving");
+    // The app's block IN arrives on the way back (`lastInGain = inTarget`, PluginProcessor.cpp:1494-1495): the feed,
+    // read off the dry tap, which stands behind it alone — undelayed, so the whole first block is compared.
     b.p.setHostInputDb(-12.0);
+    test::run(b.p.setFeedDb(-6.0));
     b.p.setStandby(false);
     b.block([&b](long i) { return di(i, b.fs); }, false);
     const Frame first = read(b.p, kBlock);
-    const float g = (float) std::pow(10.0, -12.0 / 20.0);
+    const float g = (float) std::pow(10.0, -6.0 / 20.0);
     bool arrived = first.n == kBlock;
-    for (int i = 0; i < kBlock && arrived && lat == 0; ++i) arrived = first.dry[(std::size_t) i] == b.x[(std::size_t) i] * g;
-    // at 44.1 kHz the dry is held back: compare the samples of this block that are past the hold
-    for (int i = lat; i < kBlock && arrived; ++i) arrived = first.dry[(std::size_t) i] == b.x[(std::size_t) (i - lat)] * g;
-    ok(arrived, "the host level set while stood by is applied from the first sample back, not ramped into");
+    for (int i = 0; i < kBlock && arrived; ++i) arrived = first.dry[(std::size_t) i] == b.x[(std::size_t) i] * g;
+    ok(arrived, "the feed set while stood by is applied from the first sample back, not ramped into");
+    {
+        // …and the input level in the sound. A gain capture at 48 kHz with nothing else in the way: the device's
+        // output is the dry times one number only if no gain was still travelling through the block, and the reader's
+        // level match then brings it back as the dry. Ramped from unity to -12 dB, it would drift by four times.
+        Bench c(Spec { gainModel(0.5), gainModel(0.5), gainModel(0.5), 0.0, 0.0, false }, 48000.0);
+        c.settle(60);
+        c.p.setStandby(true);
+        c.settle(12);
+        c.p.setHostInputDb(-12.0);
+        c.p.setStandby(false);
+        c.block([&c](long i) { return di(i, c.fs); }, false);
+        const Frame f = read(c.p, kBlock);
+        double worst = f.n == kBlock ? 0.0 : 1.0;
+        for (int i = 0; i < kBlock; ++i)
+            worst = std::max(worst, (double) std::abs(f.wet[(std::size_t) i] - f.dry[(std::size_t) i]));
+        ok(worst < 1e-6, "the host level set while stood by is applied from the first sample back, not ramped into "
+           "(the first block's device output against its input, worst " + std::to_string(worst) + ")");
+        // …and its VALUE, which the level match above erases: the device is 0.5 · (-12 dB) · x, and the output is the
+        // fade-in's blend of the wire (the input itself — latency 0 at 48 kHz) and that, BypassFade's walk from zero.
+        const float g12 = (float) std::pow(10.0, -12.0 / 20.0);
+        Walk walk { 0.0f, (float) (1000.0 / (c.fs * 15.0)) };
+        const auto w = walk.block(kBlock, true);
+        double off = w.empty() ? 1.0 : 0.0;
+        for (int i = 0; i < kBlock && ! w.empty(); ++i) {
+            const float x = c.x[(std::size_t) i], dev = 0.5f * (x * g12);
+            off = std::max(off, (double) std::abs(c.y[(std::size_t) i] - (x + (dev - x) * w[(std::size_t) i])));
+        }
+        ok(c.p.latencySamples() == 0 && off < 1e-6, "…the first block back is the fade from the wire to 0.5 · (-12 dB) · x "
+           "(worst " + std::to_string(off) + ")");
+        c.settle(10);                                    // the fade is over
+        double rel = 0.0;
+        for (int i = 0; i < kBlock; ++i) {
+            const float x = c.x[(std::size_t) i];
+            if (std::abs(x) > 1e-3f) rel = std::max(rel, std::abs((double) c.y[(std::size_t) i] / (0.5 * x * g12) - 1.0));
+        }
+        ok(rel < 1e-6, "…and once it has faded in, the output is 0.5 · (-12 dB) · x (worst " + std::to_string(rel) + " relative)");
+    }
     b.p.serviceHere();
     bool landed = false;
     for (int k = 0; k < 200 && ! landed; ++k) {
@@ -397,31 +568,6 @@ void neverTorn() {
                 RigPlayer::kScopeTries, torn);
     ok(torn == 0 && whole > 0, "no torn read among " + std::to_string(reads));
 }
-
-/** juce::approximatelyEqual at its defaults (absolute FLT_MIN, relative FLT_EPSILON) — BypassFade's end test. */
-bool fadeEnd(float g, float want) {
-    const float d = std::abs(g - want);
-    return d <= std::numeric_limits<float>::min() || d <= std::numeric_limits<float>::epsilon() * std::max(std::abs(g), std::abs(want));
-}
-
-/** BypassFade::advance and BypassFade::blend (BypassFade.h:58-108), transcribed: the gain of every sample of a block —
-    or none, when the block sits at the walk's end and nothing is blended (the device alone up, the wire alone down). */
-struct Walk {
-    float g, per;
-    std::vector<float> block(int n, bool up) {
-        const float want = up ? 1.0f : 0.0f;
-        if (fadeEnd(g, want)) return {};
-        const float from = g;
-        const float needed = std::abs(want - g) / std::max(1.0e-9f, per);
-        const int ramp = std::clamp((int) std::ceil(needed), 1, n);
-        const float step = per * (float) ramp;
-        g = up ? std::min(want, g + step) : std::max(want, g - step);
-        const float st = (g - from) / (float) ramp;
-        std::vector<float> out((std::size_t) n);
-        for (int i = 0; i < n; ++i) out[(std::size_t) i] = i < ramp ? from + st * (float) i : g;
-        return out;
-    }
-};
 
 void fadeAgainstWire() {
     group("the fade sample for sample: the device against its DELAYED wire, BypassFade's walk");
@@ -606,6 +752,8 @@ int main() {
     std::printf("felitronics_rigplayer_scopestandby_tests\n");
     tapPoints();
     alignment();
+    feed();
+    feedGlide();
     standby();
     pauseIsSilence();
     noAllocation();

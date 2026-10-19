@@ -2,6 +2,58 @@
 
 # Changelog
 
+## v0.5.1 — 2026-10-19
+
+### rigplayer — the scope taps where the app taps
+
+- `RigPlayer::scopeRead` now draws OrbitAmp's own two points, around the whole player (`CapturedBlock.h:543-556`: the
+  block's input copied before the drive and `player.process`, the scope written after it). **dry** = the input as the
+  block was handed it, times the feed and nothing else — before the pack's input level and the pre tone, UNDELAYED;
+  **wet** = the player's output — pre tone, models, post tone, blend knob, output level — before the stand-by fade (the
+  app's `BypassFade` blends after the block has tapped, `PluginProcessor.cpp:1538`). A pack's post tone and blend knob
+  now move the picture; its input level no longer reaches the dry. As in the app, the wet trails the dry by a capture's
+  own lag and, at a host rate other than the pack's, by `latencySamples()` (61 samples at 44.1 kHz against 48 kHz
+  captures) — v0.5.0 held the dry back to align them; the app does not, and this follows the app. Kept: written only
+  while the device runs (frozen while it stands by), the torn-read guard, the reader's level match, no allocation.
+- `RigPlayer::setFeedDb(db)` / `feedDb()`: the bench's drive on top of the device's input level — the app's block IN
+  (`PluginProcessor.cpp:1497`), which the app applies outside its player. The stand-by wire is taken before it, the
+  scope's dry after it, the pack's input level after that; the sound is one gain, the input level plus the feed, summed
+  in that order — the bytes of stating the feed as the host's hand (`setHostInputDb(stageInputDb() + db)`). Kept across
+  `load()` and `unload()`, non-finite refused, arrives (not ramps) on the way back from stand-by as the input level does.
+- The sound is untouched. Checked once while building this change (not a suite in the tree): 24 renders through
+  `fc_rig_render` — every pack of the site (X88-IR ×4, IR-X ×2, V4 ×6) at 48 kHz mono and 44.1 kHz stereo, with the
+  feed, PARK both ways and cut short, the gain dial, every tone and blend knob, one model and two, normalisation off
+  and a reset — byte-identical to v0.5.0's. The standing guard is the ABI suite, which plays the PARK-and-feed
+  scenario against the player driven on v0.5.0's spelling, up to the unload.
+- An empty player is a wire behind the feed whichever setter ran last: `publishLevels()` says so itself (the feed
+  alone in, unity out, the host's hand kept for the next load), so a hand or a feed set while nothing is loaded no
+  longer adds the hand back in — the next pack's levels glided in from the wrong place.
+
+### fcrig — ABI 3, the same shape, another picture
+
+- `fc_rig_scope_read` keeps its arguments, its count and its level match; WHAT IT DRAWS is the app's (above), not
+  v0.5.0's tap around the models. No entry point is added or changed in shape, but the meaning of one is, so
+  `FC_RIG_ABI_VERSION` is 3 and the worklet asks for 3; `fc_rig_abi.h`'s compatibility rule now says a change of
+  meaning moves the version as an addition does (it said a meaning never changes).
+- `fc_rig_set_feed_db` hands the feed to `RigPlayer::setFeedDb` instead of restating the host's input level after every
+  load; the output is v0.5.0's byte for byte (the ABI suite runs the PARK-and-feed scenario against the player driven
+  on v0.5.0's spelling too, up to the unload: an empty player now publishes the feed alone whatever hand it is given).
+- `BUILD-INFO` names the Eigen it was built against.
+
+### Eigen from our own mirror (v0.1.1's change, ported)
+
+NeuralAmpModelerCore's Eigen submodule points at gitlab.com, and every build cloned it from there; on a day GitLab
+turned requests away under load, every build failed at that clone. `nam` now fetches NeuralAmpModelerCore without its
+submodules (`GIT_SUBMODULES ""`, CMP0097) and Eigen from github.com/darwinscat/eigen — a mirror of the same repository,
+untouched — at the very commit v0.5.4's submodule pins (Eigen 5.0.1, `bc3b398`). The sources built are the same, byte
+for byte (1913 files; the same commit and tree as the submodule checkout). A NeuralAmpModelerCore whose submodule is
+already on disk (`FELITRONICS_NAM_CORE_SRC`, CMake's own `FETCHCONTENT_SOURCE_DIR_NAM_CORE_SRC`, a parent project's
+declaration) brings its own; one whose submodule was never initialised now takes the mirror's instead of failing at
+`Eigen/Dense`. The configure stops when NeuralAmpModelerCore's tree pins another Eigen than `FELITRONICS_EIGEN_COMMIT`
+(v0.4.0 to v0.5.3 pin `87300c9`, so another `FELITRONICS_NAM_CORE_TAG` can no longer build against this Eigen
+silently), and when the Eigen used is any other commit; git runs as `find_package(Git)` found it, and a git that fails
+stops the configure with its own error. A source that is not a git checkout is said so, not passed in silence.
+
 ## v0.5.0 — 2026-10-19
 
 ### rigplayer — the scope tap and stand-by (OrbitAmp's ScopeTap and PARK)

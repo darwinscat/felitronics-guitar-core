@@ -292,7 +292,7 @@ group('the worklet loads in an AudioWorkletGlobalScope, and its exports are the 
     const got = Object.keys(proc.m).filter((k) => k.startsWith('_fc_rig_')).sort();
     ok(want.length === 39, `the header declares 39 entry points (read ${want.length})`);
     ok(JSON.stringify(got) === JSON.stringify(want), `the module exports exactly the header's entry points\n      got  ${got}\n      want ${want}`);
-    ok(proc.m._fc_rig_abi_version() === 2, 'abi_version answers 2');
+    ok(proc.m._fc_rig_abi_version() === 3, 'abi_version answers 3');
     ok(!/toResizableBuffer/.test(GLUE), 'the glue never calls WebAssembly.Memory.toResizableBuffer (Chrome 144+)');
     proc.port.onmessage({ data: { dispose: true } });
 }

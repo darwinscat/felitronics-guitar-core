@@ -1163,6 +1163,50 @@ int main() {
         approx(b.gainAt(1000.0), 0.5 * std::pow(10.0, -18.0 / 20.0) * q6, 0.01, "the other end works the same way");
     }
 
+    group("an empty player holds the feed alone, whatever hand the host holds — the order of the setters changes nothing");
+    {
+        // An empty player sounds nothing, but its two levels still ride their ramps, and the next pack's glide in FROM
+        // there. unload() publishes the wire's: the feed in, unity out, the hand kept for the next load. A setter called
+        // on the empty player has to publish the same — it used to add the hand back in. Two benches that make the same
+        // calls in another order (the hand before or after the unload, the feed restated or not) must play the same bytes.
+        const auto lin = [](double dB) { return std::pow(10.0, dB / 20.0); };
+        const auto play = [](Bench& x, int blocks) {
+            std::vector<float> out, l((std::size_t) kBlock), r((std::size_t) kBlock);
+            for (int k = 0; k < blocks; ++k) {
+                for (int i = 0; i < kBlock; ++i)
+                    l[(std::size_t) i] = (float) (0.1 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * (k * kBlock + i) / x.fs));
+                float* io[2] { l.data(), r.data() };
+                felitronics::test::run (x.p.process(io, x.p.channels(), kBlock));
+                x.p.serviceHere();
+                out.insert(out.end(), l.begin(), l.end());
+            }
+            return out;
+        };
+        Bench one(levelled(0.0, 0.0)), two(levelled(0.0, 0.0));
+        for (Bench* x : { &one, &two }) { x->p.setHostInputDb(-12.0); felitronics::test::run (x->p.setFeedDb(6.0)); }
+        approx(one.gainAt(1000.0), 0.5 * lin(-12.0 + 6.0), 0.01, "loaded: the hand -12 plus the feed +6");
+        (void) two.gainAt(1000.0);
+        one.p.setHostOutputDb(-6.0);
+        one.p.unload();
+        two.p.unload();
+        felitronics::test::run (two.p.setFeedDb(6.0));    // the feed restated on the empty player…
+        two.p.setHostOutputDb(-6.0);                      // …and the output hand stated there
+        std::vector<float> a = play(one, 20), b = play(two, 20);
+        one.load(levelled(0.0, 0.0));
+        two.load(levelled(0.0, 0.0));
+        const auto a2 = play(one, 40), b2 = play(two, 40);
+        a.insert(a.end(), a2.begin(), a2.end());
+        b.insert(b.end(), b2.begin(), b2.end());
+        long off = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) off += a[i] != b[i];
+        double peak = 0.0;
+        for (std::size_t i = a.size() - (std::size_t) kBlock; i < a.size(); ++i) peak = std::max(peak, (double) std::abs(a[i]));
+        ok(off == 0 && peak > 0.01, "20 blocks empty, a load, 40 blocks: the same bytes whichever order the setters ran in ("
+           + std::to_string(off) + " of " + std::to_string(a.size()) + " samples differ)");
+        approx(one.gainAt(1000.0), 0.5 * lin(-12.0 + 6.0) * lin(-6.0), 0.01, "loaded again: the hand, the feed and the output hand heard");
+        approx(two.gainAt(1000.0), 0.5 * lin(-12.0 + 6.0) * lin(-6.0), 0.01, "…on both benches");
+    }
+
     group("alignment: two captures that land apart are lined up before they mix");
     {
         // Two files: unity, and unity two samples late.

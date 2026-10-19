@@ -377,6 +377,7 @@ public:
         scopeCap_ = scopeSamples > 0 ? (std::size_t) scopeSamples + 2u * (std::size_t) maxBlock_ : 0u;
         scopeDry_ = scopeCap_ > 0 ? std::make_unique<std::atomic<float>[]>(scopeCap_) : nullptr;
         scopeWet_ = scopeCap_ > 0 ? std::make_unique<std::atomic<float>[]>(scopeCap_) : nullptr;
+        scopeIn_.assign(scopeCap_ > 0 ? (std::size_t) maxBlock_ : 0u, 0.0f);   // the dry is taken first, written last
         scopeW_ = 0;
         scopeClaim_.store(0, std::memory_order_relaxed);
         scopeWritten_.store(0, std::memory_order_release);
@@ -636,9 +637,10 @@ public:
         wetGain_.store(1.0f, std::memory_order_release);
         // …and with no stage there is nothing to be fed or delivered: an empty player is a wire,
         // whatever hand the host is holding. The hand itself is kept — it is the bench's, not the
-        // pack's — and lands again on the next load().
-        inGain_.store(1.0f, std::memory_order_release);
-        outGain_.store(1.0f, std::memory_order_release);
+        // pack's — and lands again on the next load(). The FEED stays applied: it is in front of the
+        // device (setFeedDb), and the wire is behind it. publishLevels() says so for an empty player,
+        // so a setter called while nothing is loaded publishes the same two numbers this does.
+        publishLevels();
         chainGain_.store(1.0f, std::memory_order_release);
         for (auto& g : slotGain_) g.store(1.0f, std::memory_order_release);
         for (auto& p : pendDelay_) p.store(0, std::memory_order_release);
@@ -649,7 +651,8 @@ public:
 
     /// THE HOST'S OWN HAND ON THE PACK'S TWO LEVELS — the WHOLE number it wants this device played
     /// at, never a difference from what the pack states. Absent (the default) leaves the pack's own
-    /// number standing, which is what a plugin wants and why a plugin needs none of this.
+    /// number standing, which is what a plugin wants and why a plugin needs none of this. The feed
+    /// (setFeedDb) rides on top of the input one: the device is fed the hand plus the feed.
     ///
     /// A host with a fader used to subtract: it sent `hand - what the pack says`, and applied that
     /// outside the player. That cannot be made correct. The subtraction needs to know which pack is
@@ -665,6 +668,27 @@ public:
     void setHostOutputDb(std::optional<double> db) { hostOut_ = db; publishLevels(); }
     std::optional<double> hostInputDb()  const { return hostIn_; }
     std::optional<double> hostOutputDb() const { return hostOut_; }
+
+    /// THE FEED — how hard the bench drives this device, ON TOP of its input level (the pack's, or the host's hand
+    /// above): OrbitAmp's block IN, the trim it applies to the block's input before the block plays
+    /// (PluginProcessor.cpp:1497). The app applies it outside its player; a host with no such stage of its own (fc_rig,
+    /// fc_rig_set_feed_db) hands it here, for two reasons. The stand-by WIRE is taken before it — a parked device hands
+    /// the input on untrimmed, as the app's wire is fed before its IN (PluginProcessor.cpp:1423-1426) — and the scope's
+    /// dry is taken after it, where the app copies the block's input (CapturedBlock.h:543-544), and before the input
+    /// level, which is the player's own.
+    ///
+    /// The sound is one gain, as it was when a host stated the feed as its hand (`setHostInputDb(stageInputDb() +
+    /// feed)`): the input level plus the feed, summed here in that order, so the two spellings play the same bytes.
+    /// It belongs to the bench like the hand: kept across load() and unload() — an empty player is a wire behind it.
+    /// Message thread; a non-finite dB is refused (false) and changes nothing. 0 (the default) is no feed.
+    bool setFeedDb(double db) {
+        if (! std::isfinite(db)) return false;
+        feedDb_ = db;
+        feedGain_.store(linOf(db), std::memory_order_release);
+        publishLevels();
+        return true;
+    }
+    double feedDb() const { return feedDb_; }
     // The pack's own two levels, for a host that prints or draws them. These are what the player IS
     // applying: a host with a fader of its own applies only its deviation from them, or the level
     // lands twice — which is exactly the bug that made these keys necessary.
@@ -1067,15 +1091,21 @@ public:
     bool standingBy() const { return standingBy_.load(std::memory_order_acquire); }    // faded out, not running
 
     // --------------------------------------------------------------------- the scope: OrbitAmp's ScopeTap ----
-    // The newest samples of what went INTO the models and what came OUT of them, channel 0, for a picture (the app's
-    // SHAPE). Written on the audio thread once per block the device runs (not while it stands by — the tap keeps
-    // the last it heard, the fade-out included):
-    //   dry  the DI the device was fed, after the pack's input level (or the host's) — the dry copy the blend knob
-    //        mixes, delayed by latencySamples() as that copy is, so it stands sample for sample beside…
-    //   wet  …the models' mix: both slots aligned, weighed and through the law's gain, BEFORE the post tone, the
-    //        blend knob and the pack's output level.
-    // The capture's OWN lag is not taken out — the player never takes it out of the sound either (the alignment
-    // delays are relative, AlignmentTable.h); a pack at another rate than the host's is aligned by its rate-match.
+    // The newest samples of what went INTO the player and what came OUT of it, channel 0, for a picture (the app's
+    // SHAPE) — at the app's own two points, around the whole player: CapturedBlock::process copies the block's input
+    // before the drive and before player.process (CapturedBlock.h:543-544) and writes the scope after it (:554-556).
+    // Written on the audio thread once per block the device runs (not while it stands by — the tap keeps the last it
+    // heard, the fade-out included):
+    //   dry  the input as the block was handed it, behind the feed (setFeedDb — the app's block IN,
+    //        PluginProcessor.cpp:1497) and before everything of the player's own: the pack's input level, the pre
+    //        tone. UNDELAYED, as the app's copy is.
+    //   wet  the player's output: the pre tone, the models, the post tone, the blend knob, the pack's output level —
+    //        before the stand-by fade, which the app blends after the block has tapped (PluginProcessor.cpp:1538).
+    // So the two stand side by side as they do in the app, and no closer: the wet trails the dry by a capture's own
+    // lag (the player never takes it out of the sound, AlignmentTable.h) and, at a host rate other than the pack's,
+    // by latencySamples() — the app's picture is misaligned by the rate-match exactly so, and this follows it.
+    // (v0.5.0 tapped around the models instead — the dry after the input level and held back by latencySamples(),
+    // the wet before the post tone — the app's web spec and the site's tap around TONE3000's node, not its code.)
     //
     // scopeRead copies the newest min(n, scopeSize(), written) of both, oldest first, with the wet scaled to the
     // dry's RMS — the app's ScopeTap::read (ScopeTap.h:42-72), which matches on the way OUT, in the reader: "a boost
@@ -1093,7 +1123,8 @@ public:
     // fence), writes them (relaxed atomic floats), and publishes how far it got (a release store). The reader takes
     // the published end (acquire), copies, fences (acquire) and reads the claim: if the writer may have reached any
     // slot of what was copied, the copy is thrown away. The rings carry two blocks of slack, so a writer one whole
-    // block and a part ahead does not spoil a read. The audio side pays one fence and two stores per block.
+    // block and a part ahead does not spoil a read. The audio side pays one fence and two stores per block, and
+    // one copy of channel 0's block for the dry (times the feed's gain when one is set).
     // Any thread may read; prepare() must not run meanwhile (it never may beside process() either).
     int scopeSize() const { return scopeN_; }
     std::uint64_t scopeFrames() const { return scopeWritten_.load(std::memory_order_acquire); }   // samples written since prepare()
@@ -1251,6 +1282,7 @@ public:
                 // resumes from where it stood and takes what moved meanwhile — under the fade-in.
                 parkedRt_ = false;
                 curIn_ = inGain_.load(std::memory_order_acquire);
+                curFeed_ = feedGain_.load(std::memory_order_acquire);
                 standingBy_.store(false, std::memory_order_release);
             }
             for (int s = 0; s < 2; ++s) takeBands(s);
@@ -1261,6 +1293,18 @@ public:
             // ever and the mix becomes two instruments at two volumes. `extendDb` is a different
             // animal and stays in chainGain_ below: a trick played inside the pack past the top
             // capture, which the dry path leaving at the input jack never saw.
+            //
+            // THE SCOPE'S DRY is taken first: the input as the block was handed it, behind the feed alone — the app's
+            // CapturedBlock::process copies the block's input before the drive and before player.process
+            // (CapturedBlock.h:543-544), behind its block IN (PluginProcessor.cpp:1497), which is the feed here
+            // (setFeedDb). UNDELAYED, as the app's copy is. The feed's own ramp is advanced every block the device
+            // runs, tapped or not, so a tap that resumes does not glide from a stale gain.
+            const bool tap = nch > 0 && scopeN_ > 0;
+            if (tap) std::copy_n(a[0], count, scopeIn_.data());
+            {
+                float* const s[1] { scopeIn_.data() };
+                rampInto(s, tap ? 1 : 0, count, feedGain_.load(std::memory_order_acquire), curFeed_);
+            }
             rampInto(a, nch, count, inGain_.load(std::memory_order_acquire), curIn_);
 
             // Keep the DRY block before anything touches it: the same DI the models are fed, which is
@@ -1445,11 +1489,6 @@ public:
                 }
             }
 
-            // THE SCOPE'S TAP, both sides at once: `d` is the DI as the blend will mix it (the pack's input level in,
-            // held back by latencySamples()), `a` the models' mix — aligned, weighed, through the law's gain — and
-            // nothing after the models has touched either yet. Channel 0, when a plane was handed over at all.
-            if (nch > 0) scopeWrite(d[0], a[0], count);
-
             // The knobs AFTER the distortion, shaping what came out.
             runBands(1, a, count);
             if (! firBypass_[1].load(std::memory_order_acquire)) ok = fir_[1].process(a, channels_, count) && ok;
@@ -1481,6 +1520,13 @@ public:
             // stage, and applied any earlier it would ride the wet side alone and move a blend the
             // pack states for this position.
             rampInto(a, nch, count, outGain_.load(std::memory_order_acquire), curOut_);
+
+            // THE SCOPE'S WET: the player's output — everything above, the pre tone, the models, the post tone, the
+            // blend knob, the output level — as the app's CapturedBlock::process writes it after player.process
+            // (CapturedBlock.h:554-556), beside the dry taken at the top of the block. The stand-by fade is not in it:
+            // the app's BypassFade blends after the block has tapped (PluginProcessor.cpp:1516, :1538). At a host rate
+            // other than the pack's the wet trails the dry by latencySamples(), in the app's picture as in this one.
+            if (tap) scopeWrite(scopeIn_.data(), a[0], count);
 
             // …and a stand-by fade under way: the device against its wire, BypassFade::blend's own arithmetic
             // (BypassFade.h:87-108) — `dry + (wet - dry) · g`, g walking for the fade's own samples and then held.
@@ -1553,6 +1599,7 @@ private:
     void snapGains() noexcept {
         const bool trims = inputTrims_.load(std::memory_order_acquire);
         curIn_    = inGain_.load(std::memory_order_relaxed);
+        curFeed_  = feedGain_.load(std::memory_order_relaxed);
         curOut_   = outGain_.load(std::memory_order_relaxed);
         curChain_ = chainGain_.load(std::memory_order_relaxed);
         for (int i = 0; i < 2; ++i) curSlot_[i] = trims ? slotGain_[i].load(std::memory_order_relaxed) : 1.0f;
@@ -1638,8 +1685,17 @@ private:
     /// pack's own number. Called from apply(), from the host setters, and from load() before anything
     /// slow — a pack swap used to publish unity here (unload's reset) and the real gains only at the
     /// end of load(), so a callback landing in between heard neither pack's level.
+    ///
+    /// An EMPTY player (no stage: unload(), or a load() that found nothing to play) is a wire behind the feed: the
+    /// feed alone in, unity out, whatever hand the host holds — the hand is kept and lands on the next load(). Said
+    /// here and not only in unload(), so a setter called while nothing is loaded cannot add the hand back in.
     void publishLevels() {
-        inGain_ .store(linOf(hostIn_  ? *hostIn_  : stage_.inputDb),  std::memory_order_release);
+        if (stage_.kind != namz::rig::StageKind::Nam) {
+            inGain_ .store(linOf(feedDb_), std::memory_order_release);
+            outGain_.store(1.0f, std::memory_order_release);
+            return;
+        }
+        inGain_ .store(linOf((hostIn_  ? *hostIn_  : stage_.inputDb) + feedDb_), std::memory_order_release);
         outGain_.store(linOf(hostOut_ ? *hostOut_ : stage_.outputDb), std::memory_order_release);
     }
 
@@ -2183,6 +2239,9 @@ private:
     // after the dry block has already been taken.
     std::atomic<float>         inGain_ { 1.0f }, outGain_ { 1.0f };
     std::optional<double>      hostIn_, hostOut_;      // message thread only; empty = the pack's own
+    // The feed (setFeedDb): its dB on the message thread, summed into inGain_ there; its gain alone for the scope's dry.
+    double                     feedDb_ = 0.0;
+    std::atomic<float>         feedGain_ { 1.0f };
     std::atomic<float>         chainGain_ { 1.0f };
     std::atomic<float>         slotGain_[2] { 1.0f, 1.0f };
     // A model's `metadata.loudness` tag is a CONTRACT, not a listener's option: off, every capture
@@ -2201,6 +2260,7 @@ private:
     std::array<float, (std::size_t) kMaxDelay> lagTail_[2][kMaxChannels] {};
     int ranNch_ = 0;                        // planes that advanced state on the previous call
     float curIn_ = 1.0f, curOut_ = 1.0f;
+    float curFeed_ = 1.0f;                             // the feed's own ramp, which only the scope's dry rides
     float curChain_ = 1.0f, curSlot_[2] { 1.0f, 1.0f }, curDry_ = 0.0f, curWet_ = 1.0f;
     BandSet                    bandRt_[2];
     felitronics::rigplayer::SectionBiquad   bandCur_[2][kMaxBands];    // what the filters are running NOW
@@ -2225,6 +2285,7 @@ private:
     int scopeN_ = 0;
     std::size_t scopeCap_ = 0;
     std::unique_ptr<std::atomic<float>[]> scopeDry_, scopeWet_;
+    std::vector<float> scopeIn_;                                    // audio thread: this block's dry, kept till the end
     std::uint64_t scopeW_ = 0;                                      // audio thread: samples written
     std::atomic<std::uint64_t> scopeClaim_ { 0 }, scopeWritten_ { 0 };
 };
