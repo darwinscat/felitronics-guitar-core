@@ -340,6 +340,55 @@ void contract()
             && fc_guitar_fx_buffer (nullptr, 0) == nullptr, "a NULL instance is refused everywhere, and nothing crashes");
 }
 
+/** Law 11a through the ABI: what follows a reset does not depend on what came before it — knobs moved since the last
+    block included. Two instances that took different roads to the same knobs, reset, then fed the same signal (one
+    channel, then two), must render the same bits. */
+void resetIsARestart()
+{
+    group ("reset with knobs pending: what follows does not depend on what came before");
+    fc_guitar_fx* a = fc_guitar_fx_create();
+    fc_guitar_fx* b = fc_guitar_fx_create();
+    fc_guitar_fx_set_reverb_character (a, 3);   // Plate
+    fc_guitar_fx_set_reverb_character (b, 4);   // Spring
+    fc_guitar_fx_set_reverb_mix (a, 60.0f);
+    fc_guitar_fx_set_reverb_mix (b, 60.0f);
+    test::run (fc_guitar_fx_prepare (a, 48000.0, 128) == 1);
+    test::run (fc_guitar_fx_prepare (b, 48000.0, 128) == 1);
+
+    const int frames = 128 * 188;
+    const auto inL = makeInput (frames, 48000.0, 0), inR = makeInput (frames, 48000.0, 1);
+    auto aL = inL, aR = inR, bL = inL, bR = inR;
+    for (int at = 0; at < 4800; at += 128)   // a past each, in its own room
+    {
+        test::run (fc_guitar_fx_process (a, aL.data() + at, aR.data() + at, 128) == 1);
+        test::run (fc_guitar_fx_process (b, bL.data() + at, bR.data() + at, 128) == 1);
+    }
+
+    // Both onto Room, and a restart before either has heard it.
+    fc_guitar_fx_set_reverb_character (a, 1);
+    fc_guitar_fx_set_reverb_character (b, 1);
+    fc_guitar_fx_reset (a);
+    fc_guitar_fx_reset (b);
+
+    aL = inL; aR = inR; bL = inL; bR = inR;
+    for (int at = 0; at < frames; at += 128)
+    {
+        float* ar = at < frames / 2 ? nullptr : aR.data() + at;   // one channel, then two
+        float* br = at < frames / 2 ? nullptr : bR.data() + at;
+        test::run (fc_guitar_fx_process (a, aL.data() + at, ar, 128) == 1);
+        test::run (fc_guitar_fx_process (b, bL.data() + at, br, 128) == 1);
+    }
+    double worst = 0.0;
+    for (int i = 0; i < frames; ++i)
+        worst = std::max ({ worst, (double) std::fabs (aL[(std::size_t) i] - bL[(std::size_t) i]),
+                            (double) std::fabs (aR[(std::size_t) i] - bR[(std::size_t) i]) });
+    ok (std::memcmp (aL.data(), bL.data(), aL.size() * 4) == 0 && std::memcmp (aR.data(), bR.data(), aR.size() * 4) == 0,
+        "Plate -> Room and Spring -> Room, reset, then the same signal: the same bits (worst "
+            + std::to_string (worst) + ")");
+    fc_guitar_fx_destroy (a);
+    fc_guitar_fx_destroy (b);
+}
+
 void dryAtUnity()
 {
     group ("both links only ADD: at mix 0 and 0 the output is the input");
@@ -399,6 +448,7 @@ int main()
     std::printf ("felitronics_guitar_fx_abi_tests\n");
     contract();
     bitIdentity();
+    resetIsARestart();
     dryAtUnity();
     noAllocation();
     return felitronics::test::report();

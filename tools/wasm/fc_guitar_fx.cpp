@@ -179,6 +179,11 @@ FC_EXPORT void fc_guitar_fx_reset (fc_guitar_fx* fx)
 {
     if (fx == nullptr)
         return;
+    // Knobs moved since the last block reach the stages FIRST: a reset lands every glide on its target, and the
+    // targets must be the knobs as they stand now, not as the last block heard them — or what follows the restart
+    // would depend on what came before it (law 11a).
+    if (fx->dirty)
+        fx->apply();
     fx->delay.reset();
     fx->reverb.reset();
 }
