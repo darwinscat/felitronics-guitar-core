@@ -133,6 +133,27 @@ inline Selection select(const Device& d, const Settings& axes, const std::string
     return s;
 }
 
+// The same selection with the crossfade taken away: the nearer capture alone — nearer by the handover
+// the shape puts between them (ModelBlend.h's stepped()). What a player held to ONE model sounds; past
+// the ends of the dial it is the selection unchanged, extension included.
+//
+// …WITH A DEADBAND, because every change of capture in that player is a dip: `stay` is the knot (an index
+// into s.knots) sounding now, or -1 for none, and while the pair's weight stands within `deadband` of the
+// handover — |mixHi - 0.5| < deadband — the capture already sounding stays. A hand resting on the handover
+// would otherwise dip at every tremor; outside the band the nearer capture wins, as without one.
+inline Selection steppedSelection(Selection s, int stay = -1, double deadband = 0.0) {
+    if (s.pick.lo < 0) return s;
+    if (s.pick.lo != s.pick.hi && (stay == s.pick.lo || stay == s.pick.hi) && std::abs(s.pick.mixHi - 0.5) < deadband) {
+        s.pick.lo = s.pick.hi = stay;
+        s.pick.mixHi = 0.0;
+    } else {
+        s.pick = stepped(s.pick);
+    }
+    s.fileA = s.fileB = s.knots[(std::size_t) s.pick.lo].file;
+    s.mixB  = 0.0;
+    return s;
+}
+
 // WHICH SLOT EACH CAPTURE LIVES IN — by the PARITY of its position on the dial, never by which one is
 // nearer. Nearness swaps the roles at the halfway mark, which is the one place both models are at
 // full-ish weight; the freshly-loaded one then speaks from an empty memory while it is half the sound,

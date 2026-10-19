@@ -26,6 +26,10 @@
 //     it was holding when it fell asleep — 0.500000 out of digital silence. The law owns the flag
 //     (BlendState::cold) and wakes the slot, warm-up first, the moment the request changes; the model
 //     stays where it is throughout. slotCold() and coldBlocks() read it out.
+//   • A host that can afford ONE network says so (setMaxModels(1)): the dial steps to the nearest
+//     capture, the other slot is asked for nothing, and a change of capture is a dip — down, swap, up —
+//     instead of a crossfade (nam::blendStepSingle). runBlocks() and pairBlocks() read out the cost,
+//     a resting capture's drain included.
 //   • A tone knob is applied as the pack describes it — a curve becomes a minimum-phase FIR, bands
 //     become biquads — on the side of the models its circuit puts it. ToneKnobs.h, pure.
 //   • A blend knob mixes the DI the models were fed, through the dry path's own response. BlendKnob.h.
@@ -193,6 +197,20 @@ public:
     // — and short against a session, so the saving is there whenever nobody is turning. A host may set
     // its own (setColdAfterSeconds); zero or less = never.
     static constexpr double kColdAfterSeconds = 2.0;
+    // THE DIP of a one-model player (setMaxModels(1)): how long the sound takes to fall before a capture
+    // is replaced, and to rise after. Not a new number: OrbitAmp's BypassFade (src/core/BypassFade.h,
+    // `lengthMs = 15.0f`) is "THE ONE FADE, for every link that REPLACES the signal rather than adding
+    // to it" — long enough that no step survives it, short enough that a switch still feels like a
+    // switch — and a capture swapped under a dip is exactly such a link. In seconds, so the dip is the
+    // same at every block size (BypassFade's own lesson: a fade spread over a whole 4096-sample block
+    // was eighty-five milliseconds, not fifteen). The app's other two moves set no figure of their own:
+    // a pack change is unload() + load(), whose fade-in is the law's cold start, and a channel switch is
+    // the law's crossfade, a quarter per block.
+    static constexpr double kDipSeconds = 0.015;
+    // …and the DEADBAND of its step (steppedSelection): the capture sounding stays until the pair's weight is this far
+    // past the handover — a tenth of the gap, 9 degrees of a 90-degree gap on the default shape — so a hand resting on
+    // the handover does not dip at every tremor. A dial whose shape is a switch (width zero) has no band to rest in.
+    static constexpr double kStepDeadband = 0.1;
 
     // 🔴 THE CEILING ON A HOST RATE, and every buffer derived from one is bounded by it. Far above any
     // audio rate — 3 MHz is sixteen times the highest a DAW offers — and its job is not to judge taste
@@ -289,6 +307,7 @@ public:
         maxBlock_ = maxBlock;
         channels_ = numChannels;   // validated above — law 11(b) forbids the clamp that was here
         coldAfter_.store(coldSamples(coldSeconds_), std::memory_order_release);
+        dipSamples_ = std::max(1LL, (long long) std::llround(kDipSeconds * fs_));
         for (auto& n : nam_) n.prepare(fs_, maxBlock_);
         // Not normalised: a tone curve's broadband level is part of what the pack says, and a dry path's
         // level rides in its gain. Reference-unity RMS is for cabinets, which these are not.
@@ -548,6 +567,7 @@ public:
     // Forget the device: both models cleared, the law told to start over, every filter a wire.
     void unload() {
         loaded_ = false;
+        stayFile_ = -1;                                  // a file entry of the pack going away
         ++gen_;                                          // a job out for this pack comes back to be dropped
         setRequest(0, 0, 0.0f);
         // A landing (or a failure) published and not yet consumed dies with its pack — and it must die
@@ -761,6 +781,34 @@ public:
     }
     double coldAfterSeconds() const { return coldSeconds_; }
 
+    // HOW MANY MODELS MAY RUN — 2, the default, is the player as it always was: the two captures either
+    // side of the gain dial, crossfaded by angle, the neighbour of a capture warm at weight zero (until
+    // it rests, kColdAfterSeconds). 1 is for a host that can afford one network and not two — a browser
+    // audio thread on a slow machine: the dial is STEPPED to the nearest capture (by the handover the
+    // blend shape sets, with a deadband around the capture sounding — kStepDeadband), the other slot is
+    // asked for nothing — no neighbour is ever loaded, and ONE network runs on audio, plus the outgoing
+    // capture's bounded drain as it rests, which overlaps the incoming warm-up — and a change of capture
+    // is a DIP (kDipSeconds down, the incoming capture loaded or woken and fed its field while nothing is
+    // heard, kDipSeconds up) instead of a crossfade. The pair's slots go by parity, so crossing a LINK —
+    // one file at two angles — is a change of slot: a dip and a load of the same file. See
+    // nam::blendStepSingle for the order and the one exception.
+    //
+    // Either way while playing. 1 -> 2: the neighbour is asked for at weight zero and nothing of it is
+    // heard until it is fed; on a capture the sound then does not change until the dial moves, between
+    // two captures the weight glides — a quarter per block at most — to the dial's blend. 2 -> 1 on a
+    // capture: the neighbour rests, and the sound does not change; between two captures: a dip to the
+    // nearer one. False = not 1 or 2, and nothing changes. Message thread; survives load() — it is the
+    // host's budget, not the pack's.
+    bool setMaxModels(int n) {
+        if (n != 1 && n != 2) return false;
+        maxModels_ = n;
+        stayFile_ = -1;                                  // the step's deadband starts from the nearer capture
+        single_.store(n == 1, std::memory_order_release);
+        if (loaded_) apply();
+        return true;
+    }
+    int maxModels() const { return maxModels_; }
+
     // The models' measured offsets (AlignmentTable.h), for a pack that does not carry its own. A delay
     // travels with a model and is applied at the one instant its slot is silent — weight exactly zero
     // — never as a splice on a live signal. So a table handed in BEFORE playing lands with the first
@@ -927,11 +975,18 @@ public:
     // it has slept since the last clearCounters(), for the dump beside warmBlocks().
     bool  slotCold(int slot)   const { return slotCold_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
     int   coldBlocks(int slot) const { return coldBlocks_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
+    // What the CPU actually paid: the blocks in which a slot's network ran — on audio, or draining the
+    // silence of a rest (NamStage::drainedSamples moved) — and the blocks in which both did. One model
+    // holds the second at the outgoing capture's drain per change of slot. Since clearCounters().
+    int   runBlocks(int slot) const { return runBlocks_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
+    int   pairBlocks()        const { return pairBlocks_.load(std::memory_order_relaxed); }
     void  clearCounters() {
         warmBlocks_.store(0, std::memory_order_relaxed);
         mixJumps_.store(0, std::memory_order_relaxed);
         biggestJump_.store(0.0f, std::memory_order_relaxed);
         for (auto& c : coldBlocks_) c.store(0, std::memory_order_relaxed);
+        for (auto& c : runBlocks_) c.store(0, std::memory_order_relaxed);
+        pairBlocks_.store(0, std::memory_order_relaxed);
     }
     long long modelLoads() const { return loads_; }                                   // how many the source was asked for
     int bandsDropped() const { return bandsDropped_; }                                // sections past kMaxBands
@@ -1091,9 +1146,20 @@ public:
             req.want[1] = reqWant_[1].load(std::memory_order_relaxed);
             felitronics::nam::BlendPolicy policy;
             policy.coldAfterSamples = coldAfter_.load(std::memory_order_relaxed);
+            const bool single = single_.load(std::memory_order_acquire);
+            if (single) {
+                policy.single = true;
+                policy.dipDownSamples = policy.dipUpSamples = dipSamples_;
+            }
             const auto law = felitronics::nam::blendStep(blend_, req, count, policy);
-            if (law.load.wanted && loadAsk_.load(std::memory_order_relaxed) == 0)
-                loadAsk_.store((law.load.model << 1) | (std::uint64_t) (law.load.slot & 1), std::memory_order_release);
+            // The law's ask is PUBLISHED only after both stages have run this block (below): the two-slot law asks
+            // when a slot's weight ARRIVES at zero, at the block's end, and the block can begin with it audible.
+            // Published here, a job thread that pre-empts this one could prepare and deliver the model before the
+            // stage reads it — NeuralStage takes a newly installed model at the start of its next call — and the
+            // new, unfed capture would be heard at that weight. (An AudioWorklet cannot; a native host can.)
+#ifdef FELITRONICS_RIGPLAYER_TEST_AFTER_LAW
+            FELITRONICS_RIGPLAYER_TEST_AFTER_LAW(*this);   // a test's seam; never defined in a product (RigPlayerTests.cpp)
+#endif
             for (int i = 0; i < 2; ++i) {
                 held_[(std::size_t) i].store(blend_.held[i], std::memory_order_relaxed);
                 slotCold_[(std::size_t) i].store(blend_.cold[i], std::memory_order_relaxed);
@@ -1135,9 +1201,15 @@ public:
             // where it stopped and settles within its block, like any other gain change; its delay line
             // was cleared on the way to sleep. (The rail is checked as well as the flag: the flag says
             // what the law decided, the weights say what this block sounds like.)
-            const bool run[2] { ! blend_.cold[0], ! blend_.cold[1] };
+            // ONE MODEL AT A TIME runs only what the law can hear or is warming: a slot with no model
+            // (the two-slot player hands an empty stage the block, which passes it through) and a slot
+            // whose replacement is in flight (the two-slot player runs its old model at weight zero)
+            // are not run either — the law counts neither as fed, so neither has a field to keep.
+            const bool run[2] { ! blend_.cold[0] && (! single || (blend_.held[0] != 0 && ! blend_.inFlight[0])),
+                                ! blend_.cold[1] && (! single || (blend_.held[1] != 0 && ! blend_.inFlight[1])) };
             const bool aAlone = ! run[1] && law.beginB <= 0.0 && law.endB <= 0.0;
             const bool bAlone = ! run[0] && law.beginB >= 1.0 && law.endB >= 1.0;
+            const bool hush   = single && law.beginGain <= 0.0 && law.endGain <= 0.0;
             const bool trims = inputTrims_.load(std::memory_order_acquire);
             if (run[1]) for (int c = 0; c < nch; ++c) std::copy(a[c], a[c] + count, b[c]);
             if (run[0]) rampInto(a, nch, count, trims ? slotGain_[0].load(std::memory_order_acquire) : 1.0f, curSlot_[0]);
@@ -1163,8 +1235,23 @@ public:
             // while it slept and now fails every block instead. That is law 11's answer — a call that
             // cannot be honoured says so — and it is not constructible in a test without exhausting
             // memory, so it is written here rather than gated.
+            const long long drained[2] { nam_[0].drainedSamples(), nam_[1].drainedSamples() };
             ok = nam_[0].process(a, run[0] ? nch : 0, count, norm) && ok;
             ok = nam_[1].process(b, run[1] ? nch : 0, count, norm) && ok;
+            // WHAT THE CPU PAID — a slot's network ran if it was handed the audio holding a model, OR if its stage
+            // spent part of a drain on it (a slot put to rest is fed its field of silence once, width-zero call
+            // above): one network on audio in one-model mode, plus the outgoing capture's bounded drain. Two relaxed
+            // loads of the stage's own odometer, which it keeps on this thread.
+            {
+                const bool ran0 = (run[0] && blend_.held[0] != 0) || nam_[0].drainedSamples() != drained[0];
+                const bool ran1 = (run[1] && blend_.held[1] != 0) || nam_[1].drainedSamples() != drained[1];
+                if (ran0) runBlocks_[0].fetch_add(1, std::memory_order_relaxed);
+                if (ran1) runBlocks_[1].fetch_add(1, std::memory_order_relaxed);
+                if (ran0 && ran1) pairBlocks_.fetch_add(1, std::memory_order_relaxed);
+            }
+            // …and only now may a job thread see the law's ask (see above, at the law).
+            if (law.load.wanted && loadAsk_.load(std::memory_order_relaxed) == 0)
+                loadAsk_.store((law.load.model << 1) | (std::uint64_t) (law.load.slot & 1), std::memory_order_release);
             // Align BEFORE the weights: during a ramp the two gains must sum to one at the SAME instant.
             // Each slot carries its own history per channel, advanced every block including at zero.
             for (int c = 0; c < nch; ++c) {
@@ -1172,14 +1259,25 @@ public:
                                                          slotDelay_[0].load(std::memory_order_acquire), count);
                 if (run[1]) felitronics::nam::blendDelay(b[c], lagTail_[1][(std::size_t) c].data(), kMaxDelay,
                                                          slotDelay_[1].load(std::memory_order_acquire), count);
-                if (aAlone)      { /* slot 1 asleep at zero: `a` is the whole sound */ }
+                // A one-model block the law holds silent throughout is SILENCE, written, not a mix
+                // multiplied by zero: the weight may be travelling between two slots neither of which
+                // was run, and a stale buffer times zero is a NaN if it held one.
+                if (hush)        std::fill(a[c], a[c] + count, 0.0f);
+                else if (aAlone) { /* slot 1 asleep at zero: `a` is the whole sound */ }
                 else if (bAlone) std::copy(b[c], b[c] + count, a[c]);
                 else             felitronics::nam::blendMix(a[c], b[c], count, law.beginB, law.endB);
-                // …and the law's own gain, which is below one only while nothing has been fed yet.
-                if (law.beginGain < 1.0 || law.endGain < 1.0) {
-                    const float dg = (float) (law.endGain - law.beginGain) / (float) count;
+                // …and the law's own gain, which is below one only while a slot that carries weight is
+                // not yet safe to hear (a cold start, a device change, a turn to two models) — or,
+                // with one model, through a dip, whose ramp may end inside the block (gainRamp) and
+                // holds there. Zero = the whole block, which is the arithmetic this always was.
+                if (! hush && (law.beginGain < 1.0 || law.endGain < 1.0)) {
+                    const int ramp = law.gainRamp > 0 ? std::min(law.gainRamp, count) : count;
+                    const float dg = (float) (law.endGain - law.beginGain) / (float) ramp;
                     float g = (float) law.beginGain;
-                    for (int i = 0; i < count; ++i) { g += dg; a[c][i] *= g; }
+                    for (int i = 0; i < count; ++i) {
+                        if (i < ramp) g += dg; else g = (float) law.endGain;
+                        a[c][i] *= g;
+                    }
                 }
             }
 
@@ -1322,9 +1420,23 @@ private:
         const auto& d = stage_.device;
         publishLevels();   // ahead of the early return: they are the stage's, not the selection's
         sel_  = select(d, axes_, dial_, dialDeg_, shape_, topExtend_);
+        // ONE MODEL: the nearer capture alone, in the slot its parity names (targetB is then a rail),
+        // and the other slot asked for NOTHING — the law never loads a slot that wants nothing.
+        // Stepped with a deadband around the capture sounding now, which is remembered by its FILE ENTRY: an entry
+        // has one setting per control, so a switch to another panel cannot find it among the new knots and the step
+        // starts afresh there; unload() and setMaxModels() forget it.
+        if (maxModels_ == 1) {
+            int stay = -1;
+            for (std::size_t i = 0; i < sel_.knots.size(); ++i)
+                if (sel_.knots[i].file == stayFile_) { stay = (int) i; break; }
+            sel_ = steppedSelection(sel_, stay, kStepDeadband);
+            stayFile_ = sel_.pick.lo >= 0 ? sel_.knots[(std::size_t) sel_.pick.lo].file : -1;
+        }
         plan_ = slotPlan(sel_, d);
         if (plan_.file[0] < 0) { setRequest(0, 0, 0.0f); return; }
-        setRequest(modelIdOf(plan_.file[0]), modelIdOf(plan_.file[1]), (float) plan_.targetB);
+        std::uint64_t want[2] { modelIdOf(plan_.file[0]), modelIdOf(plan_.file[1]) };
+        if (maxModels_ == 1) want[plan_.targetB >= 0.5 ? 0 : 1] = 0;
+        setRequest(want[0], want[1], (float) plan_.targetB);
         for (int i = 0; i < 2; ++i) slotGain_[i].store(linOf(plan_.inputDb[i]), std::memory_order_release);
         chainGain_.store(linOf(sel_.extendDb), std::memory_order_release);
         stageDelays();
@@ -1776,6 +1888,8 @@ private:
     long long          loads_ = 0;
     int                bandsDropped_ = 0;
     double             coldSeconds_ = kColdAfterSeconds;
+    int                maxModels_ = 2;                 // setMaxModels; the audio side reads single_
+    int                stayFile_ = -1;                 // the file entry a one-model player sounds (kStepDeadband)
     // A 1/12-octave grid from 20 Hz to 20 kHz, on which every curve-form knob is summed whatever grid
     // it shipped on.
     std::vector<double> commonGrid_ = felitronics::lineareq::logFreqGrid(20.0, 20000.0, 121);
@@ -1788,6 +1902,7 @@ private:
     double ledgerFs_ = 0.0;      // the rate blend_'s host-sample counts are in; 0 = never prepared (restateInHostSamples)
     int    maxBlock_ = 0, channels_ = 1;
     bool   prepared_ = false;
+    long long dipSamples_ = 1;   // kDipSeconds at fs_, for the law's one-model dip
 
     // the mailboxes (message → audio, audio → message)
     felitronics::nam::NamStage nam_[2];
@@ -1811,6 +1926,9 @@ private:
     std::atomic<long long>     coldAfter_ { 0 };          // coldSeconds_ at fs_, for the law; 0 = never
     std::atomic<bool>          slotCold_[2] { false, false };
     std::atomic<int>           coldBlocks_[2] { 0, 0 };
+    std::atomic<int>           runBlocks_[2] { 0, 0 };
+    std::atomic<int>           pairBlocks_ { 0 };
+    std::atomic<bool>          single_ { false };       // setMaxModels(1), for the audio thread
     // The pack's own levels, and the reason they are two gains of their own rather than one more
     // term in chainGain_: inGain_ has to reach the dry side of a blend, and chainGain_ is applied
     // after the dry block has already been taken.
