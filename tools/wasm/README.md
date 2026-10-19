@@ -34,9 +34,15 @@ void          fc_guitar_fx_set_<knob> (fc_guitar_fx*, <int|float>);     // fifte
 prepare takes 1 kHz … 768 kHz and maxBlock 1 … 65536, allocates every line, and a refusal disarms the instance.
 process answers 1 when it processed all `n` frames and 0 when it refused without touching a sample; it allocates
 nothing and locks nothing, nor do reset and the setters. One thread owns an instance — in a worklet, the audio thread.
+A NULL right channel is a mono call, and it STOPS channel 1 (law 11a): the right-hand delay line and room are dropped,
+so a stream that alternates mono and stereo calls loses the right tail each time. There is no clock-only call (the
+stages' law-11c gap): a NULL left channel is refused; feed silence instead. A reset applies knobs set since the last
+block before it restarts the stages.
 
 **The knobs are the app's parameters, in the app's units** (percent where the face reads percent), at the app's
-defaults, each clamped onto the app parameter's range; a non-finite value is ignored. A setter records the value; the
+defaults, each clamped onto the app parameter's range; a non-finite value is ignored. The mapping is the app's under
+core's laws — DARK's curve is `core::det::pow` where the app calls `powf`, and the app still runs its own copies of
+the stages — so a render here sits ulp-level from the app's, not bit-identical to it. A setter records the value; the
 next `process()` hands every knob to the stages in the app's order before it runs them, as the app does at the top of
 every block.
 
@@ -84,15 +90,37 @@ The processor hands the `WebAssembly.Module` to the glue through `instantiateWas
 never builds a URL and never decodes text (it is linked `-sENVIRONMENT=worklet`); instantiating a compiled module is
 cheap on the audio thread, and one compile serves every node on the page. Why not the alternatives: `SINGLE_FILE`
 inlines the wasm as base64 (a third larger, and decoded and compiled ON the audio thread at construction), and a
-processor that fetched its own module cannot in a worklet. A browser that cannot clone a `WebAssembly.Module` into
-the worklet can post the bytes instead (`processorOptions: { wasmBytes }`); the processor then compiles once, at
-construction.
+processor that fetched its own module cannot in a worklet.
+
+**The bytes path.** WebKit does not throw on a `WebAssembly.Module` it cannot clone into the worklet: the option
+arrives as `null`. The processor then answers `{ error, retry: 'wasmBytes' }` and finishes. A page detects exactly
+that and retries with a second node:
+
+```js
+node.port.onmessage = async (e) => {
+    if (e.data.retry !== 'wasmBytes') return;
+    node.disconnect();
+    const wasmBytes = await (await fetch(wasmUrl)).arrayBuffer();
+    node = new AudioWorkletNode(context, 'fc-guitar-fx', { ...options, processorOptions: { wasmBytes, knobs } });
+};
+```
+
+That processor compiles the 32 KB itself — `new WebAssembly.Module(bytes)`, SYNCHRONOUSLY, on the audio thread,
+once, at construction — so the first quanta of that node may be late. Both paths render the same bits (tested).
+
+**Every end is final.** An `{ error }` it posts, or a `{ dispose: true }` it receives: the instance is destroyed,
+the module and the views are dropped, the port is closed, and `process()` answers false from then on, so the node and
+its ~25 MB of wasm memory can be collected without waiting for the context to close. The errors: no module, a module
+older than the processor, a refused prepare (a rate outside 1 kHz … 768 kHz), and a render quantum of another size
+than the one prepared (128, or the scope's `renderQuantumSize`) — that one passes its quantum dry, then ends.
 
 **Knobs travel as port messages, not AudioParams.** They are settings a hand moves — two switches, two choices —
 and the stages already glide what must glide (the delay's head, the room's parameters). An AudioParam would be read
 every quantum for fifteen knobs to find them unchanged; a message costs nothing until a knob moves, is handled on
 the audio thread between quanta, and is heard from the next quantum's first sample. Knobs posted before the module
-is up are queued and land before prepare, so the room starts at its character.
+is up are queued and land before prepare, so the room starts at its character. The integer knobs are settled in the
+processor, because a wasm `i32` takes ToInt32 of a number (NaN becomes 0, 2^32 wraps to 0): a non-finite value is
+ignored, a switch is any non-zero, a choice is rounded and clamped onto its range.
 
 `process()` allocates nothing per 128-frame quantum: it copies the input into two `Float32Array` views made once
 after prepare (onto `fc_guitar_fx_buffer`), calls the module, and copies back. A mono input plays on both channels;
@@ -119,12 +147,27 @@ fc_guitar_fx ABI <n>
 
 | file | raw | gzip | brotli |
 |---|---|---|---|
-| `fcguitarfx.wasm` | 32 418 | 15 150 | 13 285 |
-| `fcguitarfx.mjs` | 7 837 | 2 399 | 2 116 |
-| `fcguitarfx-worklet.js` | 6 899 | 2 701 | 2 297 |
+| `fcguitarfx.wasm` | 32 434 | 15 157 | 13 445 |
+| `fcguitarfx.mjs` | 7 844 | 2 392 | 2 111 |
+| `fcguitarfx-worklet.js` | 9 497 | 3 632 | 3 096 |
 
 The module's memory starts at 24 MiB (the policy's 8 MB stack plus emscripten's 16 MB default) and an instance
 allocates about 2.5 MB at 48 kHz, most of it the 6.1-second delay line.
+
+## Browser floor
+
+**Chrome 85, Firefox 79, Safari 15 (iOS 15)** — the newest of what the module asks for:
+
+- the glue's JavaScript, at emscripten's default floor (Chrome 85, Firefox 79, Safari 15: logical assignment, class
+  fields). A worklet-only link drops those minimums, and emscripten then reaches for growable ArrayBuffers
+  (`wasmMemory.toResizableBuffer()`, Chrome 144, Firefox 145, Safari 26.2 — every iPhone short of iOS 26 would fail at
+  instantiation); `-sGROWABLE_ARRAYBUFFERS=0` keeps it out, and the link then matches a `web,worklet` link at the
+  default floor except for the web loader (`CMakeLists.txt` says how that was measured);
+- the wasm's own features: non-trapping float-to-int and bulk memory (Chrome 75, Firefox 79, Safari 15) — found by
+  validating the module against MVP plus one feature at a time (binaryen's `wasm-opt --mvp-features --enable-…`);
+- module AudioWorklets with a static import (Chrome 66, Firefox 76, Safari 14.1).
+
+That floor is read from the toolchain's tables and the module, not tried on a device of each version.
 
 ## Tests
 
@@ -139,8 +182,12 @@ allocates about 2.5 MB at 48 kHz, most of it the 6.1-second delay line.
   `URL`, `TextDecoder`, `atob`, `setTimeout`), the module posted as a `WebAssembly.Module`; its exports are exactly
   the header's; four control settings rendered quantum by quantum through the processor's own `process()` against
   the native render within **2e-6** (law 10: native arm64 fuses `a*b + c`, wasm cannot — measured worst 1.2e-7, and
-  a native build with contraction off agrees with the wasm bit for bit); no allocation per quantum; and the cost of
-  one 128-frame stereo quantum at 48 kHz, reported.
+  a native build with contraction off agrees with the wasm bit for bit), any non-finite sample a failure of its own;
+  every processor runs with `WebAssembly.Memory.prototype.toResizableBuffer` deleted, as on an engine older than the
+  ones that have it, and the glue may not name it; the integer knobs' non-finite and out-of-range values; the bytes
+  path against the module path, bit for bit, and WebKit's null module; dispose, a refused prepare and a foreign
+  render quantum, each terminal and each freeing the instance; no allocation per quantum; and the cost of one
+  128-frame stereo quantum at 48 kHz, reported.
 
 ## Vendoring
 

@@ -11,7 +11,9 @@ driven by the app's fifteen knobs in the app's units and defaults, behind a C AB
 `fcguitarfx.mjs` + `fcguitarfx.wasm` (32 KB, 13 KB brotli) under core's FelitronicsPolicy, and
 `fcguitarfx-worklet.js` runs it in an AudioWorklet from a `WebAssembly.Module` the page posts. Suites: the ABI
 bit-identical to the core classes driven directly; the shipped module in a worklet-shaped scope against the native
-render (within 2e-6, law 10). Needs felitronics-core v0.61.0: the pin moves there from v0.51.0.
+render (within 2e-6, law 10). Browser floor: Chrome 85, Firefox 79, Safari 15. Needs felitronics-core v0.61.0: the pin
+moves there from v0.51.0; built by default only at the top level (`FELITRONICS_GUITAR_WITH_FX`), so a consumer on an
+older core is not affected.
 
 ## v0.1.0 — 2026-09-25
 
