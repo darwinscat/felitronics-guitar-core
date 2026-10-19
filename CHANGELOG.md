@@ -2,7 +2,7 @@
 
 # Changelog
 
-## v0.5.1 — unreleased
+## v0.5.1 — 2026-10-19
 
 ### rigplayer — the scope taps where the app taps
 
