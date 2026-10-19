@@ -2,6 +2,58 @@
 
 # Changelog
 
+## v0.6.0 — unreleased
+
+### rigplayer — the preload: a turn of the gain dial that never waits for a load
+
+- `RigPlayer::setPreload(on, maxModels = kPreloadWholePack)` (off by default — the player as before, bit for bit), from
+  the next `load()`: the player hands out jobs (the same `LoadJob`, `run()`, `deliver()`) for its SET until every copy
+  in it is prepared, and from then on neither a turn of the gain dial nor a switch within the set hands out one — a
+  slot takes its prepared copy at the next `service()`, the instant a delivered job would have landed it, and the law
+  warms and crossfades (or dips) it as ever. THE SET: the panel sounding — every (capture, slot) the plan can name along
+  the dial (asked of the plan itself at every knot, between every two and at both ends, two models and one), one copy
+  per (capture, slot) since both slots hold one file at the dial's ends and across a link: **11 copies for the site's
+  packs of eleven positions and nine files** — then the pack's other panels nearest first; by default every panel of
+  the pack. `preloadProgress()` reads it out. No preload job before `prepare()`.
+- Under a cap, a switch to a panel outside the set makes the set again around it and hands out only what the law asks
+  for — never more jobs than the player without the preload — unless the host says jobs cost nothing now
+  (`setPreloadIdle(true)`). An unfetched file is fetched again when the law asks for it. Those are the only jobs after
+  ready. A panel is told apart by its knots' files and the other controls' settings, so a pack with no gain dial has
+  panels too.
+- A copy is freed whole — its `NamStage` with its capture — when it leaves the set or the pack goes: at once if no slot
+  ever ran it, otherwise by the first `service()` after the audio thread has entered `process()` again (an audio clock
+  `process()` ticks before it reads a slot's stage). A stage is never cleared and reused: `NamStage` frees what it
+  retires only from its own `process()`. On the fixture, unload leaves 0.3 % of what the pack and its set held, and 200
+  evicting switches grow the heap by 16 KB (a set is 509 KB).
+- Memory: one copy is one `NamStage` holding its capture — **2.8 MB** natively and in the wasm module for the site's
+  WaveNets (NamStage builds two NAM instances, stereo). The whole pack: 11 copies (~31 MB) for X88-IR Crunch and V4
+  Sheriff Ch1, 44 (~123 MB) for IR-X Ch2, 66 (~185 MB) for IR-X Ch1 PowerAmp; the wasm module read 41.6 MiB with X88-IR
+  Crunch preloaded against 24.1 MiB without, and 179.4 MiB with IR-X Ch1 PowerAmp.
+- A copy taken again holds its last visit; a capture with a field is warmed past it by the law, and one with none is
+  drained (`NamStage::reset`, a memoryless capture's matcher) before it lands — without that, off the model rate it
+  replayed its last visit's tail (0.0139 at 44.1 kHz on the fixture; 5.5e-6 with it, the matcher's resumption floor).
+  At the model rate the preloaded player is bit for bit the plain one on the same dial path for WaveNets and direct
+  Linears, failures included; a dense `Linear` on NAM's partitioned FFT keeps its engine's clock (8.1e-8 on a 2001-tap
+  fixture, guarded at 1e-6), and a recurrent (LSTM) copy starts from its last visit (0.054 on the decaying-cell fixture).
+
+### fc_rig ABI 4 and the processor
+
+- `fc_rig_set_preload(n)` (0 off, n ≥ 1 on with at most n copies, 2147483647 the whole pack), `fc_rig_preload_pending`,
+  `fc_rig_preload_total`, `fc_rig_preload_failed`, `fc_rig_is_gain_dial`. `FC_RIG_ABI_VERSION` 4; the processor needs 4.
+- `fcrig-worklet.js`: `processorOptions.preload` (`true` = the whole pack, or a cap): at every pack the set is prepared
+  through the same `{ need }`, one job per quantum, SILENT; `{ preloaded: { pack, total, failed, quanta } }`; then the
+  start's calibration and play. While it preloads, switches, dials and levels land at once — `processorOptions.knobs`
+  and a `{ set }` posted before the module was up included — so the set is made around the panel asked for; the gain
+  dial (`gain`, or its name in `dial` or `switch`) and maxModels wait with the start.
+- Measured in Chromium 151 (Playwright, 'playback', 48 kHz, X88-IR Crunch, a continuous turn 0 → 300 → 0 at a degree
+  per 16 ms): without the preload 8 – 9 underruns (171 – 192 ms) in the first turn and 10 – 14 more in the second
+  (the bytes kept, the loads still run); with it 0 and 0 — the 2 – 4 it costs (43 – 85 ms) fall in the silent start.
+  In Playwright's Firefox 153 build one capture ran at 70 – 75 % of a quantum and a load took 305 – 315 ms, the same in a
+  plain Worker as in the worklet (whether the module was compiled from bytes or posted as a Module was not recorded);
+  that build calibrated to one model and lost 0.45 s of audio clock per DRIVE step without the preload, 0.13 s with it.
+  Whether a release Firefox, with the module compiled from bytes, is as slow is not measured here — the site's own
+  record (round 13) reads 259 – 300 µs a render there, 10 % of a quantum.
+
 ## v0.5.1 — 2026-10-19
 
 ### rigplayer — the scope taps where the app taps

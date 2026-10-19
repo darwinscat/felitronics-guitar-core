@@ -80,6 +80,26 @@ The contract in short (the header has it whole): one thread owns an instance; `p
 throw, and never allocate while the captures are Linear or WaveNet (LSTM and ConvNet allocate inside the pinned NAM); `prepare()` takes 1 kHz … 768 kHz, maxBlock 1 … 65536, 1 or 2 channels, and a refusal
 disarms; a mono call runs ONE network per sounding capture, so a guitar is prepared for 1 channel.
 
+### ABI 4 — the preload (v0.6.0)
+
+| entry point | what it is |
+|---|---|
+| `fc_rig_set_preload(rig, n)` | `RigPlayer::setPreload`: 0 off (the default), n ≥ 1 on with at most n prepared copies, 2147483647 (`kPreloadWholePack`) the whole pack — from the next `fc_rig_load` |
+| `fc_rig_preload_pending(rig)` | copies of the set not yet settled; 0 = ready (or not preloading) |
+| `fc_rig_preload_total(rig)` | copies in the set; 0 = the pack loaded is not preloading |
+| `fc_rig_preload_failed(rig)` | settled copies that failed or could not be fetched |
+| `fc_rig_is_gain_dial(rig, name)` | 1 = `name` is the loaded pack's gain dial |
+
+The jobs the preload hands out are the ordinary ones (`fc_rig_take_job` …). With the set ready, neither a turn of the
+gain dial nor a switch within the set takes one. `processorOptions.preload` (`true` = the whole pack, or a cap) turns it
+on in the processor: silent until the set is ready (`{ preloaded: { pack, total, failed, quanta } }`), then the start's
+calibration, then play — again at every `{ load }`. While it preloads, switches, dials and levels land at once — those in
+`processorOptions.knobs` and in a `{ set }` posted before the module was up too — so the set is made around the panel
+the page asked for; the gain dial (`gain`, or its name in `dial` or `switch`) and `maxModels` wait with the start. The
+whole pack is 11 copies for X88-IR Crunch and V4 Sheriff Ch1 (41.6 MiB of module memory against 24.1 MiB without), 44
+for IR-X Ch2, 66 for IR-X Ch1 PowerAmp (179.4 MiB), each prepared in its own quantum of the silent start. What the set
+is, its memory and what a copy taken again holds: the player's README, "The preload".
+
 ## The load job, across the boundary and across the port
 
 RigPlayer never loads by itself: its law asks for a capture and the host runs a JOB and brings it back. Inside the
@@ -288,6 +308,17 @@ bursts each, the median: one capture sounding **3.8 – 4.2 %** of the quantum (
 Ch1 and turned the blend on. In node (rig-parity.mjs): 3.6 % and 7.4 %. DevTools' CPU throttling does not reach the
 audio thread (×4 read the same), so the slow-machine decision is tested with an injected slow render instead.
 
+With the preload (Chromium 151, Playwright headless, `latencyHint: 'playback'`, 48 kHz, X88-IR Crunch, a continuous turn
+0 → 300 → 0 at a degree every 16 ms, `playbackStats` of a fresh context): without it 8 – 9 underruns (171 – 192 ms) in
+the first turn and 10 – 14 more in the second, where every byte is already kept and the loads still run; with it 0 in
+either — the 2 – 4 (43 – 85 ms) it costs fall in the silent start, eleven jobs back to back (11 copies in 105 quanta,
+the start 0.32 s against 0.19). Firefox 153 (Playwright's build) runs one capture at 70 – 75 % of a quantum and a load
+in 305 – 315 ms, in a plain module Worker as in the worklet (Chromium: 95 µs and 24 – 36 ms) — the engine, not the
+harness — and so calibrates to one model; a DRIVE step from capture to capture lost 0.45 s of audio clock without the
+preload and 0.13 s with it, and 602 knob messages in a turn cost nothing beyond the captures they crossed (in Chromium
+not one underrun): nothing heavy runs per knob move. What Firefox still pays per step is the one-model change itself —
+the incoming capture's warm-up beside the outgoing capture's drain — on an engine that runs one network at 75 %.
+
 ## Tests
 
 - `felitronics_rig_abi_tests` (ctest, native): the ABI against RigPlayer driven directly with a ModelSource — **bit for
@@ -304,6 +335,12 @@ audio thread (×4 read the same), so the slow-machine decision is tested with an
   level plus the feed; a feed of 0 is byte-identical to none); a missing file and garbage — failures,
   still bit for bit; a fetch that failed once is asked for again on a later visit and lands, still bit for bit; a job out across a load is dropped and jobs flow again; the contract; no allocation in
   `process()`/`reset()` through loads and dips.
+- `felitronics_rig_preload_tests` (ctest, native): the preload on the fixture pack — the set (seven copies: green's four
+  knots, its two ends' twins, red's one; one job each, each file fetched once), then ZERO jobs through a turn 0 → 300 → 0
+  a degree a block, a switch and back, two models and one; bit for bit with the plain player on that path at the model
+  rate (failures included: a capture that is not one, a file not fetched), within 1e-4 at 44.1 kHz (5.5e-6, the
+  matcher's floor; 0.0139 before a memoryless copy was drained at its landing); no allocation in `process()`; unload
+  frees the set, a load makes it again; ABI 4 through the C surface, bit for bit with RigPlayer.
 - `felitronics_rig_wasm_parity` (ctest when `FELITRONICS_GUITAR_RIG_WASM_DIR` names `build.sh`'s output; real packs
   too with `FELITRONICS_GUITAR_RIG_PACKS`; `node --experimental-vm-modules --expose-gc rig-parity.mjs <dir>
   <fc_rig_render> <abi header> [<packs dir>]`): the processor and the glue as ES modules in a context shaped like an
@@ -325,7 +362,7 @@ audio thread (×4 read the same), so the slow-machine decision is tested with an
   BigInt knob is ignored; no module, a refused prepare, a
   foreign quantum and a trap — one error, dry, alive, only dispose ends; no allocation per quantum (under 4 bytes of
   JS heap per quantum over 15 000, no garbage collection — a boxed number per quantum reads 16.5 … 17.1); the cost of
-  one quantum with one capture and with two, reported.
+  one quantum with one capture and with two, reported; ABI 4 — with the preload, every pack is silent until `{ preloaded }`, calibrates after it, and a turn 0 → sweep → 0 a degree a quantum posts no `{ need }` and runs no job; the preloaded processor bit for bit with a plain one on the same input and dial path.
 
 ## What a page owes it
 
