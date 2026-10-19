@@ -49,6 +49,7 @@ if (typeof vm.SourceTextModule !== 'function') {
 const TOLERANCE = 2e-5;
 const PACKS = ['X88-IR Crunch', 'IR-X Ch1 PowerAmp', 'V4 Sheriff Ch1'];
 const Q = 128;
+const SCOPE_N = 2048;   // the player's scope tap: what a { scope } carries back at most
 
 let failures = 0, checks = 0;
 const ok = (cond, msg) => { ++checks; if (!cond) { ++failures; console.log('    FAIL: ' + msg); } };
@@ -57,8 +58,15 @@ const group = (name) => console.log('  - ' + name);
 // ---- the simulated AudioWorkletGlobalScope -------------------------------------------------------------------------
 class AudioWorkletProcessor {
     constructor() {
-        this.port = { onmessage: null, posted: [], closed: false,
-                      postMessage(m) { this.posted.push(m); }, close() { this.closed = true; } };
+        // A port as a page's end of it sees one: a message posted WITH a transfer list arrives as the structured
+        // clone (the listed buffers detached here, the receiver's its own), and the list is recorded.
+        this.port = { onmessage: null, posted: [], transferred: [], closed: false,
+                      postMessage(m, transfer) {
+                          const list = transfer || [];
+                          this.transferred.push(...list);
+                          this.posted.push(list.length ? structuredClone(m, { transfer: list }) : m);
+                      },
+                      close() { this.closed = true; } };
     }
 }
 const GLUE = fs.readFileSync(path.join(dir, 'fcrig.mjs'), 'utf8');
@@ -167,21 +175,37 @@ function scriptOf(moves) {
         for (const k in s.switch || {}) args.push(at, 'switch', k, String(s.switch[k]));
         for (const k in s.dial || {}) args.push(at, 'dial', k, String(s.dial[k]));
         if (s.gain !== undefined) args.push(at, 'gain', String(s.gain));
+        if (s.feed !== undefined) args.push(at, 'feed', String(s.feed));
+        if (s.standby !== undefined) args.push(at, 'standby', s.standby ? '1' : '0');
     }
     return args;
 }
 
-function renderNative(packDir, sr, frames, channels, maxModels, moves, ins) {
-    const args = [packDir, String(sr), String(frames), String(channels), 'max', String(maxModels), ...scriptOf(moves)];
+function renderNative(packDir, sr, frames, channels, maxModels, moves, ins, scopeEvery = 0) {
+    const scopeFile = scopeEvery > 0 ? path.join(fixtureDir, 'scope.bin') : null;   // one file, removed with the fixture
+    const args = [packDir, String(sr), String(frames), String(channels), 'max', String(maxModels),
+                  ...(scopeFile ? ['scope', scopeFile, String(scopeEvery)] : []), ...scriptOf(moves)];
     const input = Buffer.alloc(frames * 4 * channels);
     for (let c = 0; c < channels; ++c) Buffer.from(ins[c].buffer).copy(input, c * frames * 4);
     const r = spawnSync(renderBin, args, { input, maxBuffer: frames * 4 * channels + 1024 });
     if (r.status !== 0) throw new Error(`fc_rig_render exited ${r.status}: ${r.stderr}`);
     const out = new Float32Array(r.stdout.buffer.slice(r.stdout.byteOffset, r.stdout.byteOffset + frames * 4 * channels));
-    return Array.from({ length: channels }, (_, c) => out.subarray(c * frames, (c + 1) * frames));
+    const outs = Array.from({ length: channels }, (_, c) => out.subarray(c * frames, (c + 1) * frames));
+    if (!scopeFile) return outs;
+    // fc_rig_render's records: int32 n, float64 frames, 2048 dry, 2048 wet.
+    const bin = fs.readFileSync(scopeFile), rec = 4 + 8 + 2 * SCOPE_N * 4, scopes = [];
+    for (let at = 0; at + rec <= bin.length; at += rec) {
+        const dv = new DataView(bin.buffer, bin.byteOffset + at, rec);
+        const f = new Float32Array(bin.buffer.slice(bin.byteOffset + at + 12, bin.byteOffset + at + rec));
+        scopes.push({ n: dv.getInt32(0, true), frames: dv.getFloat64(4, true), dry: f.subarray(0, SCOPE_N), wet: f.subarray(SCOPE_N) });
+    }
+    return { outs, scopes };
 }
 
-async function renderWorklet(w, packDir, frames, channels, maxModels, moves, ins, override) {
+async function renderWorklet(w, packDir, frames, channels, maxModels, moves, ins, override, scopeEvery = 0) {
+    let buf = scopeEvery > 0 ? new ArrayBuffer(2 * SCOPE_N * 4) : null;   // the page's ONE scope buffer, travelling
+    const scopes = [];
+    let travelBad = 0;   // a { scope } that did not travel as a page's does: transferred out, transferred back
     const proc = await newProcessor(w, packDir, { calibrate: false, maxModels, stereo: channels === 2 });
     const iL = new Float32Array(Q), iR = new Float32Array(Q), oL = new Float32Array(Q), oR = new Float32Array(Q);
     const outs = Array.from({ length: channels }, () => new Float32Array(frames));
@@ -195,8 +219,23 @@ async function renderWorklet(w, packDir, frames, channels, maxModels, moves, ins
         outs[0].set(oL, at);
         if (channels === 2) outs[1].set(oR, at);
         answer(proc, w, packDir, override);
+        if (buf && (at / Q + 1) % scopeEvery === 0) {
+            const inbound = structuredClone({ scope: buf }, { transfer: [buf] });   // the page posts it, transferred
+            const mark = proc.port.posted.length;
+            proc.port.onmessage({ data: inbound });
+            const back = proc.port.posted.slice(mark).find((m) => m.scope !== undefined);
+            if (!back || !proc.port.transferred.includes(inbound.scope) || inbound.scope.byteLength !== 0
+                || !(back.scope instanceof ArrayBuffer) || back.scope.byteLength !== 2 * SCOPE_N * 4) {
+                ++travelBad;
+                buf = new ArrayBuffer(2 * SCOPE_N * 4);
+                continue;
+            }
+            const f = new Float32Array(back.scope);
+            scopes.push({ n: back.n, frames: back.frames, dry: f.slice(0, SCOPE_N), wet: f.slice(SCOPE_N) });
+            buf = back.scope;
+        }
     }
-    return { outs, proc };
+    return { outs, proc, scopes, travelBad };
 }
 
 /** Knob moves for a pack, read off its manifest: the gain dial through captures and between them, every other
@@ -251,9 +290,9 @@ group('the worklet loads in an AudioWorkletGlobalScope, and its exports are the 
     const want = [...fs.readFileSync(header, 'utf8').matchAll(/^[A-Za-z_][A-Za-z0-9_ *]* (fc_rig_[a-z_]+) \(/gm)]
         .map((m) => '_' + m[1]).sort();
     const got = Object.keys(proc.m).filter((k) => k.startsWith('_fc_rig_')).sort();
-    ok(want.length === 35, `the header declares 35 entry points (read ${want.length})`);
+    ok(want.length === 39, `the header declares 39 entry points (read ${want.length})`);
     ok(JSON.stringify(got) === JSON.stringify(want), `the module exports exactly the header's entry points\n      got  ${got}\n      want ${want}`);
-    ok(proc.m._fc_rig_abi_version() === 1, 'abi_version answers 1');
+    ok(proc.m._fc_rig_abi_version() === 2, 'abi_version answers 2');
     ok(!/toResizableBuffer/.test(GLUE), 'the glue never calls WebAssembly.Memory.toResizableBuffer (Chrome 144+)');
     proc.port.onmessage({ data: { dispose: true } });
 }
@@ -277,6 +316,55 @@ for (const pack of packs) {
         ok(c.within(TOLERANCE), `${label}: worst ${c.worst}, ${c.nonFinite} non-finite, against ${TOLERANCE}`);
         ok(peak > 0.01 && loads.length >= 2 && loads.every((m) => m.ok), `${label}: the pack plays, every load landed`);
         ok(!proc.port.posted.some((m) => m.error), `${label}: no error`);
+        proc.port.onmessage({ data: { dispose: true } });
+    }
+}
+
+group(`ABI 2 — the scope and PARK through the processor, against the native render, within ${TOLERANCE}`);
+{
+    const early = await newProcessor(w0, null, { calibrate: false });
+    const probe = new ArrayBuffer(2 * SCOPE_N * 4);
+    early.port.onmessage({ data: { scope: probe } });
+    const first = early.port.posted.findLast((m) => m.scope !== undefined);
+    ok(first && early.port.transferred.includes(probe) && probe.byteLength === 0 && first.scope.byteLength === 2 * SCOPE_N * 4
+       && first.n === 0 && first.frames === 0,
+       'a { scope } before anything was rendered goes back transferred (detached here, whole there): n 0, frames 0');
+    early.port.onmessage({ data: { dispose: true } });
+    for (const pack of [packs[0], ...(realPack !== packs[0] ? [realPack] : [])]) {
+        const frames = Math.round(48000 * 3 / Q) * Q;
+        const at = (s) => Math.round(48000 * s / Q) * Q;
+        const moves = [
+            { frame: at(0.4), set: { feed: 4 } },
+            { frame: at(0.9), set: { standby: true } },          // PARK…
+            { frame: at(1.2), set: { gain: 60, feed: -3 } },     // …knobs and the feed moved while stood by…
+            { frame: at(1.6), set: { standby: false } },         // …and back
+            { frame: at(2.0), set: { standby: true } },          // a fade cut short both ways
+            { frame: at(2.0) + 3 * Q, set: { standby: false } },
+            { frame: at(2.5), set: { feed: 0 } },
+        ];
+        const ins = [makeInput(frames, 48000, 0)];
+        const every = 8;
+        const { outs, proc, scopes, travelBad } = await renderWorklet(w0, pack.dir, frames, 1, 2, moves, ins, undefined, every);
+        const ref = renderNative(pack.dir, 48000, frames, 1, 2, moves, ins, every);
+        const c = compare(outs, ref.outs);
+        let worst = 0, frameMiss = 0, nMiss = 0, still = 0, fresh = 0;
+        for (let k = 0; k < Math.min(scopes.length, ref.scopes.length); ++k) {
+            const a = scopes[k], b = ref.scopes[k];
+            if (a.n !== b.n) ++nMiss;
+            if (a.frames !== b.frames) ++frameMiss;
+            if (k > 0) { if (a.frames === scopes[k - 1].frames) ++still; else ++fresh; }
+            for (let i = 0; i < a.n; ++i)
+                worst = Math.max(worst, Math.abs(a.dry[i] - b.dry[i]), Math.abs(a.wet[i] - b.wet[i]));
+        }
+        console.log(`      ${pack.name}: output worst ${c.worst.toExponential(3)}; ${scopes.length} frames read, scope worst `
+                    + `${worst.toExponential(3)}, ${fresh} fresh and ${still} unchanged (stood by)`);
+        ok(c.within(TOLERANCE), `${pack.name}: the output through PARK and back, worst ${c.worst}`);
+        ok(scopes.length === ref.scopes.length && scopes.length > 100 && nMiss === 0 && frameMiss === 0 && worst <= TOLERANCE,
+           `${pack.name}: every scope frame — its count, its length, both sides — the native one's (worst ${worst})`);
+        ok(still > 5 && fresh > 50, `${pack.name}: the count stands still while stood by and moves otherwise`);
+        ok(travelBad === 0, `${pack.name}: every scope buffer went back in the transfer list — detached on the processor's `
+           + `side, the frame whole on the page's (${travelBad} did not)`);
+        ok(!proc.port.posted.some((m) => m.error), `${pack.name}: no error`);
         proc.port.onmessage({ data: { dispose: true } });
     }
 }
@@ -495,6 +583,48 @@ group('the start decides again at every { load }, and only on valid evidence');
     ok(again.length === 1 && again[0].maxModels === 1 && again[0].share > 0.25,
        `the { load } re-arms the start: timed again, slow now, one model (${JSON.stringify(again.map((c) => c.maxModels))})`);
     ok(loudBefore === 0, '…silent until it decided');
+    proc.port.onmessage({ data: { dispose: true } });
+}
+group('PARK does not wait for the start: a { load } while parked plays the wire, the start resumes on the return');
+{
+    const proc = await newProcessor(w0, fixtureDir);                       // calibrate: on (the default)
+    play(proc, 400, () => answer(proc, w0, fixtureDir));
+    const decided = proc.port.posted.filter((m) => m.calibrated).length;
+    proc.port.onmessage({ data: { standby: true } });
+    play(proc, 40, () => answer(proc, w0, fixtureDir));
+    const mark = proc.port.posted.length;
+    proc.port.onmessage({ data: { load: w0.buffer(fs.readFileSync(path.join(fixtureDir, 'rig.json'))) } });
+    const n = 300 * Q, xin = new Float32Array(n), yL = new Float32Array(n), yR = new Float32Array(n);
+    const oL = new Float32Array(Q), oR = new Float32Array(Q);
+    for (let q = 0; q < 300; ++q) {
+        riffAt = (riffAt + Q) % RIFF.length;
+        const x = RIFF.subarray(riffAt, riffAt + Q);
+        proc.process([[x]], [[oL, oR]], {});
+        xin.set(x, q * Q); yL.set(oL, q * Q); yR.set(oR, q * Q);
+        answer(proc, w0, fixtureDir);
+    }
+    const lat = proc.m._fc_rig_latency_samples(proc.rig);
+    let wire = true, energy = 0;
+    for (let i = lat; i < n && wire; ++i) { wire = yL[i] === xin[i - lat] && yR[i] === yL[i]; energy += yL[i] * yL[i]; }
+    ok(decided === 1 && wire && energy > 1,
+       `parked, a { load }: 300 quanta of the input at fc_rig_latency_samples (${lat}), bit for bit — not silence (energy ${energy.toFixed(1)})`);
+    ok(after(proc, mark, (m) => m.calibrated).length === 0 && proc.calState === 'waiting',
+       '…and the start waits: no burst, no decision while it stands by');
+    proc.port.onmessage({ data: { standby: false } });
+    proc.port.onmessage({ data: { set: { gain: 240 } } });   // sent during the start: both wait for it, in order
+    proc.port.onmessage({ data: { set: { gain: 60 } } });
+    const back = proc.port.posted.length;
+    let q = 0;
+    for (; q < 600 && after(proc, back, (m) => m.calibrated).length === 0; ++q) play(proc, 1, () => answer(proc, w0, fixtureDir));
+    const at = proc.port.posted.findIndex((m, i) => i >= back && m.calibrated);
+    const early = proc.port.posted.slice(back, at < 0 ? undefined : at).some((m) => m.loaded === 'g240.nam' || m.loaded === 'g60.namz');
+    const peak = play(proc, 300, () => answer(proc, w0, fixtureDir));
+    proc.port.onmessage({ data: { read: true } });
+    const st = proc.port.posted.findLast((m) => m.state);
+    ok(at >= 0, `back: the start resumes and decides again (a second { calibrated } after ${q} quanta)`);
+    ok(!early && peak > 0.01 && st && st.state.sounding.tagged === true,
+       `…the knobs sent during it land after it, in order (the last one, 60 — the tagged capture — sounds; peak ${peak.toFixed(3)})`);
+    ok(!proc.port.posted.some((m) => m.error), 'no error');
     proc.port.onmessage({ data: { dispose: true } });
 }
 for (const [what, install] of [

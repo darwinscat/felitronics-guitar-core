@@ -12,7 +12,11 @@
 // The script is the processor's knob messages, each at the frame of the quantum it lands before:
 //   @<frame> max <1|2>     @<frame> gain <deg>     @<frame> dial <name> <deg>     @<frame> switch <name> <value>
 //   @<frame> normalize <0|1>   @<frame> trims <0|1>   @<frame> shape <point> <width>   @<frame> reset
-// …and `max <1|2>` before the first `@` is the budget set before the pack loads (the processor's maxModels option).
+//   @<frame> standby <0|1>     @<frame> feed <db>                                                  (ABI 2)
+// …and `max <1|2>` before the first `@` is the budget set before the pack loads (the processor's maxModels option);
+// `scope <file> <every>` before the first `@` writes the scope as the processor answers { scope } — after every
+// <every>-th quantum's render and pump, one record: int32 samples read, float64 fc_rig_scope_frames, then kScope
+// floats of dry and kScope of wet (zeros past what was read), little-endian.
 //
 // THE SCHEDULE, as the processor keeps it: prepare(rate, 128, channels); the budget; the pack loaded; then per
 // quantum: the messages due, process(), and the job pump — take a job; if it needs bytes, they arrive (the page
@@ -33,6 +37,7 @@
 namespace
 {
 constexpr int kQuantum = 128;
+constexpr int kScope = 2048;   // what the processor asks for: the player's whole tap
 
 std::vector<char> readFile (const std::string& path)
 {
@@ -66,7 +71,8 @@ int main (int argc, char** argv)
     const long frames = std::atol (argv[3]);
     const int channels = std::atoi (argv[4]);
 
-    int budget = 0;
+    int budget = 0, scopeEvery = 0;
+    std::string scopePath;
     std::vector<Move> moves;
     for (int i = 5; i < argc;)
     {
@@ -74,9 +80,10 @@ int main (int argc, char** argv)
         if (argv[i][0] == '@') { m.frame = std::atol (argv[i] + 1); m.kind = argv[++i]; }
         ++i;
         const auto arg = [&] (std::string& s) { if (i < argc) s = argv[i++]; };
-        if (m.kind == "dial" || m.kind == "switch" || m.kind == "shape") { arg (m.a); arg (m.b); }
+        if (m.kind == "dial" || m.kind == "switch" || m.kind == "shape" || m.kind == "scope") { arg (m.a); arg (m.b); }
         else if (m.kind != "reset") arg (m.a);
         if (m.frame < 0 && m.kind == "max") budget = std::atoi (m.a.c_str());
+        else if (m.frame < 0 && m.kind == "scope") { scopePath = m.a; scopeEvery = std::atoi (m.b.c_str()); }
         else moves.push_back (m);
     }
 
@@ -89,7 +96,8 @@ int main (int argc, char** argv)
     const auto manifest = readFile (dir + "/rig.json");
     if (fc_rig_load (rig, manifest.data(), (int) manifest.size()) != 1) { std::fprintf (stderr, "load refused\n"); return 1; }
 
-    std::vector<float> out (in.size());
+    std::vector<float> out (in.size()), dry ((std::size_t) kScope), wet ((std::size_t) kScope);
+    std::FILE* scope = scopeEvery > 0 && ! scopePath.empty() ? std::fopen (scopePath.c_str(), "wb") : nullptr;
     float* io[2] { fc_rig_buffer (rig, 0), channels > 1 ? fc_rig_buffer (rig, 1) : nullptr };
     std::size_t next = 0;
     for (long at = 0; at < frames; at += kQuantum)
@@ -106,6 +114,8 @@ int main (int argc, char** argv)
             else if (m.kind == "trims") fc_rig_set_input_trims (rig, (int) x);
             else if (m.kind == "shape") fc_rig_set_blend_shape (rig, x, std::atof (m.b.c_str()));
             else if (m.kind == "reset") fc_rig_reset (rig);
+            else if (m.kind == "standby") fc_rig_set_standby (rig, (int) x);
+            else if (m.kind == "feed") fc_rig_set_feed_db (rig, x);
         }
         const long n = std::min<long> (kQuantum, frames - at);
         for (int c = 0; c < channels; ++c)
@@ -125,7 +135,19 @@ int main (int argc, char** argv)
             fc_rig_job_run (rig);
             fc_rig_job_deliver (rig);
         }
+        if (scope != nullptr && (at / kQuantum + 1) % scopeEvery == 0)
+        {
+            std::fill (dry.begin(), dry.end(), 0.0f);
+            std::fill (wet.begin(), wet.end(), 0.0f);
+            const int32_t got = fc_rig_scope_read (rig, dry.data(), wet.data(), kScope);
+            const double written = fc_rig_scope_frames (rig);
+            std::fwrite (&got, sizeof got, 1, scope);
+            std::fwrite (&written, sizeof written, 1, scope);
+            std::fwrite (dry.data(), sizeof (float), dry.size(), scope);
+            std::fwrite (wet.data(), sizeof (float), wet.size(), scope);
+        }
     }
+    if (scope != nullptr) std::fclose (scope);
     std::fwrite (out.data(), sizeof (float), out.size(), stdout);
     fc_rig_destroy (rig);
     return 0;

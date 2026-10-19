@@ -24,14 +24,15 @@ Signal order, per block:
 
 | call | thread |
 |---|---|
-| `prepare(rate, maxBlock, channels ≤ 2)` | message, never while `process()` runs |
+| `prepare(rate, maxBlock, channels ≤ 2, scopeSamples = 2048)` | message, never while `process()` runs |
 | `load(rig, source)` / `unload()` | message |
-| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` | message |
+| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setStandby` | message |
 | `service()` then `takeLoadJob()` | message, from a timer — a few times a second at least |
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
 | `process(io, channels, n)` | audio — locks nothing, touches no file; allocates nothing with Linear and WaveNet captures (LSTM and ConvNet allocate inside the pinned NAM) |
 | every read-out (`liveMix`, `heldFileId`, `soundingLoudness`, `selection`, `knobValue`, `runBlocks`, `pairBlocks`, the drawing readers…) | message |
+| `scopeRead(dry, wet, n)` / `scopeFrames()` / `standingBy()` | any — lock-free beside `process()`; never beside `prepare()` |
 
 **Loading is a job the host runs.** `service()` never loads. When the law wants a model,
 `takeLoadJob()` hands out ONE job at a time — slot, `files[].id`, the bytes if already fetched, the
@@ -95,6 +96,50 @@ machine, which starts with one and turns the blend on only once it has measured 
 
 The order, the invariants and the one exception are `nam::blendStepSingle`'s; the law owns the dip
 as it owns the weight.
+
+## The scope tap — OrbitAmp's ScopeTap, inside the player
+
+The pictures of a device (the app's SHAPE) want what went in and what came out, sample beside sample. With the player
+those points are inside it, so it keeps the tap: a ring of the newest `kScopeSize` (2048 — `ScopeTap::size`; another
+length at `prepare()`, 0 = none) samples of channel 0, written once per block the device runs:
+
+- **dry** — the DI as fed: after the pack's input level (or the host's), before the pre tone — the dry copy the blend
+  knob mixes, held back by `latencySamples()` exactly as that copy is;
+- **wet** — the models' mix: both slots aligned, weighed, through the law's gain — before the post tone, the blend
+  knob and the pack's output level.
+
+So the two stand sample for sample as far as the player aligns anything: the rate-match is taken out, a capture's own
+lag is not (the player never takes it out of the sound either). In the app the tap sits around the whole block
+(`CapturedBlock.h:544-556`: the dry copied before the drive and the player, the wet the player's output); here it sits
+around the models, which is where the site's tap sat around TONE3000's node — a pack's tone knobs and output level do
+not move the picture, its input level and pre tone do.
+
+`scopeRead(dry, wet, n)` copies the newest `min(n, size, written)` of both, oldest first, with the wet scaled to the
+dry's RMS — the app's `ScopeTap::read` (`ScopeTap.h:42-72`), which matches in the reader: "a boost that is merely
+louder would drown" what the device did. It answers how many it copied; 0 = nothing written since `prepare()`.
+`scopeFrames()` counts the samples written, so a reader knows a frame is fresh. No lock and no torn frame: the writer
+claims what it is about to write, fences, writes relaxed atomic floats and publishes; the reader copies between the
+published end and the claim and throws the copy away if the writer may have reached it (two blocks of slack; retried
+`kScopeTries` times, then 0). That 0 does not leave the caller's arrays as they were — every try copies into them,
+so they then hold a copy the writer may have torn, not a frame: a reader that wants to keep its previous frame reads
+into scratch of its own and copies out on a non-zero answer (the worklet does). `scopeFrames()` is the count when it
+is read, not tied to the snapshot a concurrent reader got. A block processed with no input channel writes no tap. The
+audio side pays one fence and two stores a block.
+
+## Stand-by — OrbitAmp's PARK
+
+`setStandby(true)`: the output crossfades over 15 ms (`kStandbyFadeMs`, the app's `BypassFade`, linear, its own
+arithmetic) to a WIRE — the input at `latencySamples()`, unity, none of the pack's levels — and once the fade is down
+the device is not run: no models on audio, no tone, no law, no ramps, no scope (`standingBy()` says so). `false` fades
+it back in over the same 15 ms. Knobs set meanwhile are taken on the first block back as the app's frozen player takes
+them (the law steps from where it stood, bands glide, gains ramp); the input level arrives instead of ramping — the
+app's block IN, `lastInGain = inTarget` (`PluginProcessor.cpp:1494-1495`).
+
+Where it is stricter than the app: the app stops calling the player, so its networks and filters replay what they held
+when PARK came (0.399 out of digital silence on a 1500-sample capture, measured). Here a pause is silence (core's law
+11c): when the fade ends the filters, convolvers, the dry ring and the slot delay lines are stopped (`clearAudioState`,
+not a restart), and both stages get the width-zero call every stood-by block — each drains what it owes once, as a
+cold slot does, and costs nothing after.
 
 ## What a host must do
 

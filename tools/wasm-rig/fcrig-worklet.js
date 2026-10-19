@@ -36,8 +36,34 @@
 //       }
 //       // { ready, abi }  { calibrated: { renderUs, quantumUs, share, maxModels, renders, elapsedMs, valid, reason } }
 //       // { loaded, ok }  { pack: n, ok, sweep }  { state: {…} }  { error }
+//       if (data.scope) frame = data;                         // the scope's buffer, back: see THE SCOPE below
 //   };
-//   node.port.postMessage({ set: { gain: 210, dial: { Bass: 120 }, switch: { Bright: 'Center' } } });
+//   node.port.postMessage({ set: { gain: 210, dial: { Bass: 120 }, switch: { Bright: 'Center' }, feed: 6 } });
+//   node.port.postMessage({ standby: true });                 // PARK; { standby: false } plays again (THE PARK below)
+//
+// THE SCOPE (ABI 2: fc_rig_scope_read — OrbitAmp's ScopeTap): the page owns ONE ArrayBuffer of 2·n floats and
+// sends it ({ scope: buffer }, transferred); the processor copies the newest frame into it — the dry in floats
+// [0, n), the wet at the dry's RMS in [n, 2n), n ≤ 2048 — and sends the same buffer back, transferred:
+// { scope: buffer, n: <samples read, 0 = none yet>, frames: <the tap's count> }. `frames` moves only when the
+// tap was written, so an unchanged count is a frame already drawn (and stood by, it does not move). Why a buffer
+// that travels rather than one the processor posts: a fresh 16 KB array per frame is 1 MB/s of garbage made ON THE
+// AUDIO THREAD at 60 fps, and its collector runs there too; a transferred buffer is neither copied by the structured
+// clone nor allocated by either side — what each message costs is the message object and one view of the buffer,
+// a few dozen bytes, on the port, never in process(). One request in flight: the page asks again when it is back.
+// WHERE IT TAPS — not where OrbitAmp's own code taps. The dry is the DI after the pack's input level and the feed,
+// held back by the player's latency; the wet is the models' mix BEFORE the pack's post tone, its blend knob and its
+// output level. That is the app's web spec ("the model's, before the tone stack", src/core/Monitor.cpp:189-191) and
+// the site's tap around TONE3000's node; the app's code taps around its WHOLE player (src/core/CapturedBlock.h:544-556:
+// the dry before the input level, undelayed; the wet after the pack's tone stack and levels), so a pack with a post
+// tone or a blend draws another SHAPE there. A device handed no input channel writes no tap.
+//
+// THE PARK ({ standby }) DOES NOT WAIT. Every other knob that arrives while the start decides is held until it has
+// decided; PARK is applied at once (before the module is up: as soon as it is), because a parked player runs no
+// network — the start's evidence cannot come while it stands by, so a PARK held behind it would hold for ever and a
+// { load } while parked would be silence for good. So: parked, the start pauses (no burst, no decision), the
+// output is the player's own — the fade, then the input at the latency — whatever the start's state, and the start
+// resumes on { standby: false }, silent until it decides, as after any { load }. { set: { standby } } is the same
+// message.
 //
 // THE START, AND THE DECISION IT MAKES — AGAIN AT EVERY PACK. A browser's audio thread may afford two networks or
 // only one, and the only honest way to know is to time one on it. So, unless processorOptions.calibrate is false: at
@@ -81,7 +107,7 @@
 
 import createFcRig from './fcrig.mjs';
 
-const ABI = 1;              // the oldest fc_rig ABI this processor speaks
+const ABI = 2;              // the oldest fc_rig ABI this processor speaks (2: the scope, stand-by, the feed)
 const BLEND_SHARE = 0.25;   // the blend (two models) is turned on when ONE render costs at most this share of a quantum
 const CAL_MS = 30;          // the calibration burst lasts at least this long by Date.now
 const CAL_MAX = 20000;      // …and at most this many renders
@@ -90,6 +116,7 @@ const CAL_FLOOR_MS = 10;    // a burst Date.now saw last less than this is not e
 const SPIN_MAX = 1e6;       // the wait for the burst's first tick gives up after this many reads (a stopped clock)
 const NEED_MS = 10000;      // a { need } unanswered this long is answered by the processor itself, with nothing
 const SCRATCH = 1024;       // module memory for the two strings of a knob (name, value): 511 UTF-8 bytes each
+const SCOPE = 2048;         // the player's scope tap: the most one { scope } carries back
 
 /** UTF-8 into the module's memory at `p`, NUL-terminated; false when it does not fit. No TextEncoder in a worklet. */
 function putUtf8(heap, p, s, room) {
@@ -143,6 +170,7 @@ class FcRigProcessor extends AudioWorkletProcessor {
         this.calState = this.calibrate ? 'waiting' : 'off';   // waiting -> steady -> done
         this.calTries = 0;
         this.queued = o.knobs ? [o.knobs] : [];               // knobs held until the start's decision
+        this.parked = o.knobs ? o.knobs.standby === true : false;   // PARK as asked: never queued (THE PARK)
         this.firstRig = o.rig || null;
         this.pack = 0;           // which load() the job out belongs to (the page echoes it)
         this.awaiting = null;    // the files[].id a job out is waiting for, or null
@@ -215,6 +243,7 @@ class FcRigProcessor extends AudioWorkletProcessor {
             }
             this.m = m;
             this.rig = m._fc_rig_create();
+            if (this.rig && this.parked) m._fc_rig_set_standby(this.rig, 1);   // before prepare: parked from sample one
             this.block = globalThis.renderQuantumSize || 128;
             this.needQuanta = this.needMs > 0 ? Math.max(1, Math.ceil(this.needMs * sampleRate / (1000 * this.block))) : 0;
             if (!this.rig || !m._fc_rig_prepare(this.rig, sampleRate, this.block, this.stereo ? 2 : 1)) {
@@ -222,6 +251,7 @@ class FcRigProcessor extends AudioWorkletProcessor {
                 return;
             }
             this.scratch = m._fc_rig_alloc(SCRATCH);
+            this.scopeAt = m._fc_rig_alloc(2 * SCOPE * 4);   // the frame's two halves in the module, read from there
             m._fc_rig_set_max_models(this.rig, this.maxModels);
             this.views();
             this.port.postMessage({ ready: true, abi });
@@ -265,7 +295,8 @@ class FcRigProcessor extends AudioWorkletProcessor {
     }
 
     /** A knob message: { set: { maxModels, normalize, inputTrims, blendShape: [point, width], switch: { name: value },
-        dial: { name: degrees }, gain: degrees } }, applied in that order. */
+        dial: { name: degrees }, gain: degrees, feed: dB } }, applied in that order. A `standby` in it is THE PARK's, taken
+        by onMessage before the set is queued. */
     apply(s) {
         const m = this.m, rig = this.rig;
         if (s.maxModels === 1 || s.maxModels === 2) { this.maxModels = s.maxModels; m._fc_rig_set_max_models(rig, s.maxModels); }
@@ -275,6 +306,23 @@ class FcRigProcessor extends AudioWorkletProcessor {
         if (s.switch) for (const k in s.switch) this.named(k, String(s.switch[k]));
         if (s.dial) for (const k in s.dial) this.named(k, num(s.dial[k]));
         if (s.gain !== undefined) m._fc_rig_set_gain_dial(rig, num(s.gain));
+        if (s.feed !== undefined) m._fc_rig_set_feed_db(rig, num(s.feed));
+    }
+
+    /** { scope: ArrayBuffer } — the newest frame into the page's own buffer, which goes straight back (THE SCOPE). A
+        buffer is always answered, before the module is up and after an error too: n 0. */
+    scope(buf) {
+        if (Object.prototype.toString.call(buf) !== '[object ArrayBuffer]') return;   // any realm's: instanceof is per realm
+        const n = Math.min(SCOPE, Math.floor(buf.byteLength / 8));
+        let got = 0, frames = 0;
+        if (this.rig && !this.failed && n > 0) {
+            const m = this.m;
+            got = m._fc_rig_scope_read(this.rig, this.scopeAt, this.scopeAt + 4 * n, n);
+            frames = m._fc_rig_scope_frames(this.rig);
+            const heap = m.HEAPF32, at = this.scopeAt >> 2, out = new Float32Array(buf, 0, 2 * n);
+            for (let i = 0; i < got; ++i) { out[i] = heap[at + i]; out[n + i] = heap[at + n + i]; }
+        }
+        this.port.postMessage({ scope: buf, n: got, frames }, [buf]);
     }
 
     named(name, value) {
@@ -296,6 +344,18 @@ class FcRigProcessor extends AudioWorkletProcessor {
     onMessage(d) {
         if (!d || this.done) return;
         if (d.dispose) { this.dispose(); return; }
+        if (d.scope !== undefined) {
+            try {
+                this.scope(d.scope);
+            } catch (e) {   // a trap inside the read: said, and the buffer still goes back (n 0)
+                this.trap(e);
+                try { this.port.postMessage({ scope: d.scope, n: 0, frames: 0 }, [d.scope]); } catch (e2) { /* gone */ }
+            }
+            return;
+        }
+        // THE PARK: never queued. Mirrored here, applied now if the module is up, by start() otherwise.
+        const park = d.standby !== undefined ? d.standby : d.set && d.set.standby !== undefined ? d.set.standby : undefined;
+        if (park !== undefined) this.parked = park === true;
         if (this.failed) return;
         if (!this.rig) {   // not up yet: knobs wait, a pack replaces the first one
             if (d.set && this.queued) this.queued.push(d.set);
@@ -303,6 +363,7 @@ class FcRigProcessor extends AudioWorkletProcessor {
             return;
         }
         try {
+            if (park !== undefined) this.m._fc_rig_set_standby(this.rig, this.parked ? 1 : 0);
             if (d.unload) { this.m._fc_rig_unload(this.rig); ++this.pack; this.awaiting = null; }
             if (d.load) {
                 if (this.calibrate) this.rearm();
@@ -453,15 +514,15 @@ class FcRigProcessor extends AudioWorkletProcessor {
             if (this.R) { if (inR) this.R.set(inR); else this.R.fill(0); }
             m._fc_rig_process(this.rig, this.pL, this.pR, this.block);
             if (this.L.buffer !== m.HEAPF32.buffer) this.views();   // the render grew it (an allocating architecture)
-            if (this.calState === 'done' || this.calState === 'off') {
-                oL.set(this.L);
+            if (this.calState === 'done' || this.calState === 'off' || this.parked) {
+                oL.set(this.L);   // parked: the player's own (the fade, then the wire) whatever the start's state
                 if (oR) oR.set(this.R || this.L);
             } else {
                 oL.fill(0);   // the start is silent until it has decided
                 if (oR) oR.fill(0);
             }
             this.pump();
-            if (this.calState === 'waiting' || this.calState === 'steady') this.calibrateStep();
+            if (!this.parked && (this.calState === 'waiting' || this.calState === 'steady')) this.calibrateStep();
         } catch (e) {
             this.trap(e);
             if (inL) { oL.set(inL); if (oR) oR.set(inR); }

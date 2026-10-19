@@ -62,7 +62,7 @@ float sample (int i, int ch)
     return (float) v;
 }
 
-enum class Kind { Gain, Dial, Switch, Max, Normalize, Trims, Shape, Reset, Reload, Unload };
+enum class Kind { Gain, Dial, Switch, Max, Normalize, Trims, Shape, Reset, Reload, Unload, Standby, Feed };
 struct Event { int block; Kind kind; std::string name, value; double a = 0.0, b = 0.0; };
 
 /** The player as the app drives it: a ModelSource over the files, one job per pump, run and delivered in place. */
@@ -72,17 +72,22 @@ struct Direct
     Files files;
     Counts refuse;
     long long fetched = 0, jobs = 0;
+    bool fed = false;      // the host's feed, stated as a host with a fader states it: the pack's own level plus it
+    double feedDb = 0.0;
 
+    void feed() { if (fed) p.setHostInputDb (p.stageInputDb() + feedDb); }
     bool load (const std::string& manifest)
     {
         bool okParse = false;
         const auto rig = namz::rig::loadRigManifest (manifest, &okParse);
-        if (! okParse) { p.unload(); return false; }
-        return p.load (rig, [this] (const std::string& id) {
+        if (! okParse) { p.unload(); feed(); return false; }
+        const bool loaded = p.load (rig, [this] (const std::string& id) {
             ++fetched;
             const auto it = files.find (id);
             return it == files.end() || refused (refuse, id) ? std::vector<std::byte> {} : it->second;
         });
+        feed();
+        return loaded;
     }
     void pump()
     {
@@ -135,7 +140,9 @@ void applyDirect (Direct& d, const Event& e, const std::string& manifest)
         case Kind::Shape:     d.p.setBlendShape ({ e.a, e.b }); break;
         case Kind::Reset:     d.p.reset(); break;
         case Kind::Reload:    (void) d.load (manifest); break;
-        case Kind::Unload:    d.p.unload(); break;
+        case Kind::Unload:    d.p.unload(); d.feed(); break;
+        case Kind::Standby:   d.p.setStandby (e.a != 0.0); break;
+        case Kind::Feed:      d.fed = true; d.feedDb = e.a; d.feed(); break;
     }
 }
 
@@ -153,12 +160,15 @@ void applyAbi (Abi& a, const Event& e, const std::string& manifest)
         case Kind::Reset:     fc_rig_reset (a.r); break;
         case Kind::Reload:    (void) fc_rig_load (a.r, manifest.c_str(), (int) manifest.size()); break;
         case Kind::Unload:    fc_rig_unload (a.r); break;
+        case Kind::Standby:   fc_rig_set_standby (a.r, e.a != 0.0 ? 1 : 0); break;
+        case Kind::Feed:      (void) fc_rig_set_feed_db (a.r, e.a); break;
     }
 }
 
 struct Outcome
 {
     int  differBlocks = 0, firstDiffer = -1;
+    int  scopeDiffer = 0, scopeReads = 0;   // blocks whose scope frame (or count) differed; reads that had a frame
     double energy = 0.0, moved = 0.0;
     long long handed = 0, abiJobs = 0, fetched = 0, directJobs = 0, failed = 0;
     int runs = 0, pairs = 0;
@@ -211,6 +221,17 @@ Outcome compare (const Files& files, int channels, int maxBeforeLoad, const std:
             }
         }
         if (! same) { ++o.differBlocks; if (o.firstDiffer < 0) o.firstDiffer = b; }
+        // The scope as a page reads it after a quantum: the newest 2048 of both sides, through the ABI and directly.
+        {
+            static std::vector<float> ad (2048), aw (2048), dd (2048), dw (2048);
+            const int an = fc_rig_scope_read (a.r, ad.data(), aw.data(), 2048);
+            const int dn = d.p.scopeRead (dd.data(), dw.data(), 2048);
+            const bool scopeSame = an == dn && (double) d.p.scopeFrames() == fc_rig_scope_frames (a.r)
+                && std::memcmp (ad.data(), dd.data(), sizeof (float) * (std::size_t) an) == 0
+                && std::memcmp (aw.data(), dw.data(), sizeof (float) * (std::size_t) an) == 0;
+            if (! scopeSame) ++o.scopeDiffer;
+            if (an > 0) ++o.scopeReads;
+        }
         d.pump();
         a.pump();
     }
@@ -288,6 +309,25 @@ void bitIdentity()
     const auto reload = compare (files, 1, 0, reloads, 700);
     report ("reload, unload, reload", reload, 700);
     ok (reload.differBlocks == 0 && reload.energy > 1.0, "a pack loaded again, unloaded, loaded again: identical, playing");
+    ok (two.scopeDiffer == 0 && one.scopeDiffer == 0 && stereo.scopeDiffer == 0 && reload.scopeDiffer == 0
+        && two.scopeReads > 1000, "ABI 2: the scope frame and its count are the player's, bit for bit, after every block");
+
+    // ABI 2: PARK and the feed — stood by mid-sweep, knobs and the feed moved while it stands by, back; a fade cut
+    // short both ways; a reload under a feed.
+    auto park = theHand();
+    park.insert (park.end(), { { 1050, Kind::Feed, "", "", 4.0 }, { 1070, Kind::Standby, "", "", 1.0 },
+                               { 1090, Kind::Gain, "", "", 60.0 }, { 1095, Kind::Dial, "Treble", "", 60.0 },
+                               { 1100, Kind::Feed, "", "", -3.0 }, { 1120, Kind::Standby, "", "", 0.0 },
+                               { 1140, Kind::Standby, "", "", 1.0 }, { 1142, Kind::Standby, "", "", 0.0 },
+                               { 1160, Kind::Reload }, { 1180, Kind::Feed, "", "", 0.0 } });
+    for (const int ch : { 1, 2 })
+    {
+        const auto o = compare (files, ch, 0, park, 1300);
+        report (ch == 1 ? "PARK and the feed, mono" : "PARK and the feed, stereo", o, 1300);
+        ok (o.differBlocks == 0 && o.scopeDiffer == 0 && o.energy > 1.0,
+            std::string ("ABI 2, ") + (ch == 1 ? "mono" : "stereo") + ": stand-by, a fade cut short both ways, knobs and "
+            "the feed moved while stood by, a reload under a feed — output and scope identical");
+    }
 }
 
 void jobProtocol()
@@ -353,10 +393,102 @@ void jobProtocol()
     }
 }
 
+/** The feed's MEANING, not its forwarding (bitIdentity drives both sides through the same sum, so it proves only that
+    the sum is carried): the device's input level is the pack's own plus the feed — read off the dry tap, which is the
+    input times exactly that level — and it follows the pack across a reload; a feed of 0 is no feed at all. */
+void feedMeaning()
+{
+    group ("the feed: the pack's input level plus it, on the dry tap, across a reload; 0 is no feed");
+    const auto fixture = fc_rig_fixture::pack();
+    bool okParse = false;
+    auto rig = namz::rig::loadRigManifest (fixture.manifest, &okParse);
+    test::run (okParse && rig.chain.size() == 1 && rig.chain[0].inputDb == -2.0);
+    rig.chain[0].inputDb = -6.0;
+    const std::string minus6 = namz::rig::writeManifest (rig);
+
+    int clock = 0;
+    const auto play = [&clock] (Abi& a, int blocks, std::vector<float>* out = nullptr) {
+        for (int b = 0; b < blocks; ++b, clock += kBlock)
+        {
+            float* io = fc_rig_buffer (a.r, 0);
+            for (int i = 0; i < kBlock; ++i) io[i] = sample (clock + i, 0);
+            test::run (fc_rig_process (a.r, io, nullptr, kBlock) == 1);
+            if (out != nullptr) out->insert (out->end(), io, io + kBlock);
+            a.pump();
+        }
+    };
+    // The dry tap's last block against the input of that block times `g`, bit for bit (48 kHz: no hold).
+    const auto dryIs = [&clock] (Abi& a, float g) {
+        std::vector<float> d (kBlock), w (kBlock);
+        if (fc_rig_scope_read (a.r, d.data(), w.data(), kBlock) != kBlock || fc_rig_latency_samples (a.r) != 0) return false;
+        for (int i = 0; i < kBlock; ++i)
+            if (d[(std::size_t) i] != sample (clock - kBlock + i, 0) * g) return false;
+        return true;
+    };
+    {
+        Abi a; a.files = fixture.files;
+        test::run (fc_rig_prepare (a.r, kFs, kBlock, 1) == 1);
+        test::run (fc_rig_load (a.r, minus6.c_str(), (int) minus6.size()) == 1);
+        test::run (fc_rig_set_feed_db (a.r, 6.0) == 1);
+        play (a, 60);
+        ok (dryIs (a, 1.0f), "a pack at -6 dB in, the feed +6: the dry tap is the input itself (linOf(0) = 1), bit for bit");
+        test::run (fc_rig_load (a.r, fixture.manifest.c_str(), (int) fixture.manifest.size()) == 1);
+        play (a, 60);
+        ok (dryIs (a, (float) std::pow (10.0, 4.0 / 20.0)),
+            "…reloaded to a pack at -2 dB, the feed still +6: the dry tap follows to the new level plus the feed (+4 dB)");
+    }
+    {
+        Abi none, zero;
+        none.files = zero.files = fixture.files;
+        for (Abi* a : { &none, &zero })
+        {
+            test::run (fc_rig_prepare (a->r, kFs, kBlock, 1) == 1);
+            test::run (fc_rig_load (a->r, fixture.manifest.c_str(), (int) fixture.manifest.size()) == 1);
+        }
+        test::run (fc_rig_set_feed_db (zero.r, 0.0) == 1);
+        std::vector<float> outNone, outZero;
+        const int start = clock;
+        play (none, 300, &outNone);
+        clock = start;
+        play (zero, 300, &outZero);
+        double energy = 0.0;
+        for (const float v : outNone) energy += (double) v * v;
+        ok (energy > 1.0 && outNone.size() == outZero.size()
+                && std::memcmp (outNone.data(), outZero.data(), sizeof (float) * outNone.size()) == 0,
+            "a feed of 0 dB: the output byte-identical to a feed never set, 300 blocks");
+    }
+}
+
 void contract()
 {
     group ("the contract");
-    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 1u, "abi_version answers the header's 1");
+    {
+        std::vector<float> d (16), w (16);
+        ok (fc_rig_scope_read (nullptr, d.data(), w.data(), 16) == 0 && fc_rig_scope_frames (nullptr) == 0.0
+            && fc_rig_set_feed_db (nullptr, 1.0) == 0, "ABI 2 on a NULL instance: nothing read, nothing written, refused");
+        fc_rig_set_standby (nullptr, 1);
+        fc_rig* r = fc_rig_create();
+        ok (fc_rig_scope_read (r, d.data(), w.data(), 16) == 0 && fc_rig_scope_frames (r) == 0.0,
+            "an instance never prepared has no frame");
+        test::run (fc_rig_prepare (r, kFs, kBlock, 1) == 1);
+        ok (fc_rig_set_feed_db (r, std::numeric_limits<double>::quiet_NaN()) == 0
+            && fc_rig_set_feed_db (r, std::numeric_limits<double>::infinity()) == 0 && fc_rig_set_feed_db (r, 3.0) == 1,
+            "a non-finite feed is refused, a finite one taken");
+        ok (fc_rig_scope_read (r, d.data(), w.data(), 16) == 0, "prepared, nothing processed: no frame yet");
+        float* io = fc_rig_buffer (r, 0);
+        std::fill (io, io + kBlock, 0.1f);
+        test::run (fc_rig_process (r, io, nullptr, kBlock) == 1);
+        ok (fc_rig_scope_read (r, d.data(), w.data(), 16) == 16 && fc_rig_scope_frames (r) == (double) kBlock
+            && fc_rig_scope_read (r, nullptr, w.data(), 16) == 0 && fc_rig_scope_read (r, d.data(), w.data(), 0) == 0,
+            "one block: a frame, the count moved by the block; a NULL array or n < 1 reads nothing");
+        fc_rig_set_standby (r, 1);
+        for (int k = 0; k < 10; ++k) test::run (fc_rig_process (r, io, nullptr, kBlock) == 1);
+        const double frames = fc_rig_scope_frames (r);
+        test::run (fc_rig_process (r, io, nullptr, kBlock) == 1);
+        ok (fc_rig_scope_frames (r) == frames, "stood by, the count stands still");
+        fc_rig_destroy (r);
+    }
+    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 2u, "abi_version answers the header's 2");
     fc_rig* r = fc_rig_create();
     float x[4] {};
     ok (fc_rig_process (r, x, nullptr, 4) == 0, "process before prepare is refused");
@@ -445,6 +577,7 @@ int main()
     std::printf ("felitronics_rig_abi_tests\n");
     contract();
     bitIdentity();
+    feedMeaning();
     jobProtocol();
     noAllocation();
     return felitronics::test::report();

@@ -25,7 +25,7 @@ keeps either set of flags from leaking into the other.
 ## The ABI
 
 ```c
-uint32_t fc_rig_abi_version (void);                                         // 1
+uint32_t fc_rig_abi_version (void);                                         // 2
 fc_rig*  fc_rig_create (void);   void fc_rig_destroy (fc_rig*);
 int      fc_rig_prepare (fc_rig*, double rate, int maxBlock, int channels);  // 1 ok, 0 refused (disarmed)
 float*   fc_rig_buffer (fc_rig*, int channel);                               // maxBlock floats in the module's memory
@@ -47,13 +47,31 @@ double   fc_rig_sounding_db (fc_rig*);   int fc_rig_sounding_tagged (fc_rig*);  
 int      fc_rig_held (fc_rig*, int slot);   int fc_rig_latency_samples (fc_rig*);
 int      fc_rig_run_blocks (fc_rig*, int slot);   int fc_rig_pair_blocks (fc_rig*);   int fc_rig_warm_blocks (fc_rig*);
 void     fc_rig_clear_counters (fc_rig*);
+// ABI 2
+int      fc_rig_scope_read (fc_rig*, float* dry, float* wet, int n);   // the newest ≤ 2048 of the tap; 0 = none yet
+double   fc_rig_scope_frames (fc_rig*);                                // samples written to the tap: moves = fresh
+void     fc_rig_set_standby (fc_rig*, int on);                         // PARK: 15 ms to the wire, then not run
+int      fc_rig_set_feed_db (fc_rig*, double db);                      // the block's IN on top of the pack's level
 ```
 
 The setters are the ones the app's block calls (`setDial`, `setSwitch`, `setBlendShape`, `setInputTrims`) plus
 `setMaxModels` and `setNormalize`; the read-outs are what a face shows (`soundingLoudness`) and what a host measures its
-budget by (`runBlocks`, `pairBlocks`). Not exposed in ABI 1: the host-level hand (`setHostInputDb/OutputDb` — a page
-has its own INPUT and OUTPUT around the player), tone overrides, the alignment table, the cold rest, the drawing
-read-outs. Each is one append away. **Compatibility is append-only** exactly as `fc_guitar_fx`'s.
+budget by (`runBlocks`, `pairBlocks`). **Compatibility is append-only** exactly as `fc_guitar_fx`'s.
+
+### ABI 2 — what the site's demo needs that ABI 1 lacked (read off its `sound/chain.ts` and `sound/engine.ts`)
+
+| the site today | in the app | ABI 2 |
+|---|---|---|
+| SHAPE from a scope worklet around TONE3000's node (`readScope`, `ScopeRing`) | `ScopeTap`, written by the captured block (`CapturedBlock.h:556`), level-matched in its reader | `fc_rig_scope_read` + `fc_rig_scope_frames` (the points are `RigPlayer::scopeRead`'s: the DI as fed and the models' mix, aligned) |
+| PARK as GainNodes around the node, `setTargetAtTime` with τ = 10 ms (~40 ms to settle) | the captured block crossfaded to its wire over `BypassFade`'s 15 ms, then not run (`PluginProcessor.cpp:1397-1559`) | `fc_rig_set_standby` |
+| TURBO's push and the position's trim as one gain before the node (`setFeed`) | the push is the block's IN (`Channels.cpp` `blockIn`), applied after the wire and before the dry tap, only while the block runs, ARRIVING on the way back; the position's trim is the player's own (`files[].input_db`) | `fc_rig_set_feed_db` (the push only; the trim is already applied) |
+
+Looked at and NOT added, because the page has them already or the app keeps them outside its block: the INPUT and
+OUTPUT trims, the cuts, the cabinet, the delay and the room (all around the node), the loudness lift (the player
+normalises, -18 dB), BASS/MIDDLE/TREBLE (the pack's tone through `{ set: { dial } }` — ABI 1), the capture swap's dip
+(the player's law), latency (`fc_rig_latency_samples`). Not exposed still, each one append away: the host OUTPUT level,
+tone overrides, the alignment table, the cold rest, the drawing read-outs, the app's drive for a device with no gain
+axis (`CapturedBlock.h:546-552` — the site's packs all have one).
 
 The contract in short (the header has it whole): one thread owns an instance; `process()` and `reset()` never lock or
 throw, and never allocate while the captures are Linear or WaveNet (LSTM and ConvNet allocate inside the pinned NAM); `prepare()` takes 1 kHz … 768 kHz, maxBlock 1 … 65536, 1 or 2 channels, and a refusal
@@ -107,11 +125,28 @@ node.port.onmessage = async ({ data }) => {                                 // r
 node.port.postMessage({ set: { gain: 210, dial: { Bass: 120, Treble: 200 }, switch: { Boost: 'on' } } });
 node.port.postMessage({ load: otherRigJsonArrayBuffer });                   // another pack
 node.port.postMessage({ read: true });                                      // → { state: { sounding, latency, … } }
+node.port.postMessage({ standby: true });                                   // PARK (ABI 2); false plays again
+let scope = new ArrayBuffer(2 * 2048 * 4);                                  // the page's ONE scope buffer
+node.port.postMessage({ scope }, [scope]);                                  // → { scope, n, frames }: it, transferred back
 node.port.postMessage({ dispose: true });                                   // the only end
 ```
 
 `{ set }` takes `maxModels`, `normalize`, `inputTrims`, `blendShape: [point, width]`, `switch: { name: value }`,
-`dial: { name: degrees }` and `gain` (the crossfade dial, whatever the pack names it), applied in that order. Names
+`dial: { name: degrees }`, `gain` (the crossfade dial, whatever the pack names it) and `feed` (dB), applied in that
+order, and queued while the start decides. `{ standby }` (PARK; `{ set: { standby } }` is the same) is NEVER queued: a
+parked player runs no network, so the start's evidence cannot come while it stands by, and a PARK held behind it held
+for ever — a `{ load }` while parked was silence for good. It is applied at once (before the module is up, as soon as
+it is); while parked the start pauses and the output is the player's own (the fade, then the input at the latency)
+whatever the start's state; `{ standby: false }` resumes the start, silent until it decides, as after any `{ load }`.
+
+**The scope (ABI 2).** The page owns one `ArrayBuffer` of `2·n` floats (`n` ≤ 2048) and sends it, transferred; the
+processor copies the newest frame into it — dry in `[0, n)`, wet at the dry's RMS in `[n, 2n)` — and sends the
+buffer back, transferred (the page's own memory again, a new `ArrayBuffer` object): `{ scope, n: <read; 0 = none yet>, frames: <the tap's count> }`. An unchanged `frames` is a
+frame already drawn (stood by, it does not move). Before the module is up, or after an error, the buffer still comes
+back, `n` 0. Why a travelling buffer: a fresh 16 KB array posted per frame is ~1 MB/s of garbage made on the audio
+thread at 60 fps, collected there too; a transferred buffer is neither copied by the structured clone nor allocated on
+either side — a message costs the message object and one view, on the port, never in `process()`. One request in
+flight: ask again when it is back. The read happens on the audio thread between quanta, so it can never tear. Names
 and values travel as UTF-8 written by the processor itself (a worklet may have no TextEncoder or TextDecoder). Options:
 `stereo: true` plays two channels (two networks per capture); `calibrate: false` skips the start's decision and
 starts at `maxModels` (2 if absent); `needTimeoutMs` (above). Loading, the bytes path (`wasmBytes`, WebKit's null module), errors and dispose
@@ -181,7 +216,7 @@ felitronics-guitar-core <git describe>
 felitronics-core v0.61.1
 NeuralAmpModelerCore v0.5.4
 namz v4.1.0
-fc_rig ABI 1
+fc_rig ABI 2
 emscripten 6.0.9 (…)
 flags -fno-exceptions -fno-rtti -msimd128 -msse4.1; exceptions on the NAM objects only, wasm legacy EH
 wasm features sign-ext nontrapping-float-to-int simd exception-handling
@@ -189,9 +224,9 @@ wasm features sign-ext nontrapping-float-to-int simd exception-handling
 
 | file | raw | gzip | brotli |
 |---|---|---|---|
-| `fcrig.wasm` | 796 298 | 285 546 | 215 577 |
-| `fcrig.mjs` | 12 047 | 3 985 | 3 593 |
-| `fcrig-worklet.js` | 20 332 | 6 687 | 5 868 |
+| `fcrig.wasm` | 802 547 | 287 555 | 217 169 |
+| `fcrig.mjs` | 12 395 | 4 058 | 3 654 |
+| `fcrig-worklet.js` | 27 973 | 9 264 | 8 127 |
 
 (TONE3000's `nam-engine.wasm`, which the site ships today, is 415 269 raw: NAM alone, no player, no tone, no pack.) The
 module's memory starts at 24 MiB and grows as captures load.
@@ -254,7 +289,11 @@ audio thread (×4 read the same), so the slow-machine decision is tested with an
   bit**, on the fixture pack: two models and one (set before the load, then 1 → 2 → 1 while playing), mono and stereo,
   the gain swept across captures, the link and past the top, a channel switch, tone and blend knobs, normalisation and
   input trims off and on, a blend shape, a reset, a pack loaded again and unloaded; the jobs and the bytes handed in
-  where the source was asked (each file once, revisits from the kept bytes); a missing file and garbage — failures,
+  where the source was asked (each file once, revisits from the kept bytes); ABI 2: the scope frame and its count
+  bit for bit after every block of every scenario, and PARK — stood by mid-sweep, a fade cut short both ways, knobs and
+  the feed moved while stood by, a reload under a feed — mono and stereo, output and scope bit for bit; the feed's
+  MEANING, not only its forwarding (a pack at -6 dB fed +6 taps the input itself, a reload follows the new level plus
+  the feed, a feed of 0 is byte-identical to none); a missing file and garbage — failures,
   still bit for bit; a fetch that failed once is asked for again on a later visit and lands, still bit for bit; a job out across a load is dropped and jobs flow again; the contract; no allocation in
   `process()`/`reset()` through loads and dips.
 - `felitronics_rig_wasm_parity` (ctest when `FELITRONICS_GUITAR_RIG_WASM_DIR` names `build.sh`'s output; real packs
@@ -266,7 +305,11 @@ audio thread (×4 read the same), so the slow-machine decision is tested with an
   Eigen spells its own multiply-add: fused on native arm64's NEON, not on SIMD128 — measured 1.2e-7 on the fixture,
   1.7e-6 … 5.5e-6 on X88-IR Crunch, IR-X Ch1 PowerAmp, V4 Sheriff Ch1, two models and one); garbage for a capture is a
   failed load, not a trap, and growing the memory mid-stream; the start's decision with a real pack (blend on) and an
-  injected slow render (one model), the silent start, the queued knobs in order; the load protocol across the port —
+  injected slow render (one model), the silent start, the queued knobs in order; ABI 2 — PARK never queued (a
+  `{ load }` while parked plays the wire bit for bit, the start resumes on the return and decides again, the knobs sent
+  during it land after it in order); the `{ scope }` round trip as a page's port carries it (the reply in the
+  transfer list, detached on the processor's side, the frame whole on the page's; `n` 0 before anything rendered) and every frame of a render through PARK and back against
+  `fc_rig_render`'s (count, length, both sides; 8.9e-8 on the fixture, 8.3e-7 on X88-IR Crunch), frozen while stood by; the load protocol across the port —
   a first capture that fails ends the start at one model, an answer of null is asked for again, an answer with no
   `{ need }` out posts nothing, an answer forty quanta late lands, an old pack's answer is dropped, an unanswered
   `{ need }` times out and the next job flows; a `{ load }` decides again (slow now: one model); a stopped clock and
