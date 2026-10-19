@@ -19,7 +19,10 @@ Guitar-amp DSP for the Darwin's Cat products, on top of [felitronics-core](https
 
 And for the browser, `tools/wasm` — `fcguitarfx`, the amps' echo and room (core's `delay::TapeDelay` and
 `reverb::AmpReverb` driven by the app's knobs) behind the `fc_guitar_fx` C ABI, as a wasm module and an AudioWorklet
-processor: [`tools/wasm/README.md`](tools/wasm/README.md).
+processor: [`tools/wasm/README.md`](tools/wasm/README.md). And `tools/wasm-rig` — `fcrig`, the pack player itself
+(`rigplayer` with NAM) behind the `fc_rig` C ABI, as a wasm module and an AudioWorklet processor that fetches its
+captures through the page and decides at its start whether the browser can afford the blend of two:
+[`tools/wasm-rig/README.md`](tools/wasm-rig/README.md).
 
 ## Build
 

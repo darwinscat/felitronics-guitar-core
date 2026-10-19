@@ -5,6 +5,7 @@
 /cmake-build-*/
 /out/
 /tools/wasm/build/
+/tools/wasm-rig/build/
 *.o
 *.obj
 *.a

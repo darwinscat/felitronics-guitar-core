@@ -51,7 +51,8 @@
 //
 // Threads, exactly as NamStage: prepare() / load() / the knob setters / service() / takeLoadJob() /
 // deliver() on the message thread; run() on any thread but the audio one; process() alone on the audio
-// thread — it allocates nothing, locks nothing, touches no file. The read-outs are atomics.
+// thread — it locks nothing, touches no file, and allocates nothing while the captures are Linear or
+// WaveNet (an LSTM or ConvNet capture allocates inside the pinned NAM: NamStage.h). The read-outs are atomics.
 
 #include <felitronics/rigplayer/AlignmentTable.h>
 #include <felitronics/rigplayer/BlendKnob.h>
@@ -891,12 +892,15 @@ public:
 
     // Message thread. The light half: the bytes kept (fetched once per file, however many times the
     // dial crosses it), the model installed in its slot, the law told it landed — or failed. A job from
-    // a pack that is gone is dropped whole: the law was told to start over when the pack left.
+    // a pack that is gone is dropped whole: the law was told to start over when the pack left. An EMPTY
+    // answer is not kept: it is the source's "could not fetch it", not the file, so the file is asked for
+    // again the next time the law wants it (bytes that are not a model ARE kept — they are the file).
     void deliver(Loaded loaded) {
         jobOut_ = false;
         auto& job = loaded.job;
         if (job.generation != gen_ || ! loaded_) return;
-        if (loaded.fetched && job.model >= 1 && job.model <= models_.size()) {
+        if (loaded.fetched && loaded.bytes != nullptr && ! loaded.bytes->empty()
+                && job.model >= 1 && job.model <= models_.size()) {
             auto& m = models_[(std::size_t) job.model - 1];
             if (m.bytes == nullptr) { m.bytes = loaded.bytes; ++loads_; }
         }
