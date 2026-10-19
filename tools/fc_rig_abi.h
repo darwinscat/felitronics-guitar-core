@@ -74,6 +74,7 @@
 //   1         everything below but the ABI-2 block
 //   2         + fc_rig_scope_read, fc_rig_scope_frames, fc_rig_set_standby, fc_rig_set_feed_db
 //   3         no entry point added: fc_rig_scope_read draws OrbitAmp's two points around the whole player (v0.5.1)
+//   4         + fc_rig_set_preload, fc_rig_preload_pending, fc_rig_preload_total, fc_rig_preload_failed (v0.6.0)
 //
 // ====================================================================================
 // ABI 2 — THE SCOPE, PARK AND THE FEED (OrbitAmp's ScopeTap, its PARK, its block IN)
@@ -105,10 +106,40 @@
 //                     A non-finite db is refused (0). A change GLIDES, as the player's every level does (rampInto,
 //                     about 10 ms); the app's IN trim ramps over one host block instead (PluginProcessor.cpp:1497 —
 //                     2.7 ms at 128 samples, 10.7 ms at 512), and on the return from PARK it arrives, here as there.
+//
+// ====================================================================================
+// ABI 4 — THE PRELOAD (RigPlayer::setPreload): a turn of the gain dial that never waits for a load
+// ====================================================================================
+// In a worklet a load job runs on the audio thread (THE CONTRACT): 24 - 49 ms per capture in Chromium, so a turn of
+// the gain dial across captures underran at every capture it reached. With the preload on, the player prepares the
+// pack's captures BEFORE they are asked for — the jobs come out of fc_rig_take_job as ever, one at a time, and the host
+// runs them as ever, while it is silent — and once the set is ready neither a turn of the gain dial nor a switch within
+// the set hands out a job: a slot takes its prepared copy at the next fc_rig_take_job, and the law crossfades (or dips)
+// as before.
+//   fc_rig_set_preload(n)   0 = off (the default; the player as before, bit for bit); n >= 1 = on, at most n prepared
+//                     copies; 2147483647 (RigPlayer::kPreloadWholePack, what `preload: true` passes) = the whole pack.
+//                     From the NEXT fc_rig_load. THE SET: the panel sounding — every capture of the gain axis at the
+//                     other controls' settings, one copy per (capture, slot) the dial can put it in: 11 for the site's
+//                     packs of eleven positions and nine files — whole, whatever n; then the pack's other panels (every
+//                     captured combination of the other controls), nearest first, while the set stays within n. Under
+//                     a cap, a switch to a panel outside the set makes the set again around it, and what it lacks is a
+//                     job only when the law asks for it — as many as without the preload. Memory: one copy is one
+//                     capture prepared, ~2.8 MB (natively and in the module) for the site's WaveNets; the whole pack is
+//                     11 copies (~31 MB) for X88-IR Crunch and V4 Sheriff Ch1, 44 (~123 MB) for IR-X Ch2, 66 (~185 MB)
+//                     for IR-X Ch1 PowerAmp. A copy is freed when it leaves the set or the pack goes, by the next
+//                     fc_rig_take_job after a render. Answers 1; 0 for a negative n or no instance.
+//   fc_rig_preload_pending()  copies of the set not yet settled; 0 = ready (or not preloading). A copy settles prepared,
+//                     or failed (its bytes were not a capture), or unfetched (none were handed in): the set is ready
+//                     without those, and the law is told the load failed when it asks — an unfetched file is a job
+//                     again then, as without the preload.
+//   fc_rig_preload_total()    copies in the set; 0 = the pack loaded is not preloading.
+//   fc_rig_preload_failed()   of the settled, the failed and the unfetched.
+//   fc_rig_is_gain_dial(name) 1 = `name` is the loaded pack's gain dial (the one fc_rig_set_gain_dial turns), 0 otherwise
+//                     — so a host that queues the gain dial apart from the other knobs knows it by any name.
 
 #include <stdint.h>
 
-#define FC_RIG_ABI_VERSION 3u
+#define FC_RIG_ABI_VERSION 4u
 
 #ifdef __cplusplus
 extern "C" {
@@ -169,6 +200,13 @@ int      fc_rig_scope_read (fc_rig* rig, float* dry, float* wet, int n);   // sa
 double   fc_rig_scope_frames (fc_rig* rig);                    // samples written to the tap since prepare
 void     fc_rig_set_standby (fc_rig* rig, int on);             // PARK: 1 stands by, 0 plays
 int      fc_rig_set_feed_db (fc_rig* rig, double db);          // the block's IN on top of the pack's input level
+
+// ---- ABI 4: the preload (see ABI 4 above) --------------------------------------------------------------------------
+int      fc_rig_set_preload (fc_rig* rig, int maxModels);      // 0 off; n >= 1 on, at most n copies; from the next load
+int      fc_rig_preload_pending (fc_rig* rig);                 // copies not settled yet; 0 = ready, or not preloading
+int      fc_rig_preload_total (fc_rig* rig);                   // copies in the set; 0 = not preloading
+int      fc_rig_preload_failed (fc_rig* rig);                  // settled copies that failed or were not fetched
+int      fc_rig_is_gain_dial (fc_rig* rig, const char* name);  // 1 = `name` is the pack's gain dial (the crossfade one)
 
 #ifdef __cplusplus
 }

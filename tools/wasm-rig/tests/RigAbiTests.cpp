@@ -542,8 +542,8 @@ void contract()
         ok (fc_rig_scope_frames (r) == frames, "stood by, the count stands still");
         fc_rig_destroy (r);
     }
-    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 3u,
-        "abi_version answers the header's 3 (the scope draws the app's two points since v0.5.1)");
+    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 4u,
+        "abi_version answers the header's 4 (the preload since v0.6.0; the scope at the app's two points since v0.5.1)");
     fc_rig* r = fc_rig_create();
     float x[4] {};
     ok (fc_rig_process (r, x, nullptr, 4) == 0, "process before prepare is refused");

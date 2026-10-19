@@ -35,7 +35,7 @@
 //           node.port.postMessage({ file: data.need, pack: data.pack, bytes }, bytes ? [bytes] : []);
 //       }
 //       // { ready, abi }  { calibrated: { renderUs, quantumUs, share, maxModels, renders, elapsedMs, valid, reason } }
-//       // { loaded, ok }  { pack: n, ok, sweep }  { state: {…} }  { error }
+//       // { loaded, ok }  { pack: n, ok, sweep }  { preloaded: { pack, total, failed, quanta } }  { state: {…} }  { error }
 //       if (data.scope) frame = data;                         // the scope's buffer, back: see THE SCOPE below
 //   };
 //   node.port.postMessage({ set: { gain: 210, dial: { Bass: 120 }, switch: { Bright: 'Center' }, feed: 6 } });
@@ -97,6 +97,20 @@
 // parsing a capture, building and warming its network, tens of milliseconds — stalls the quantum it runs in. Accepted
 // for now (Oleh, 19.10.2026); the player's own dip hides the swap itself.
 //
+// THE PRELOAD (processorOptions.preload, ABI 4 — fc_rig_set_preload) MOVES THOSE STALLS TO WHERE NOTHING IS HEARD.
+// `preload: true` (the whole pack: RigPlayer::kPreloadWholePack), or a number (a cap on the prepared copies): at every
+// pack, before the start's calibration, the player prepares every capture of the pack — the panel sounding first, then
+// the pack's other panels nearest first, within the cap (fc_rig_abi.h, ABI 4) — through the same { need } and the same
+// jobs, one per quantum, while the output is SILENT; when the set is ready it posts { preloaded: { pack, total, failed,
+// quanta } } and the start goes on as ever (calibration, then play). From then on neither a turn of the gain dial nor a
+// switch within the set asks for a load: no { need }, no job, no stall — a capture taken is a prepared one. Under a
+// cap, a switch to a panel outside the set loads only what the law asks for, as without the preload. While it
+// preloads, the knobs that shape the set — switches, dials, the levels — are applied at once, those that came with the
+// processor's options and before the module was up included (so the set is made around the panel the page asked for);
+// the gain dial — by `gain`, or by its name in `dial` or `switch` — and maxModels wait with the start, in order.
+// Memory: a copy is ~2.8 MiB of the module's memory for the site's WaveNets: the whole pack is 11 copies for X88-IR
+// Crunch and V4 Sheriff Ch1, 44 for IR-X Ch2, 66 for IR-X Ch1 PowerAmp (fc_rig_abi.h).
+//
 // ZERO ALLOCATION PER QUANTUM. process() copies into views made once — and again only after the module's memory grew
 // (which detaches every older view): checked at the top of every quantum (a load grows it) and again after the render,
 // before copying out (a capture whose architecture allocates while it renders — LSTM and ConvNet in the pinned NAM,
@@ -106,7 +120,9 @@
 
 import createFcRig from './fcrig.mjs';
 
-const ABI = 3;              // the oldest fc_rig ABI this processor speaks (2: the scope, stand-by, the feed; 3: the scope at the app's points)
+const ABI = 4;              // the oldest fc_rig ABI this processor speaks (2: the scope, stand-by, the feed; 3: the scope at the app's points; 4: the preload)
+const PRELOAD_WHOLE = 0x7fffffff;   // preload: true — RigPlayer::kPreloadWholePack, every copy of the pack
+const WAIT_HELD = 16;       // preloaded, the capture timed at 12 o'clock lands within a quantum or two: past this many, it failed
 const BLEND_SHARE = 0.25;   // the blend (two models) is turned on when ONE render costs at most this share of a quantum
 const CAL_MS = 30;          // the calibration burst lasts at least this long by Date.now
 const CAL_MAX = 20000;      // …and at most this many renders
@@ -177,6 +193,11 @@ class FcRigProcessor extends AudioWorkletProcessor {
         const needMs = o.needTimeoutMs === undefined ? NEED_MS : num(o.needTimeoutMs);
         this.needMs = Number.isFinite(needMs) && needMs > 0 ? needMs : 0;
         this.needQuanta = 0;     // the same in quanta, once the quantum is known (start); 0 = never
+        const pre = o.preload === true ? PRELOAD_WHOLE : num(o.preload);
+        this.preload = Number.isFinite(pre) && pre >= 1 ? Math.floor(pre) : 0;   // the cap; 0 = no preload
+        this.preloading = false; // the pack's set is being prepared: silent, the start waits
+        this.preQuanta = 0;      // quanta the preload took
+        this.waitHeld = 0;       // quanta the start has waited for its capture, preloaded
         this.port.onmessage = (e) => this.onMessage(e.data);
 
         let module;
@@ -252,11 +273,12 @@ class FcRigProcessor extends AudioWorkletProcessor {
             this.scratch = m._fc_rig_alloc(SCRATCH);
             this.scopeAt = m._fc_rig_alloc(2 * SCOPE * 4);   // the frame's two halves in the module, read from there
             m._fc_rig_set_max_models(this.rig, this.maxModels);
+            if (this.preload > 0) m._fc_rig_set_preload(this.rig, this.preload);   // from the first pack on
             this.views();
             this.port.postMessage({ ready: true, abi });
             if (this.firstRig) this.load(this.firstRig);
             this.firstRig = null;
-            if (this.calState === 'off') this.drain();
+            if (this.calState === 'off' && !this.preloading) this.drain();
         } catch (e) {
             this.trap(e);
         }
@@ -282,6 +304,16 @@ class FcRigProcessor extends AudioWorkletProcessor {
         const sweep = m._fc_rig_gain_dial_sweep(this.rig);
         if (ok && this.calState !== 'off' && this.calState !== 'done' && sweep > 0)
             m._fc_rig_set_gain_dial(this.rig, sweep / 2);   // 12 o'clock: the capture the start is timed on
+        this.preloading = ok && this.preload > 0 && m._fc_rig_preload_total(this.rig) > 0;
+        this.preQuanta = 0;
+        this.waitHeld = 0;
+        // Knobs that waited for the start — the processor's options, and what came before the module was up — shape
+        // the set now, before its first job: only the gain dial and maxModels go on waiting.
+        if (this.preloading && this.queued.length > 0) {
+            const q = this.queued;
+            this.queued = [];
+            for (const s of q) this.early(s);
+        }
         this.port.postMessage({ pack: this.pack, ok, sweep });
     }
 
@@ -334,6 +366,29 @@ class FcRigProcessor extends AudioWorkletProcessor {
         }
     }
 
+    /** While the set is being prepared: what shapes it lands now; the gain dial (by `gain`, or by its name in `dial` or
+        `switch`) and maxModels are queued to wait with the start, in order. */
+    early(s) {
+        const { gain, maxModels, dial, switch: sw, ...now } = s;
+        const wait = {};
+        if (maxModels !== undefined) wait.maxModels = maxModels;
+        for (const [key, from] of [['switch', sw], ['dial', dial]]) {
+            if (!from) continue;
+            for (const k in from) {
+                const to = this.isGain(k) ? (wait[key] ??= {}) : (now[key] ??= {});
+                to[k] = from[k];
+            }
+        }
+        if (gain !== undefined) wait.gain = gain;
+        this.apply(now);
+        if (Object.keys(wait).length > 0) this.queued.push(wait);
+    }
+
+    isGain(name) {
+        const p = this.scratch;
+        return putUtf8(this.m.HEAPU8, p, name, SCRATCH / 2) && this.m._fc_rig_is_gain_dial(this.rig, p) === 1;
+    }
+
     drain() {
         const q = this.queued;
         this.queued = [];
@@ -363,14 +418,15 @@ class FcRigProcessor extends AudioWorkletProcessor {
         }
         try {
             if (park !== undefined) this.m._fc_rig_set_standby(this.rig, this.parked ? 1 : 0);
-            if (d.unload) { this.m._fc_rig_unload(this.rig); ++this.pack; this.awaiting = null; }
+            if (d.unload) { this.m._fc_rig_unload(this.rig); ++this.pack; this.awaiting = null; this.preloaded(false); }
             if (d.load) {
                 if (this.calibrate) this.rearm();
                 this.load(d.load);
             }
             if (d.file !== undefined) this.bytes(d);
             if (d.set) {
-                if (this.calState === 'waiting' || this.calState === 'steady') this.queued.push(d.set);
+                if (this.preloading) this.early(d.set);   // what shapes the set lands now; the gain dial waits
+                else if (this.calState === 'waiting' || this.calState === 'steady') this.queued.push(d.set);
                 else this.apply(d.set);
             }
             if (d.reset) this.m._fc_rig_reset(this.rig);
@@ -397,7 +453,7 @@ class FcRigProcessor extends AudioWorkletProcessor {
         m._fc_rig_job_run(rig);
         const ok = m._fc_rig_job_deliver(rig) === 1;
         this.port.postMessage({ loaded: file, ok });
-        if (!ok && this.calState === 'waiting') this.decide(null, 'load-failed');   // nothing to time: one model
+        if (!ok && this.calState === 'waiting' && !this.preloading) this.decide(null, 'load-failed');   // nothing to time: one model
     }
 
     /** After every quantum: housekeeping and, when the law asks, a job — run here at once if the player has the
@@ -450,6 +506,8 @@ class FcRigProcessor extends AudioWorkletProcessor {
             if (this.awaiting === null && (m._fc_rig_held(rig, 0) || m._fc_rig_held(rig, 1))) {
                 m._fc_rig_clear_counters(rig);
                 this.calState = 'steady';
+            } else if (this.preload > 0 && this.awaiting === null && ++this.waitHeld > WAIT_HELD) {
+                this.decide(null, 'load-failed');   // preloaded and still nothing held: its capture could not be prepared
             }
             return;
         }
@@ -476,6 +534,15 @@ class FcRigProcessor extends AudioWorkletProcessor {
         this.drain();
     }
 
+    /** The set is ready (or the pack went): said once, and the start goes on — or, with no calibration, the knobs land. */
+    preloaded(say = true) {
+        if (!this.preloading) return;
+        this.preloading = false;
+        if (say) this.port.postMessage({ preloaded: { pack: this.pack, total: this.m._fc_rig_preload_total(this.rig),
+                                                      failed: this.m._fc_rig_preload_failed(this.rig), quanta: this.preQuanta } });
+        if (this.calState === 'off') this.drain();
+    }
+
     read() {
         const m = this.m, rig = this.rig;
         this.port.postMessage({ state: {
@@ -485,6 +552,8 @@ class FcRigProcessor extends AudioWorkletProcessor {
             latency: m._fc_rig_latency_samples(rig), maxModels: this.maxModels,
             runBlocks: [m._fc_rig_run_blocks(rig, 0), m._fc_rig_run_blocks(rig, 1)],
             pairBlocks: m._fc_rig_pair_blocks(rig), warmBlocks: m._fc_rig_warm_blocks(rig),
+            preload: { total: m._fc_rig_preload_total(rig), pending: m._fc_rig_preload_pending(rig),
+                       failed: m._fc_rig_preload_failed(rig) },
         } });
     }
 
@@ -513,7 +582,7 @@ class FcRigProcessor extends AudioWorkletProcessor {
             if (this.R) { if (inR) this.R.set(inR); else this.R.fill(0); }
             m._fc_rig_process(this.rig, this.pL, this.pR, this.block);
             if (this.L.buffer !== m.HEAPF32.buffer) this.views();   // the render grew it (an allocating architecture)
-            if (this.calState === 'done' || this.calState === 'off' || this.parked) {
+            if (((this.calState === 'done' || this.calState === 'off') && !this.preloading) || this.parked) {
                 oL.set(this.L);   // parked: the player's own (the fade, then the wire) whatever the start's state
                 if (oR) oR.set(this.R || this.L);
             } else {
@@ -521,7 +590,10 @@ class FcRigProcessor extends AudioWorkletProcessor {
                 if (oR) oR.fill(0);
             }
             this.pump();
-            if (!this.parked && (this.calState === 'waiting' || this.calState === 'steady')) this.calibrateStep();
+            if (this.preloading) {
+                ++this.preQuanta;
+                if (m._fc_rig_preload_pending(this.rig) === 0) this.preloaded();
+            } else if (!this.parked && (this.calState === 'waiting' || this.calState === 'steady')) this.calibrateStep();
         } catch (e) {
             this.trap(e);
             if (inL) { oL.set(inL); if (oR) oR.set(inR); }

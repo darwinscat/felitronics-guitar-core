@@ -290,9 +290,9 @@ group('the worklet loads in an AudioWorkletGlobalScope, and its exports are the 
     const want = [...fs.readFileSync(header, 'utf8').matchAll(/^[A-Za-z_][A-Za-z0-9_ *]* (fc_rig_[a-z_]+) \(/gm)]
         .map((m) => '_' + m[1]).sort();
     const got = Object.keys(proc.m).filter((k) => k.startsWith('_fc_rig_')).sort();
-    ok(want.length === 39, `the header declares 39 entry points (read ${want.length})`);
+    ok(want.length === 44, `the header declares 44 entry points (read ${want.length})`);
     ok(JSON.stringify(got) === JSON.stringify(want), `the module exports exactly the header's entry points\n      got  ${got}\n      want ${want}`);
-    ok(proc.m._fc_rig_abi_version() === 3, 'abi_version answers 3');
+    ok(proc.m._fc_rig_abi_version() === 4, 'abi_version answers 4');
     ok(!/toResizableBuffer/.test(GLUE), 'the glue never calls WebAssembly.Memory.toResizableBuffer (Chrome 144+)');
     proc.port.onmessage({ data: { dispose: true } });
 }
@@ -819,6 +819,141 @@ for (const [what, max, gain] of [['one capture', 1, 0.5], ['two captures', 2, 0.
     console.log(`      ${what}: ${us.toFixed(1)} us per quantum = ${(100 * us / (1e6 * Q / 48000)).toFixed(2)} % `
                 + `(networks ran ${runs} block-runs in ${n} quanta, both ${pairs})`);
     proc.port.onmessage({ data: { dispose: true } });
+}
+
+group('THE PRELOAD (ABI 4): silent until the set is ready, then the start, then the gain dial swept both ways — no { need }, no job');
+for (const pack of packs) {
+    const sweep = (JSON.parse(fs.readFileSync(path.join(pack.dir, 'rig.json'), 'utf8')).chain[0].device?.controls
+        || JSON.parse(fs.readFileSync(path.join(pack.dir, 'rig.json'), 'utf8')).chain[0].controls || [])
+        .find((c) => c.sweep)?.sweep || 300;
+    const runs = { n: 0 };
+    hooked((m) => { const run = m._fc_rig_job_run; m._fc_rig_job_run = (r) => { ++runs.n; return run(r); }; });
+    const proc = await newProcessor(w0, pack.dir, { preload: true });
+    const oL = new Float32Array(Q), oR = new Float32Array(Q);
+    const ins = makeInput(Q * 6000, 48000, 0);
+    let q = 0, loud = 0, pre, cal;
+    const step = () => {
+        proc.process([[ins.subarray((q % 6000) * Q, (q % 6000 + 1) * Q)]], [[oL, oR]], {});
+        ++q;
+        answer(proc, w0, pack.dir);
+    };
+    for (; q < 3000 && !(pre = proc.port.posted.find((m) => m.preloaded));) {
+        step();
+        for (let i = 0; i < Q; ++i) loud = Math.max(loud, Math.abs(oL[i]));
+    }
+    const runsPre = runs.n, memPre = proc.m.HEAPU8.buffer.byteLength;
+    while (q < 6000 && !(cal = proc.port.posted.find((m) => m.calibrated))) {
+        step();
+        for (let i = 0; i < Q; ++i) loud = Math.max(loud, Math.abs(oL[i]));
+    }
+    const p = pre && pre.preloaded;
+    ok(p && p.total > 0 && p.failed === 0, `${pack.name}: the set is ready (${p ? p.total : '?'} copies, ${p ? p.quanta : '?'} quanta, `
+       + `${runsPre} jobs run, the module's memory ${(memPre / 1048576).toFixed(1)} MiB)`);
+    ok(cal && cal.calibrated.valid, `${pack.name}: the start calibrated after it (maxModels ${cal ? cal.calibrated.maxModels : '?'})`);
+    ok(loud === 0, `${pack.name}: silent until then`);
+    const mark = proc.port.posted.length, runsReady = runs.n;
+    let peak = 0, finite = true;
+    for (let d = 0; d <= sweep; ++d) { proc.port.onmessage({ data: { set: { gain: d } } }); step(); for (const v of oL) { finite &&= Number.isFinite(v); peak = Math.max(peak, Math.abs(v)); } }
+    for (let d = sweep; d >= 0; --d) { proc.port.onmessage({ data: { set: { gain: d } } }); step(); for (const v of oL) { finite &&= Number.isFinite(v); peak = Math.max(peak, Math.abs(v)); } }
+    const needs = after(proc, mark, (m) => m.need !== undefined).length;
+    ok(needs === 0 && runs.n === runsReady, `${pack.name}: a sweep 0 -> ${sweep} -> 0, one degree a quantum: ${needs} { need }, `
+       + `${runs.n - runsReady} jobs run (none), peak ${peak.toFixed(3)}`);
+    ok(finite && peak > 0, `${pack.name}: it played`);
+    console.log(`      ${pack.name}: ${p ? p.total : '?'} copies prepared in ${p ? p.quanta : '?'} quanta (${runsPre} jobs), `
+                + `module memory ${(memPre / 1048576).toFixed(1)} MiB; the sweep: ${needs} { need }, ${runs.n - runsReady} jobs`);
+    proc.port.onmessage({ data: { dispose: true } });
+}
+{
+    // The cache must not change the sound: the preloaded processor against one without, the same input and the same
+    // dial path from the first quantum (no calibration: its burst is timed, so its quanta differ run to run). Both
+    // players run through the preload — the first silences its output until { preloaded } — so the quanta compared
+    // are those after it, where both have played the same input all along.
+    const pack = realPack;
+    const sweep = 300;
+    const a = await newProcessor(w0, pack.dir, { preload: true, calibrate: false, maxModels: 2 });
+    const b = await newProcessor(w0, pack.dir, { calibrate: false, maxModels: 2 });
+    const ins = makeInput(Q * 6000, 48000, 0);
+    const aL = new Float32Array(Q), aR = new Float32Array(Q), bL = new Float32Array(Q), bR = new Float32Array(Q);
+    let q = 0, ready = false, worst = 0, compared = 0, needsB = 0;
+    const path = [];
+    for (let d = 0; d <= sweep; ++d) path.push(d);
+    for (let d = sweep; d >= 0; d -= 2) path.push(d);
+    let at = 0;
+    for (; q < 6000 && at < path.length; ++q) {
+        if (ready) { a.port.onmessage({ data: { set: { gain: path[at] } } }); b.port.onmessage({ data: { set: { gain: path[at] } } }); ++at; }
+        const x = ins.subarray(q * Q, (q + 1) * Q);
+        const mb = b.port.posted.length;
+        a.process([[x]], [[aL, aR]], {});
+        b.process([[x]], [[bL, bR]], {});
+        answer(a, w0, pack.dir);
+        answer(b, w0, pack.dir);
+        if (ready) {
+            needsB += after(b, mb, (m) => m.need !== undefined).length;
+            for (let i = 0; i < Q; ++i) worst = Math.max(worst, Math.abs(aL[i] - bL[i]));
+            compared += Q;
+        }
+        ready ||= !!a.port.posted.find((m) => m.preloaded);
+    }
+    ok(compared > 0 && worst === 0, `${pack.name} in wasm: the preloaded player bit for bit with the plain one over `
+       + `${compared} samples of the sweep (max |diff| ${worst})`);
+    console.log(`      (the plain one asked for ${needsB} { need } through the same sweep and ran its loads on the audio thread; `
+                + `module memory: preloaded ${(a.m.HEAPU8.buffer.byteLength / 1048576).toFixed(1)} MiB, plain `
+                + `${(b.m.HEAPU8.buffer.byteLength / 1048576).toFixed(1)} MiB)`);
+    ok(needsB > 0, 'the control: the plain one did load as it went');
+    a.port.onmessage({ data: { dispose: true } });
+    b.port.onmessage({ data: { dispose: true } });
+}
+
+group('THE PRELOAD and the knobs that wait for the start: the set is made around them, the gain dial waits');
+{
+    // The knobs of processorOptions, and a { set } posted before the module is up, choose the panel: the set is made
+    // around THAT panel before its first job (cap 1: red's two copies, not green's) — so after { preloaded } nothing
+    // is loaded while the start calibrates and plays.
+    for (const how of ['knobs', 'early']) {
+        const runs = { n: 0 };
+        hooked((m) => { const run = m._fc_rig_job_run; m._fc_rig_job_run = (r) => { ++runs.n; return run(r); }; });
+        const rig = w0.buffer(fs.readFileSync(path.join(fixtureDir, 'rig.json')));
+        const red = { switch: { Channel: 'red' } };
+        const proc = new w0.cls({ numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+                                  processorOptions: { module: w0.module, rig, preload: 1, ...(how === 'knobs' ? { knobs: red } : {}) } });
+        if (how === 'early') proc.port.onmessage({ data: { set: red } });
+        const up = await settle(proc, (m) => m.ready || m.error);
+        ok(up && up.ready, `${how}: the processor came up`);
+        let q = 0, pre;
+        for (; q < 400 && !(pre = proc.port.posted.find((m) => m.preloaded)); ++q) play(proc, 1, () => answer(proc, w0, fixtureDir));
+        const mark = proc.port.posted.length, runsReady = runs.n;
+        for (let k = 0; k < 300 && !proc.port.posted.find((m) => m.calibrated); ++k) play(proc, 1, () => answer(proc, w0, fixtureDir));
+        play(proc, 60, () => answer(proc, w0, fixtureDir));
+        const needs = after(proc, mark, (m) => m.need !== undefined).length;
+        const p = pre && pre.preloaded;
+        ok(p && p.total === 2 && p.pack === proc.pack, `${how}: the set made around red, the panel asked for (${p ? p.total : '?'} `
+           + `copies; { preloaded } names pack ${p ? p.pack : '?'})`);
+        ok(needs === 0 && runs.n === runsReady && proc.m._fc_rig_preload_pending(proc.rig) === 0,
+           `${how}: after { preloaded }, through the start and 60 quanta: ${needs} { need }, ${runs.n - runsReady} jobs`);
+        proc.port.onmessage({ data: { dispose: true } });
+    }
+    // The gain dial addressed by its NAME (in `dial` or `switch`) while the set is prepared waits with the start, as
+    // `gain` does: the start is timed on the capture at 12 o'clock, not on the one the page turned to.
+    for (const key of ['dial', 'switch']) {
+        const seen = { proc: null, calls: [] };
+        hooked((m) => {
+            const dial = m._fc_rig_set_dial, sw = m._fc_rig_set_switch;
+            const note = (what) => seen.calls.push({ what, at: seen.proc ? seen.proc.port.posted.length : -1 });
+            m._fc_rig_set_dial = (r, p, v) => { note('dial'); return dial(r, p, v); };
+            m._fc_rig_set_switch = (r, p, v) => { note('switch'); return sw(r, p, v); };
+        });
+        const proc = await newProcessor(w0, fixtureDir, { preload: true });
+        seen.proc = proc;
+        proc.port.onmessage({ data: { set: { [key]: { Gain: key === 'dial' ? 30 : '60' } } } });
+        let q = 0;
+        for (; q < 400 && !proc.port.posted.find((m) => m.calibrated); ++q) play(proc, 1, () => answer(proc, w0, fixtureDir));
+        const cal = proc.port.posted.findIndex((m) => m.calibrated);
+        const early = seen.calls.filter((c) => c.at <= cal);
+        ok(cal >= 0 && seen.calls.length > 0 && early.length === 0,
+           `{ set: { ${key}: { Gain } } } while preloading: applied after { calibrated } (${early.length} call(s) before it, `
+           + `${seen.calls.length} in all)`);
+        proc.port.onmessage({ data: { dispose: true } });
+    }
 }
 
 fs.rmSync(fixtureDir, { recursive: true, force: true });
