@@ -121,6 +121,20 @@ async function newProcessor(w, knobs, options = { module: w.module }) {
     return proc;
 }
 
+/** Every sample of `a` against `b`. A non-finite sample on EITHER side fails the comparison for good: it is counted
+    apart, and never folded into `worst`, where a later finite difference could overwrite it. */
+function compare(a, b) {
+    let worst = 0, differ = 0, nonFinite = 0;
+    for (let ch = 0; ch < a.length; ++ch)
+        for (let i = 0; i < a[ch].length; ++i) {
+            if (!Number.isFinite(a[ch][i]) || !Number.isFinite(b[ch][i])) { ++nonFinite; continue; }
+            const d = Math.abs(a[ch][i] - b[ch][i]);
+            if (d > 0) ++differ;
+            if (d > worst) worst = d;
+        }
+    return { worst, differ, nonFinite, within: (tol) => nonFinite === 0 && worst <= tol };
+}
+
 // ---- a fixed input: plucks, stereo-different, a noise burst, tapered ---------------------------------------------
 function makeInput(frames, sr, ch) {
     const x = new Float32Array(frames);
@@ -215,18 +229,31 @@ for (const s of SCENARIOS) {
     const w = s.sr === 48000 ? w0 : await loadWorklet(s.sr);
     const { out } = await renderWorklet(w, frames, s.knobs, s.moves, inL, inR);
     const ref = renderNative(s.sr, frames, s.knobs, s.moves, inL, inR);
-    let worst = 0, differ = 0, peak = 0, moved = 0;
+    const c = compare(out, ref);
+    let peak = 0, moved = 0;
     for (let ch = 0; ch < 2; ++ch)
         for (let i = 0; i < frames; ++i) {
-            const d = Math.abs(out[ch][i] - ref[ch][i]);
-            if (d > 0 || Number.isNaN(d)) ++differ;
-            if (!(d <= worst)) worst = d;
             peak = Math.max(peak, Math.abs(ref[ch][i]));
             moved = Math.max(moved, Math.abs(ref[ch][i] - (ch ? inR : inL)[i]));
         }
-    console.log(`      ${s.name}: ${differ} of ${2 * frames} samples differ, worst ${worst.toExponential(3)} (peak ${peak.toFixed(3)})`);
-    ok(worst <= TOLERANCE, `${s.name}: worst |wasm - native| ${worst} exceeds ${TOLERANCE}`);
+    console.log(`      ${s.name}: ${c.differ} of ${2 * frames} samples differ, worst ${c.worst.toExponential(3)}, `
+                + `${c.nonFinite} non-finite (peak ${peak.toFixed(3)})`);
+    ok(c.within(TOLERANCE), `${s.name}: worst |wasm - native| ${c.worst}, ${c.nonFinite} non-finite, against ${TOLERANCE}`);
     ok(moved > 1e-3, `${s.name}: the render is not the input`);
+}
+
+group('the comparison itself: a NaN is a failure that no later difference can hide');
+{
+    const pair = () => [[new Float32Array(1000), new Float32Array(1000)], [new Float32Array(1000), new Float32Array(1000)]];
+    const [a, b] = pair();
+    a[0][100] = NaN;          // a fault, early...
+    a[0][900] = 1e-7;         // ...then a finite difference, inside the tolerance, after it
+    const c = compare(a, b);
+    ok(!c.within(TOLERANCE) && c.nonFinite === 1, `a NaN followed by a finite difference is caught (nonFinite ${c.nonFinite}, worst ${c.worst})`);
+    const [x, y] = pair();
+    y[1][500] = Infinity;     // on the reference side
+    const d = compare(x, y);
+    ok(!d.within(TOLERANCE) && d.nonFinite === 1, `an Infinity in the native render is caught (nonFinite ${d.nonFinite})`);
 }
 
 group('no allocation per render quantum');
