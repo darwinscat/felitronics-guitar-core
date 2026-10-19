@@ -26,7 +26,18 @@
 #include <string>
 #include <vector>
 
-#if defined(__APPLE__)
+// Under AddressSanitizer the heap is ASan's own: glibc's mallinfo2() reads zero there, so the heap is read off ASan.
+#if defined(__SANITIZE_ADDRESS__)
+#define FC_RIG_TEST_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define FC_RIG_TEST_ASAN 1
+#endif
+#endif
+
+#if defined(FC_RIG_TEST_ASAN)
+#include <sanitizer/allocator_interface.h>
+#elif defined(__APPLE__)
 #include <malloc/malloc.h>
 #elif defined(__GLIBC__)
 #include <malloc.h>
@@ -53,7 +64,9 @@ float sample (int i, double fs)
     -1 where there is no reading here (the checks that need it say so and skip). */
 long long heapInUse()
 {
-#if defined(__APPLE__)
+#if defined(FC_RIG_TEST_ASAN)
+    return (long long) __sanitizer_get_current_allocated_bytes();   // allocated less freed (quarantined counts as freed)
+#elif defined(__APPLE__)
     malloc_statistics_t st {};
     malloc_zone_statistics (nullptr, &st);
     return (long long) st.size_in_use;
