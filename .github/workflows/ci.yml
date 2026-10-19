@@ -89,9 +89,9 @@ jobs:
       - name: det-math manifest
         run: node build/_deps/felitronics_core-src/tools/lint/check-det-math.mjs --satellite
       - name: One allocation counter
-        run: node build/_deps/felitronics_core-src/tools/lint/check-alloc-counter.mjs modules tests
+        run: node build/_deps/felitronics_core-src/tools/lint/check-alloc-counter.mjs modules tests tools/wasm
       - name: No long double
-        run: node build/_deps/felitronics_core-src/tools/lint/check-no-long-double.mjs modules tests
+        run: node build/_deps/felitronics_core-src/tools/lint/check-no-long-double.mjs modules tests tools/wasm
 
   # ---- nightly -------------------------------------------------------------------------------------------
   changed:
