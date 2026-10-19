@@ -32,8 +32,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(FELITRONICS_GUITAR_BUILD_TESTS "Build felitronics-guitar-core self-tests" "${PROJECT_IS_TOP_LEVEL}")
 option(FELITRONICS_GUITAR_WITH_NAM
        "Build felitronics::nam and felitronics::rigplayer (fetches the pinned NeuralAmpModelerCore + namz)" ON)
+# The browser module is this repository's own product, not a module a plugin links: built when this repository is the
+# top level, opt-in for a consumer — whose core may predate the delay and reverb this needs.
 option(FELITRONICS_GUITAR_WITH_FX
-       "Build the fc_guitar_fx C ABI (tools/wasm) over core's delay + reverb (felitronics-core v0.61.0+)" ON)
+       "Build the fc_guitar_fx C ABI (tools/wasm) over core's delay + reverb (felitronics-core v0.61.0+)"
+       "${PROJECT_IS_TOP_LEVEL}")
 
 # --- felitronics-core, resolved by whoever owns the graph ---------------------------------------------
 # Top-level: this repository IS the owner, so it resolves core itself — a sibling checkout when there is
