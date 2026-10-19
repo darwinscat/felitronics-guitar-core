@@ -234,8 +234,11 @@ through a JavaScript trampoline, in the hot path too.
 Read from the toolchain's tables (emscripten's `tools/feature_matrix.py`; SIMD128, which that table does not list,
 from caniuse) and the module, not tried on a device of each version. Against the ~five-year floor
 (Chrome 85 / Firefox 79 / Safari 15) that is about a year younger on Chrome and Firefox and eighteen months on Safari —
-SIMD, not exceptions, is what costs Safari 15.x. A page that must reach those would need a second, scalar build and
-`WebAssembly.validate` to choose; not built.
+SIMD, not exceptions, is what costs Safari 15.x.
+
+**The floor is accepted (Oleh, 19.10.2026), and there is no scalar build.** A page detects support before it builds the
+node — `WebAssembly.validate` on the module's bytes (or a tiny module with one SIMD128 op and one legacy `try`) — and
+below the floor shows its own message instead of the player.
 
 ## Cost
 
@@ -269,8 +272,9 @@ audio thread (×4 read the same), so the slow-machine decision is tested with an
   `{ need }` times out and the next job flows; a `{ load }` decides again (slow now: one model); a stopped clock and
   polluted counters are not valid evidence (one model); a render that grows the memory copies out bit for bit; a
   BigInt knob is ignored; no module, a refused prepare, a
-  foreign quantum and a trap — one error, dry, alive, only dispose ends; no allocation per quantum; the cost of one
-  quantum with one capture and with two, reported.
+  foreign quantum and a trap — one error, dry, alive, only dispose ends; no allocation per quantum (under 4 bytes of
+  JS heap per quantum over 15 000, no garbage collection — a boxed number per quantum reads 16.5 … 17.1); the cost of
+  one quantum with one capture and with two, reported.
 
 ## What a page owes it
 

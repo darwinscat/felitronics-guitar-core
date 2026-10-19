@@ -632,7 +632,16 @@ group('an error is not an end: dry, alive, one { error }; only dispose ends it')
     w0.ctx.__onRigModule = undefined;
 }
 
-group('no allocation per render quantum');
+// NO ALLOCATION, AS A BOUND PER QUANTUM. heapUsed moves by itself in every window, whatever its length — 12 … 37 KB
+// in node 26 on arm64 macOS, V8's own (feedback, tiering, the observer) — so the difference between a 5 000-quantum
+// and a 20 000-quantum window read −8 … +16 KB over a dozen runs: at most ~1.1 byte per quantum, and no garbage
+// collection. The smallest object JavaScript can put on V8's heap is a 16-byte HeapNumber (12 with pointer
+// compression, as in Chrome); one per quantum is 180 … 240 KB over the 15 000. The bound, 4 bytes per quantum (60 KB):
+// 3.7 times the most the noise read, a third of that object. Its control, injected into process() in a scratch copy
+// of the build and not kept: one boxed number per quantum reads 16.5 … 17.1 bytes per quantum and fails, an empty
+// object 57.1; the processor as shipped reads 0.07 … 1.04.
+const ALLOC_BYTES_PER_QUANTUM = 4;
+group(`no allocation per render quantum: under ${ALLOC_BYTES_PER_QUANTUM} bytes of JS heap per quantum, no GC`);
 {
     const proc = await newProcessor(w0, realPack.dir, { calibrate: false, maxModels: 2, knobs: { gain: 165 } });
     const iL = makeInput(Q, 48000, 0), oL = new Float32Array(Q), oR = new Float32Array(Q);
@@ -654,10 +663,13 @@ group('no allocation per render quantum');
     await new Promise((r) => setTimeout(r, 50));
     obs.disconnect();
     const inWindows = gcs.filter((t) => (t >= short.t0 && t <= short.t1) || (t >= long.t0 && t <= long.t1)).length;
-    const extra = long.grew - short.grew;
+    const extra = long.grew - short.grew, perQuantum = extra / 15000;
     console.log(`      the JS heap moved ${short.grew} bytes over 5 000 quanta and ${long.grew} over 20 000 (${extra} for `
-                + `the 15 000 more), ${inWindows} garbage collections in either window`);
-    ok(inWindows === 0 && extra < 16384, `process() allocates: ${extra} bytes for 15 000 more quanta, ${inWindows} GCs`);
+                + `the 15 000 more: ${perQuantum.toFixed(2)} bytes per quantum), ${inWindows} garbage collections in `
+                + `either window`);
+    ok(inWindows === 0 && perQuantum < ALLOC_BYTES_PER_QUANTUM,
+       `process() allocates: ${perQuantum.toFixed(2)} bytes per quantum (${extra} for 15 000 more quanta; the bound `
+       + `${ALLOC_BYTES_PER_QUANTUM}), ${inWindows} GCs`);
     proc.port.onmessage({ data: { dispose: true } });
 }
 
