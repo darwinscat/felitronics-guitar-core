@@ -93,13 +93,14 @@ inlines the wasm as base64 (a third larger, and decoded and compiled ON the audi
 processor that fetched its own module cannot in a worklet.
 
 **The bytes path.** WebKit does not throw on a `WebAssembly.Module` it cannot clone into the worklet: the option
-arrives as `null`. The processor then answers `{ error, retry: 'wasmBytes' }` and finishes. A page detects exactly
-that and retries with a second node:
+arrives as `null`. The processor then answers `{ error, retry: 'wasmBytes' }` and passes the dry through. A page
+detects exactly that and replaces the node with a second one:
 
 ```js
 node.port.onmessage = async (e) => {
     if (e.data.retry !== 'wasmBytes') return;
     node.disconnect();
+    node.port.postMessage({ dispose: true });
     const wasmBytes = await (await fetch(wasmUrl)).arrayBuffer();
     node = new AudioWorkletNode(context, 'fc-guitar-fx', { ...options, processorOptions: { wasmBytes, knobs } });
 };
@@ -108,11 +109,14 @@ node.port.onmessage = async (e) => {
 That processor compiles the 32 KB itself — `new WebAssembly.Module(bytes)`, SYNCHRONOUSLY, on the audio thread,
 once, at construction — so the first quanta of that node may be late. Both paths render the same bits (tested).
 
-**Every end is final.** An `{ error }` it posts, or a `{ dispose: true }` it receives: the instance is destroyed,
-the module and the views are dropped, the port is closed, and `process()` answers false from then on, so the node and
-its ~25 MB of wasm memory can be collected without waiting for the context to close. The errors: no module, a module
-older than the processor, a refused prepare (a rate outside 1 kHz … 768 kHz), and a render quantum of another size
-than the one prepared (128, or the scope's `renderQuantumSize`) — that one passes its quantum dry, then ends.
+**An error is not an end; only dispose is.** The node stands in series (amp → fcguitarfx → out), so a processor
+that went silent would mute the whole chain. A setup or runtime error — no module (the bytes retry included), a
+module older than the processor, a refused prepare (a rate outside 1 kHz … 768 kHz), a render quantum of another
+size than the one prepared (128, or the scope's `renderQuantumSize`) — posts ONE `{ error }`, frees the C instance if
+there is one, and from then on the processor passes its input through dry, bit for bit, and keeps `process()`
+answering true. The page decides from there: it may rewire around the node and send `{ dispose: true }`. Dispose is
+the only end: the instance freed, the module and the views dropped, the port closed, and `process()` false from then
+on, so the node and its ~25 MB of wasm memory can be collected without waiting for the context to close.
 
 **Knobs travel as port messages, not AudioParams.** They are settings a hand moves — two switches, two choices —
 and the stages already glide what must glide (the delay's head, the room's parameters). An AudioParam would be read
@@ -185,8 +189,9 @@ That floor is read from the toolchain's tables and the module, not tried on a de
   a native build with contraction off agrees with the wasm bit for bit), any non-finite sample a failure of its own;
   every processor runs with `WebAssembly.Memory.prototype.toResizableBuffer` deleted, as on an engine older than the
   ones that have it, and the glue may not name it; the integer knobs' non-finite and out-of-range values; the bytes
-  path against the module path, bit for bit, and WebKit's null module; dispose, a refused prepare and a foreign
-  render quantum, each terminal and each freeing the instance; no allocation per quantum; and the cost of one
+  path against the module path, bit for bit, and WebKit's null module; after each error (no module, a refused
+  prepare, a foreign render quantum) one `{ error }`, the instance freed, and the input passed dry, bit for bit, for
+  many quanta with `process()` true — and dispose the only end; no allocation per quantum; and the cost of one
   128-frame stereo quantum at 48 kHz, reported.
 
 ## Vendoring

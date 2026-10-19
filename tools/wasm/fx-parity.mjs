@@ -20,7 +20,7 @@
 //   5. THE COST of one 128-frame stereo quantum at 48 kHz under the heaviest settings — reported, not gated.
 //   And around those: the glue may not name toResizableBuffer, and every processor runs with it deleted (the browser
 //   floor); a non-finite sample fails a comparison for good; the integer knobs' NaN and out-of-range values; the
-//   bytes path against the module path; and every end of a processor — dispose, an error — final and freeing.
+//   bytes path against the module path; an error — dry from then on, bit for bit, and alive — and dispose, the only end.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -231,6 +231,21 @@ function quantum(proc, n = Q) {
     return proc.process([i], [o], {});
 }
 
+/** `n` quanta of the fixed input through `proc` (quanta of `size` frames): every one must answer true and come out
+    as it went in, bit for bit — the dry a failed processor owes the chain it stands in. */
+function passesDry(proc, n, size = Q) {
+    const inL = makeInput(n * size, 48000, 0), inR = makeInput(n * size, 48000, 1);
+    const oL = new Float32Array(size), oR = new Float32Array(size);
+    let alive = true, exact = true;
+    for (let q = 0; q < n; ++q) {
+        const iL = inL.subarray(q * size, (q + 1) * size), iR = inR.subarray(q * size, (q + 1) * size);
+        alive = proc.process([[iL, iR]], [[oL, oR]], {}) === true && alive;
+        for (let i = 0; i < size; ++i)
+            exact = exact && Object.is(oL[i], iL[i]) && Object.is(oR[i], iR[i]);
+    }
+    return alive && exact;
+}
+
 /** `frames` of the fixed input through a processor made with `options`, the knob moves posted at their frames. */
 async function renderWith(w, frames, knobs, moves, options) {
     const proc = await newProcessor(w, knobs, options);
@@ -279,43 +294,61 @@ group('the bytes path: a processor that compiles the posted bytes itself renders
     const first = await settle(proc);
     ok(first && first.error && first.retry === 'wasmBytes',
        `a null module answers { error, retry: 'wasmBytes' } (got ${JSON.stringify(first)})`);
-    ok(quantum(proc) === false && proc.port.closed, 'and the processor is finished: process() false, port closed');
+    ok(passesDry(proc, 200) && !proc.port.closed, 'and then passes its input dry, bit for bit, for 200 quanta, alive');
 }
 
-group('the processor\'s end: dispose, a refused prepare and a foreign render quantum are terminal, and free the instance');
+group('an error is not an end: the node stands in series, so it passes dry and lives; only dispose ends it');
 {
     const destroyed = [];
-    w0.ctx.__onFxModule = (m) => {
+    const spy = (m) => {
         const destroy = m._fc_guitar_fx_destroy;
         m._fc_guitar_fx_destroy = (fx) => { destroyed.push(fx); return destroy(fx); };
     };
+    w0.ctx.__onFxModule = spy;
+    const disposeEnds = (proc, what) => {
+        proc.port.onmessage?.({ data: { dispose: true } });
+        ok(quantum(proc) === false && proc.port.closed && proc.m === null, `${what}: dispose ends it — false, port closed`);
+    };
 
+    // A live processor: dispose is the end, and frees the instance.
     const proc = await newProcessor(w0, {});
     const fx = proc.fx;
     ok(quantum(proc) === true, 'a live processor keeps its node alive');
-    proc.port.onmessage({ data: { dispose: true } });
-    ok(destroyed.length === 1 && destroyed[0] === fx, `dispose destroys the instance (${destroyed})`);
-    ok(quantum(proc) === false && proc.port.closed && proc.m === null && proc.L === null,
-       'after dispose: process() false, port closed, module and views dropped');
+    disposeEnds(proc, 'live');
+    ok(destroyed.length === 1 && destroyed[0] === fx && proc.L === null, `dispose destroys the instance (${destroyed})`);
 
+    // No module: the bytes retry asked for, the dry through, alive until disposed.
+    const none = new w0.cls({ numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+                              processorOptions: { module: null } });
+    const asked = await settle(none);
+    ok(asked && asked.retry === 'wasmBytes' && passesDry(none, 200) && !none.port.closed,
+       'no module: { error, retry } once, then 200 quanta dry, bit for bit, alive');
+    ok(none.port.posted.filter((m) => m.error).length === 1, 'no module: one error, not one per quantum');
+    disposeEnds(none, 'no module');
+
+    // A refused prepare: the instance freed at once, the dry through.
     destroyed.length = 0;
     const wLow = await loadWorklet(500);   // below the stages' 1 kHz floor: prepare refuses
-    wLow.ctx.__onFxModule = w0.ctx.__onFxModule;
+    wLow.ctx.__onFxModule = spy;
     const low = new wLow.cls({ numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
                                processorOptions: { module: wLow.module } });
     const said = await settle(low);
-    ok(said && said.error && destroyed.length === 1, `a refused prepare posts an error and destroys the instance `
+    ok(said && said.error && destroyed.length === 1, `a refused prepare: an error, the instance destroyed `
                                                      + `(${JSON.stringify(said)}, ${destroyed.length} destroyed)`);
-    ok(quantum(low) === false && low.port.closed && low.m === null, 'and the processor is finished');
+    ok(passesDry(low, 200) && !low.port.closed && low.port.posted.filter((m) => m.error).length === 1,
+       'a refused prepare: then 200 quanta dry, bit for bit, alive, one error');
+    disposeEnds(low, 'refused prepare');
+    ok(destroyed.length === 1, 'dispose after a failure frees nothing twice');
 
+    // A quantum of another size than the one prepared: an error once, that quantum and every later one dry.
     destroyed.length = 0;
-    const odd = await newProcessor(w0, {});
-    const outL = new Float32Array(256), outR = new Float32Array(256), inL = makeInput(256, 48000, 0);
-    const alive = odd.process([[inL, inL]], [[outL, outR]], {});
-    const errors = odd.port.posted.filter((m) => m.error);
-    ok(alive === false && errors.length === 1 && destroyed.length === 1 && outL[255] === inL[255],
-       `a 256-frame quantum with no renderQuantumSize in scope: one error, the dry passed, terminal `
-       + `(${alive}, ${errors.length} errors, ${destroyed.length} destroyed)`);
+    const odd = await newProcessor(w0, { delay_mix: 50, reverb_mix: 60 });
+    ok(passesDry(odd, 50, 256) && destroyed.length === 1 && !odd.port.closed,
+       `256-frame quanta with no renderQuantumSize in scope: dry from the first, bit for bit, alive (${destroyed.length} destroyed)`);
+    ok(odd.port.posted.filter((m) => m.error).length === 1, 'and one error for fifty such quanta');
+    odd.port.onmessage({ data: { set: { delay_mix: 100 } } });   // knobs to a failed processor change nothing
+    ok(passesDry(odd, 10, 256), 'a knob after the error changes nothing: still dry');
+    disposeEnds(odd, 'foreign quantum');
     w0.ctx.__onFxModule = undefined;
 }
 
