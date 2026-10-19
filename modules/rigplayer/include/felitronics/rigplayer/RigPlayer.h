@@ -76,6 +76,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -213,6 +214,19 @@ public:
     // the handover does not dip at every tremor. A dial whose shape is a switch (width zero) has no band to rest in.
     static constexpr double kStepDeadband = 0.1;
 
+    // STAND-BY (setStandby): OrbitAmp's PARK as its captured block plays it (src/PluginProcessor.cpp:1397-1559, the
+    // `captured` lambda): the block is crossfaded against a WIRE — its own input, delayed by the block's latency, at
+    // unity — over BypassFade's length (src/core/BypassFade.h:32, `lengthMs = 15.0f`, linear, both ways), and once
+    // the fade is down the block is not run at all. Spelled in milliseconds and computed as BypassFade::prepare
+    // computes it (`1000 / (rate · 15)` per sample), so the two walk the same floats.
+    static constexpr double kStandbyFadeMs = 15.0;
+
+    // THE SCOPE TAP (scopeRead): OrbitAmp's ScopeTap (src/core/ScopeTap.h:25, `size = 2048`) — the newest this many
+    // samples of the dry and the wet, channel 0. prepare() takes another length; zero is no tap and no memory.
+    static constexpr int kScopeSize = 2048;
+    static constexpr int kMaxScopeSize = 1 << 20;   // refused above: the tap is a picture, not a recorder
+    static constexpr int kScopeTries = 4;           // a read the writer kept overtaking is retried this often
+
     // 🔴 THE CEILING ON A HOST RATE, and every buffer derived from one is bounded by it. Far above any
     // audio rate — 3 MHz is sixteen times the highest a DAW offers — and its job is not to judge taste
     // but to keep `(int) f(sampleRate)` inside int and the rings it sizes inside memory. A rate above
@@ -280,10 +294,12 @@ public:
     // LAW 11(b): BINDING, and it used to CLAMP — `prepare(48000, 256, 4)` was accepted as a 2-channel
     // player, after which every `process(io, 4, n)` was refused forever and the caller was told only at
     // the second call. That is the defect the law's own text describes, in this file.
-    [[nodiscard]] bool prepare(double sampleRate, int maxBlock, int numChannels) {
+    // `scopeSamples` is the scope tap's length (kScopeSize by default; 0 = no tap), refused outside 0 … kMaxScopeSize.
+    [[nodiscard]] bool prepare(double sampleRate, int maxBlock, int numChannels, int scopeSamples = kScopeSize) {
         prepared_ = false;                       // law 11(b): disarm FIRST, then validate, then write
         if (numChannels < 1 || numChannels > kMaxChannels) return false;
         if (maxBlock < 1) return false;
+        if (scopeSamples < 0 || scopeSamples > kMaxScopeSize) return false;
         // 🔴 IN RANGE, not merely finite — and the difference is the whole point, because an earlier
         // version of this line said `isfinite` and that is NOT the property the code below depends on.
         // The dry-aligner capacity is `(int) ceil(<a function of fs_>)`, and an out-of-range float→int
@@ -349,6 +365,21 @@ public:
         // the asking now lives in dryAlignerCapacity(), where it can be pinned at rates this file
         // never runs, because inline arithmetic here is exactly what could not be.
         dryLatency_.prepare(channels_, maxBlock_, dryAlignerCapacity (fs_));
+        // The stand-by WIRE is the same length for the same reason: what a stood-by device hands on is its input at
+        // the latency it reports (the app's `wire`, PluginProcessor.cpp:1409-1467 — "a wire the same LENGTH as the
+        // block it replaces").
+        wire_.prepare(channels_, maxBlock_, dryAlignerCapacity (fs_));
+        fadeStep_ = (float) (1000.0 / (fs_ * kStandbyFadeMs));   // BypassFade::prepare, spelled the same
+        // The scope's two rings: the tap's length plus two blocks of slack, so a read overtaken by the writer by a
+        // block and a half is still whole (scopeRead). Atomic floats — relaxed loads and stores are plain moves on
+        // every target this builds for, and they make the reader's copy a race the language defines.
+        scopeN_   = scopeSamples;
+        scopeCap_ = scopeSamples > 0 ? (std::size_t) scopeSamples + 2u * (std::size_t) maxBlock_ : 0u;
+        scopeDry_ = scopeCap_ > 0 ? std::make_unique<std::atomic<float>[]>(scopeCap_) : nullptr;
+        scopeWet_ = scopeCap_ > 0 ? std::make_unique<std::atomic<float>[]>(scopeCap_) : nullptr;
+        scopeW_ = 0;
+        scopeClaim_.store(0, std::memory_order_relaxed);
+        scopeWritten_.store(0, std::memory_order_release);
         for (int c = 0; c < kMaxChannels; ++c) {
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
             dryBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
@@ -368,6 +399,7 @@ public:
         // contractually never concurrent with process().
         for (int s = 0; s < 2; ++s) bandRt_[s].count = 0;
         snapGains();
+        snapStandby();                                   // BypassFade::snapTo — no fade on the first block
         prepared_ = true;
         if (loaded_) {                                   // the FIRs and the bands were designed for the old rate
             for (int s = 0; s < 2; ++s) { rebuildCurves(s); rebuildBands(s); }
@@ -455,6 +487,7 @@ public:
         for (auto& f : fir_) f.clearAudioState();
         dry_.clearAudioState();
         dryLatency_.reset();             // the dry leg's ring: a LITERAL replay of the previous stream
+        wire_.reset();                   // …and the stand-by wire's, for the same reason
         clearAudioState();
         // THE BANDS SNAP, THEY DO NOT RETIRE. prepare() zeroes `bandRt_.count` because its
         // coefficients were designed for the old rate and `rebuildBands()` follows it; here the rate
@@ -487,6 +520,7 @@ public:
         for (int s = 0; s < 2; ++s)
             for (int k = 0; k < bandRt_[s].count; ++k) bandCur_[s][k] = bandTo_[s][k];
         snapGains();
+        snapStandby();                   // the stand-by fade lands too: a restart restarts the parameter epoch
         // 🔴 …AND A SLOT CAUGHT MID-WARM-UP IS RE-ARMED, exactly as prepare() re-arms it. This restart has
         // just flushed both networks, so a slot that was part-way through its receptive field is holding
         // NOTHING — and the law, left alone, goes on crediting it every sample it heard before the
@@ -578,6 +612,10 @@ public:
         landFail_.store(0, std::memory_order_release);
         forget_.store(true, std::memory_order_release);
         loadAsk_.store(0, std::memory_order_release);    // …and an ask for it is void with it
+        // …and so is what the law last said it holds. held_ is written by the law alone, and a device that stands by
+        // runs no law: left alone, the old pack's model ids would outlive it there and name the NEW pack's models
+        // once load() fills models_ again — heldFileId() and fc_rig_held saying "held" of captures never loaded.
+        for (auto& h : held_) h.store(0, std::memory_order_relaxed);
         for (auto& n : nam_) n.clearModel();
         models_.clear(); fileModel_.clear();
         axes_.clear(); dial_.clear(); dialSweep_ = 0; dialDeg_ = 0.0;
@@ -1004,6 +1042,97 @@ public:
     BlendGains blendGains() const { return { (double) dryGain_.load(std::memory_order_relaxed),
                                              (double) wetGain_.load(std::memory_order_relaxed) }; }
 
+    // ------------------------------------------------------------------- stand-by: OrbitAmp's PARK ----
+    // On: the device's output fades to the WIRE — its own input at its latency, at unity, none of the pack's levels —
+    // over kStandbyFadeMs, and then the device is not run: no tone, no models on audio, no law, no ramps, no scope.
+    // Off: it fades back in over the same 15 ms and runs every block again. Exactly the app's captured block under
+    // PARK (PluginProcessor.h:774 `linkWorks` false for every row but the tuner, IN and OUT; the block not run once
+    // its BypassFade is down, PluginProcessor.cpp:1515-1516; the fade 15 ms, BypassFade.h:32).
+    //
+    // Knobs moved while it stands by — dials, switches, a gain dial that wants another capture, a pack loaded — are
+    // taken on the first block back, as the app's frozen player takes them: the law steps from where it stood, a
+    // band glides from its old coefficients, a gain ramps from its old value. One exception, also the app's: the
+    // pack's input level (and the host's, setHostInputDb) ARRIVES on the first block back rather than sliding
+    // into it — the app's block IN trim, `lastInGain = inTarget` when the block was off (PluginProcessor.cpp:1494-1495).
+    //
+    // WHERE THIS PLAYER IS STRICTER THAN THE APP, and why. The app simply stops calling the player, so its networks
+    // and filters hold what they heard before PARK and replay it on the return — the THIRD way this file would stop
+    // clocking a NamStage, and the other two are closed above (a plane taken away, a sleeping slot). Here a pause
+    // is silence (law 11c): on the block the fade-out ends, the filters, the dry ring and the per-slot delay lines
+    // are STOPPED (clearAudioState — a stop, not a restart: no ramp snaps, no law resets), and both stages are
+    // handed the width-zero call every stood-by block, so each drains the silence it owes ONCE and costs nothing
+    // after it — what the cold rest pays, per park. The return is then what it would be after silence.
+    void setStandby(bool on) { standby_.store(on, std::memory_order_release); }
+    bool standby() const { return standby_.load(std::memory_order_acquire); }          // what was asked
+    bool standingBy() const { return standingBy_.load(std::memory_order_acquire); }    // faded out, not running
+
+    // --------------------------------------------------------------------- the scope: OrbitAmp's ScopeTap ----
+    // The newest samples of what went INTO the models and what came OUT of them, channel 0, for a picture (the app's
+    // SHAPE). Written on the audio thread once per block the device runs (not while it stands by — the tap keeps
+    // the last it heard, the fade-out included):
+    //   dry  the DI the device was fed, after the pack's input level (or the host's) — the dry copy the blend knob
+    //        mixes, delayed by latencySamples() as that copy is, so it stands sample for sample beside…
+    //   wet  …the models' mix: both slots aligned, weighed and through the law's gain, BEFORE the post tone, the
+    //        blend knob and the pack's output level.
+    // The capture's OWN lag is not taken out — the player never takes it out of the sound either (the alignment
+    // delays are relative, AlignmentTable.h); a pack at another rate than the host's is aligned by its rate-match.
+    //
+    // scopeRead copies the newest min(n, scopeSize(), written) of both, oldest first, with the wet scaled to the
+    // dry's RMS — the app's ScopeTap::read (ScopeTap.h:42-72), which matches on the way OUT, in the reader: "a boost
+    // that is merely louder would drown" what the device DID. Answers how many it copied: 0 = never written since
+    // prepare() (or no tap, or n < 1, or a null pointer) — or the writer overtook the read kScopeTries times in a row.
+    // That last 0 does NOT leave the caller's arrays as they were: every try copies straight into them, so after it
+    // they hold a copy the writer may have torn, and are not a frame. A caller that wants to keep its previous frame
+    // reads into scratch of its own and copies out on a non-zero answer — as the worklet does (fcrig-worklet.js,
+    // the module's own two halves). Under one thread (process() and the read never concurrent, as fc_rig is driven)
+    // the writer cannot overtake and the 0 never comes. scopeFrames() is the count published at the moment it is
+    // read, not tied to the snapshot a concurrent reader got: read it before scopeRead() and the frame is at least
+    // that fresh.
+    //
+    // NO TORN FRAME, NO LOCK. The writer claims the samples it is about to write (a relaxed store, then a release
+    // fence), writes them (relaxed atomic floats), and publishes how far it got (a release store). The reader takes
+    // the published end (acquire), copies, fences (acquire) and reads the claim: if the writer may have reached any
+    // slot of what was copied, the copy is thrown away. The rings carry two blocks of slack, so a writer one whole
+    // block and a part ahead does not spoil a read. The audio side pays one fence and two stores per block.
+    // Any thread may read; prepare() must not run meanwhile (it never may beside process() either).
+    int scopeSize() const { return scopeN_; }
+    std::uint64_t scopeFrames() const { return scopeWritten_.load(std::memory_order_acquire); }   // samples written since prepare()
+    int scopeRead(float* dry, float* wet, int n) const noexcept {
+        if (dry == nullptr || wet == nullptr || n < 1 || scopeN_ == 0) return 0;
+        const std::uint64_t cap = (std::uint64_t) scopeCap_;
+        for (int t = 0; t < kScopeTries; ++t) {
+            const std::uint64_t end = scopeWritten_.load(std::memory_order_acquire);
+            if (end == 0) return 0;
+            const int m = (int) std::min({ (std::uint64_t) n, (std::uint64_t) scopeN_, end });
+            const std::uint64_t from = end - (std::uint64_t) m;
+#ifdef FELITRONICS_RIGPLAYER_TEST_SCOPE_READING
+            // A test's seam, never defined in a product (ScopeStandbyTests.cpp): the end is taken, nothing is copied
+            // yet — a writer that moves HERE is a writer racing the whole copy, the worst a concurrent one can do.
+            FELITRONICS_RIGPLAYER_TEST_SCOPE_READING(*this);
+#endif
+            std::size_t at = (std::size_t) (from % cap);
+            for (int i = 0; i < m; ++i) {
+                dry[i] = scopeDry_[at].load(std::memory_order_relaxed);
+                wet[i] = scopeWet_[at].load(std::memory_order_relaxed);
+                if (++at == scopeCap_) at = 0;
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (scopeClaim_.load(std::memory_order_relaxed) > from + cap) continue;   // overtaken: a slot was rewritten
+            // ScopeTap::read's level match, word for word: sums in double, the same floor, one float factor.
+            double dr = 0.0, wr = 0.0;
+            for (int i = 0; i < m; ++i) {
+                dr += (double) dry[i] * dry[i];
+                wr += (double) wet[i] * wet[i];
+            }
+            if (wr > 1.0e-12 && dr > 1.0e-12) {
+                const float k = (float) std::sqrt(dr / wr);
+                for (int i = 0; i < m; ++i) wet[i] *= k;
+            }
+            return m;
+        }
+        return 0;
+    }
+
     // ---------------------------------------------------------------------- the audio thread ----
 
     // In place. `numChannels` up to what prepare() was given (fewer is fine: the missing planes are
@@ -1083,6 +1212,7 @@ public:
                 for (int c = nch; c < ranNch_; ++c) lagTail_[i][(std::size_t) c].fill(0.0f);
         ranNch_ = nch;
         const bool norm = normalize_.load(std::memory_order_acquire);
+        const bool works = ! standby_.load(std::memory_order_acquire);   // read once a call, as the app reads `linkWorks` once a block
         float* a[kMaxChannels]; float* b[kMaxChannels]; float* d[kMaxChannels];
         for (int c = 0; c < kMaxChannels; ++c) { b[c] = slotB_[c].data(); d[c] = dryBuf_[c].data(); }
 
@@ -1092,6 +1222,36 @@ public:
             for (int c = 0; c < channels_; ++c) {
                 if (c < nch && io[c] != nullptr) a[c] = io[c] + done;
                 else { a[c] = spare_[c].data(); std::fill(a[c], a[c] + count, 0.0f); }
+            }
+
+            // STAND-BY (setStandby, and the app's `captured` lambda it follows). The wire is FED every block, as
+            // the app feeds its own (PluginProcessor.cpp:1440-1467): a window filled only once a fade starts is
+            // cold and hands out its length in silence. It reads the input before anything here touches it.
+            wire_.advance((const float* const*) a, channels_, count, latencySamples());
+            const StandbySpan span = standbyAdvance(count, works);
+            if (! works && ! span.moving) {
+                // Stood by: the wire IS the output, and nothing else runs. On the first such block the stages
+                // that hold audio are stopped (park()); every block the two stages get the width-zero call, which
+                // drains what each still owes once and is free after that — counted like any other drain.
+                if (! parkedRt_) park();
+                for (int c = 0; c < nch; ++c) std::copy_n(wire_.delayed(c), count, a[c]);
+                const long long drained[2] { nam_[0].drainedSamples(), nam_[1].drainedSamples() };
+                ok = nam_[0].process(a, 0, count, norm) && ok;
+                ok = nam_[1].process(b, 0, count, norm) && ok;
+                const bool ran0 = nam_[0].drainedSamples() != drained[0];
+                const bool ran1 = nam_[1].drainedSamples() != drained[1];
+                if (ran0) runBlocks_[0].fetch_add(1, std::memory_order_relaxed);
+                if (ran1) runBlocks_[1].fetch_add(1, std::memory_order_relaxed);
+                if (ran0 && ran1) pairBlocks_.fetch_add(1, std::memory_order_relaxed);
+                done += count;
+                continue;
+            }
+            if (parkedRt_) {
+                // Back: the host's level ARRIVES (the app's IN trim, `lastInGain = inTarget`), everything else
+                // resumes from where it stood and takes what moved meanwhile — under the fade-in.
+                parkedRt_ = false;
+                curIn_ = inGain_.load(std::memory_order_acquire);
+                standingBy_.store(false, std::memory_order_release);
             }
             for (int s = 0; s < 2; ++s) takeBands(s);
 
@@ -1285,6 +1445,11 @@ public:
                 }
             }
 
+            // THE SCOPE'S TAP, both sides at once: `d` is the DI as the blend will mix it (the pack's input level in,
+            // held back by latencySamples()), `a` the models' mix — aligned, weighed, through the law's gain — and
+            // nothing after the models has touched either yet. Channel 0, when a plane was handed over at all.
+            if (nch > 0) scopeWrite(d[0], a[0], count);
+
             // The knobs AFTER the distortion, shaping what came out.
             runBands(1, a, count);
             if (! firBypass_[1].load(std::memory_order_acquire)) ok = fir_[1].process(a, channels_, count) && ok;
@@ -1316,6 +1481,20 @@ public:
             // stage, and applied any earlier it would ride the wet side alone and move a blend the
             // pack states for this position.
             rampInto(a, nch, count, outGain_.load(std::memory_order_acquire), curOut_);
+
+            // …and a stand-by fade under way: the device against its wire, BypassFade::blend's own arithmetic
+            // (BypassFade.h:87-108) — `dry + (wet - dry) · g`, g walking for the fade's own samples and then held.
+            if (span.moving) {
+                const int ramp = std::clamp(span.ramp, 1, count);
+                const float step = (span.to - span.from) / (float) ramp;
+                for (int c = 0; c < nch; ++c) {
+                    const float* w = wire_.delayed(c);
+                    for (int i = 0; i < count; ++i) {
+                        const float g = i < ramp ? span.from + step * (float) i : span.to;
+                        a[c][i] = w[i] + (a[c][i] - w[i]) * g;
+                    }
+                }
+            }
             done += count;
         }
         return ok;
@@ -1379,6 +1558,72 @@ private:
         for (int i = 0; i < 2; ++i) curSlot_[i] = trims ? slotGain_[i].load(std::memory_order_relaxed) : 1.0f;
         curDry_   = dryGain_.load(std::memory_order_relaxed);
         curWet_   = wetGain_.load(std::memory_order_relaxed);
+    }
+
+    // ------------------------------------------------------------- stand-by and the scope, audio side ----
+
+    // Where the stand-by fade stands at the start of a block and at its end, and for how many of its samples it
+    // moves: BypassFade::Span and BypassFade::advance (BypassFade.h:47-81), the same floats in the same order.
+    struct StandbySpan { float from = 1.0f, to = 1.0f; bool moving = false; int ramp = 0; };
+    StandbySpan standbyAdvance(int numSamples, bool works) noexcept {
+        const float want = works ? 1.0f : 0.0f;
+        if (atFadeEnd(fadeG_, want)) return { fadeG_, fadeG_, false, 0 };
+        const float from   = fadeG_;
+        const float needed = std::abs(want - fadeG_) / std::max(1.0e-9f, fadeStep_);
+        const int   ramp   = std::clamp((int) std::ceil(needed), 1, numSamples);
+        const float step   = fadeStep_ * (float) ramp;
+        fadeG_ = works ? std::min(want, fadeG_ + step) : std::max(want, fadeG_ - step);
+        return { from, fadeG_, true, ramp };
+    }
+
+    // The fade's end, as BypassFade::advance tests it (BypassFade.h:62): juce::approximatelyEqual at its defaults —
+    // an absolute FLT_MIN, a relative FLT_EPSILON. Not `>= 1`: the walk up adds perSample·ramp in float and can stop
+    // one ulp short of 1 (0.99999988 at 48 kHz in 60-sample blocks); the app calls that the end and stops blending,
+    // and so must this, or the device is heard one block longer through a gain one ulp off unity.
+    // (JUCE's non-finite branch is left out: `want` is 0 or 1, and g only ever walks between them, clamped.)
+    static bool atFadeEnd(float g, float want) noexcept {
+        const float diff = std::abs(g - want);
+        return diff <= std::numeric_limits<float>::min()
+            || diff <= std::numeric_limits<float>::epsilon() * std::max(std::abs(g), std::abs(want));
+    }
+
+    // BypassFade::snapTo: the fade lands on the request, and a device that starts stood by is stood by from its first
+    // sample. Both restarts call it; neither leaves anything to stop (they clear it all themselves).
+    void snapStandby() noexcept {
+        const bool by = standby_.load(std::memory_order_acquire);
+        fadeG_ = by ? 0.0f : 1.0f;
+        parkedRt_ = by;
+        standingBy_.store(by, std::memory_order_release);
+    }
+
+    // The fade-out is over: everything that holds audio, other than the two stages (which drain), is STOPPED — the
+    // filters' memory, the convolvers' history (clearAudioState: a stop, P19's verb, not a restart: an IR fading
+    // in keeps fading), the dry ring and the per-slot delay lines. Ramps, targets, the law: untouched.
+    void park() noexcept {
+        parkedRt_ = true;
+        for (auto& f : fir_) f.clearAudioState();
+        dry_.clearAudioState();
+        dryLatency_.reset();
+        for (auto& side : bq_) for (auto& band : side) for (auto& q : band) q.reset();
+        for (auto& slot : lagTail_) for (auto& t : slot) t.fill(0.0f);
+        ranNch_ = 0;
+        standingBy_.store(true, std::memory_order_release);
+    }
+
+    // One block into the tap (see scopeRead for the protocol): claim, fence, write, publish.
+    void scopeWrite(const float* dry, const float* wet, int count) noexcept {
+        if (scopeN_ == 0) return;
+        const std::uint64_t w = scopeW_;
+        scopeClaim_.store(w + (std::uint64_t) count, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        std::size_t at = (std::size_t) (w % (std::uint64_t) scopeCap_);
+        for (int i = 0; i < count; ++i) {
+            scopeDry_[at].store(dry[i], std::memory_order_relaxed);
+            scopeWet_[at].store(wet[i], std::memory_order_relaxed);
+            if (++at == scopeCap_) at = 0;
+        }
+        scopeW_ = w + (std::uint64_t) count;
+        scopeWritten_.store(scopeW_, std::memory_order_release);
     }
 
     // ------------------------------------------------------------------ the decision, applied ----
@@ -1967,7 +2212,21 @@ private:
     felitronics::eq::Biquad    bq_[2][kMaxBands][kMaxChannels];
     felitronics::convolution::CabConvolver fir_[2], dry_;
     felitronics::core::DryAligner dryLatency_;   // holds the dry path back by the models' rate-match
+    felitronics::core::DryAligner wire_;         // the stand-by wire: the raw input at latencySamples()
     std::vector<float> slotB_[kMaxChannels], dryBuf_[kMaxChannels], spare_[kMaxChannels];
+
+    // stand-by: the request (message → audio) and what the audio thread made of it
+    std::atomic<bool> standby_ { false }, standingBy_ { false };
+    float fadeG_ = 1.0f, fadeStep_ = 1.0f;       // audio thread (and the two restarts): BypassFade's g and perSample
+    bool  parkedRt_ = false;                     // audio thread: the stages are stopped and the device is not run
+
+    // the scope tap: sized by prepare() (message thread, never beside process()), written by the audio thread,
+    // read from any thread
+    int scopeN_ = 0;
+    std::size_t scopeCap_ = 0;
+    std::unique_ptr<std::atomic<float>[]> scopeDry_, scopeWet_;
+    std::uint64_t scopeW_ = 0;                                      // audio thread: samples written
+    std::atomic<std::uint64_t> scopeClaim_ { 0 }, scopeWritten_ { 0 };
 };
 
 } // namespace felitronics::rigplayer
