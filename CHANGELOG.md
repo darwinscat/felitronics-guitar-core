@@ -2,7 +2,7 @@
 
 # Changelog
 
-## Unreleased
+## v0.5.0 — 2026-10-19
 
 ### rigplayer — the scope tap and stand-by (OrbitAmp's ScopeTap and PARK)
 
