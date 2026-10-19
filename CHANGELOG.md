@@ -2,7 +2,7 @@
 
 # Changelog
 
-## v0.6.0 — unreleased
+## v0.6.0 — 2026-10-19
 
 ### rigplayer — the preload: a turn of the gain dial that never waits for a load
 
