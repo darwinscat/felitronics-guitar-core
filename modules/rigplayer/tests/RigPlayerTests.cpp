@@ -734,6 +734,27 @@ int main() {
         approx(b.gainAt(1000.0), 0.5, 0.01, "…and the sound never blinked");
     }
 
+    group("a fetch that answered nothing is not kept: the next visit asks again");
+    {
+        // An empty answer is the host's "could not fetch it" — a network hiccup, not the file. It used to be kept as
+        // the file's bytes, so every later visit ran on nothing without asking: the capture dead until the pack was
+        // loaded again. (Bytes that are not a model are kept: they are what the file is — the group above.)
+        Bench b(rig);
+        const auto red = b.files["r150"];
+        b.files.erase("r150");                                   // the first fetch of red answers nothing
+        approx(b.gainAt(1000.0), 0.5, 0.01, "green 150 sounds");
+        ok(b.p.setSwitch("channel", "red"), "the hand switches to red, whose fetch fails");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "…and the captures it came from carry on");
+        ok(b.fetches == 3 && b.p.modelLoads() == 2, "red was asked for once, and nothing of it was kept");
+        b.files["r150"] = red;                                   // the network is back
+        ok(b.p.setSwitch("channel", "green"), "the hand leaves for green…");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "…which plays from the bytes it kept");
+        ok(b.p.setSwitch("channel", "red"), "…and comes back to red");
+        approx(b.gainAt(1000.0), 0.75, 0.01, "red's capture lands now, and sounds");
+        ok(b.fetches == 4 && b.p.modelLoads() == 3, "…asked for a second time, and kept this time ("
+                                                    + std::to_string(b.fetches) + " fetches)");
+    }
+
     group("the dial: a pair mixed by angle, the extension past the top, each file fetched once");
     {
         Bench b(rig);

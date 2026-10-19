@@ -30,7 +30,7 @@ Signal order, per block:
 | `service()` then `takeLoadJob()` | message, from a timer — a few times a second at least |
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
-| `process(io, channels, n)` | audio — allocates nothing, locks nothing, touches no file |
+| `process(io, channels, n)` | audio — locks nothing, touches no file; allocates nothing with Linear and WaveNet captures (LSTM and ConvNet allocate inside the pinned NAM) |
 | every read-out (`liveMix`, `heldFileId`, `soundingLoudness`, `selection`, `knobValue`, `runBlocks`, `pairBlocks`, the drawing readers…) | message |
 
 **Loading is a job the host runs.** `service()` never loads. When the law wants a model,
@@ -40,7 +40,9 @@ bytes through the source when the job has none, then the heavy half of a load
 (`NamStage::prepareModel` — parsing, two instances, the prewarm; some twenty milliseconds for a
 WaveNet). `deliver(loaded)` is the light half. **A job taken MUST come back through `deliver()`** —
 with a null model if it failed — or the law waits for it forever. A job that returns after `unload()`
-is dropped by the player; the host need not track it. `serviceHere()` runs the same path on one
+is dropped by the player; the host need not track it. The bytes a source answered are kept, so a file is
+fetched once — unless the answer was EMPTY: that is the source's "could not fetch it", not the file, and
+the file is asked for again the next time the law wants it. `serviceHere()` runs the same path on one
 thread, for a host without a worker and for a test.
 
 **`ModelSource` is called from wherever the host runs `run()`.** Make it safe to call off the message
