@@ -71,11 +71,38 @@
 // than itself.
 //
 //   version   the surface
-//   1         everything below
+//   1         everything below but the ABI-2 block
+//   2         + fc_rig_scope_read, fc_rig_scope_frames, fc_rig_set_standby, fc_rig_set_feed_db
+//
+// ====================================================================================
+// ABI 2 — THE SCOPE, PARK AND THE FEED (OrbitAmp's ScopeTap, its PARK, its block IN)
+// ====================================================================================
+//   fc_rig_scope_read(dry, wet, n)  copies the newest min(n, 2048, written) samples of the player's scope tap into two
+//                     float arrays of the caller (module memory): channel 0, oldest first, dry = the DI as fed (after
+//                     the pack's input level and the feed, held back by fc_rig_latency_samples()), wet = the models'
+//                     mix before the post tone, the blend knob and the output level, at the dry's RMS (RigPlayer::
+//                     scopeRead). Answers how many: 0 = nothing written yet (or n < 1, a NULL array). A block
+//                     processed with no input channel writes nothing.
+//                     THESE ARE NOT THE POINTS OF ORBITAMP'S OWN CODE. They are the app's web spec (src/core/
+//                     Monitor.cpp:189-191, "the model's, before the tone stack") and the site's tap around TONE3000's
+//                     node; the app's code taps around its whole player (src/core/CapturedBlock.h:544-556: the dry
+//                     before the input level and undelayed, the wet after the pack's own tone stack and levels). A pack
+//                     with a post tone, a blend knob or an output level draws another SHAPE there than here.
+//   fc_rig_scope_frames()  samples written to the tap since prepare(), an integer in a double: it moves when the tap
+//                     was written, so a reader knows its frame is FRESH. It does not move while the device stands by.
+//   fc_rig_set_standby(on)  PARK: the output fades over 15 ms to the input (at the latency, unity, no pack levels) and
+//                     the device stops running — no models, no tone, no scope; off fades it back in over 15 ms. Knobs
+//                     set meanwhile are taken on the way back (RigPlayer::setStandby).
+//   fc_rig_set_feed_db(db)  how hard the captures are fed ON TOP of the pack's own input level — the app's block IN
+//                     trim (TURBO's push); 0 = the pack's own. Applied inside the device: after the stand-by wire (a
+//                     parked device hands the input on untrimmed) and before the scope's dry tap. Kept across loads.
+//                     A non-finite db is refused (0). A change GLIDES, as the player's every level does (rampInto,
+//                     about 10 ms); the app's IN trim ramps over one host block instead (PluginProcessor.cpp:1497 —
+//                     2.7 ms at 128 samples, 10.7 ms at 512), and on the return from PARK it arrives, here as there.
 
 #include <stdint.h>
 
-#define FC_RIG_ABI_VERSION 1u
+#define FC_RIG_ABI_VERSION 2u
 
 #ifdef __cplusplus
 extern "C" {
@@ -130,6 +157,12 @@ int      fc_rig_run_blocks (fc_rig* rig, int slot);           // blocks a slot's
 int      fc_rig_pair_blocks (fc_rig* rig);                    // …and both did
 int      fc_rig_warm_blocks (fc_rig* rig);                    // …and a slot was still warming
 void     fc_rig_clear_counters (fc_rig* rig);
+
+// ---- ABI 2: the scope, PARK, the feed (see ABI 2 above) ------------------------------------------------------------
+int      fc_rig_scope_read (fc_rig* rig, float* dry, float* wet, int n);   // samples copied; 0 = none written yet
+double   fc_rig_scope_frames (fc_rig* rig);                    // samples written to the tap since prepare
+void     fc_rig_set_standby (fc_rig* rig, int on);             // PARK: 1 stands by, 0 plays
+int      fc_rig_set_feed_db (fc_rig* rig, double db);          // the block's IN on top of the pack's input level
 
 #ifdef __cplusplus
 }

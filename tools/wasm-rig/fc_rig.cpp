@@ -46,6 +46,16 @@ struct fc_rig
     std::vector<float> io[2];
     int  channels = 0;
     bool prepared = false;
+    bool   feedSet = false;   // fc_rig_set_feed_db was called: the host states the device's input level from then on
+    double feedDb  = 0.0;     // …as the pack's own plus this
+
+    /** The feed, restated against the pack HELD NOW — after every load and unload, because RigPlayer keeps a host
+        level across a load (the hand belongs to the bench) while the pack's own level underneath it changes. The
+        sum is made here, where the pack cannot be another than the one the player holds. */
+    void applyFeed()
+    {
+        if (feedSet) player.setHostInputDb (player.stageInputDb() + feedDb);
+    }
 
     /** What the player's ModelSource answers: the bytes handed in for the job being run, taken — RigPlayer::run asks
         once, on this thread, inside fc_rig_job_run. Nothing handed in is an empty answer, which the player reads as
@@ -116,10 +126,13 @@ FC_EXPORT int fc_rig_load (fc_rig* rig, const char* manifest, int length)
     if (rig == nullptr) return 0;
     rig->player.unload();
     rig->dropJob();
+    rig->applyFeed();
     if (manifest == nullptr || length <= 0) return 0;
     namz::rig::Rig parsed;
     if (! fcRigParseManifest (manifest, (std::size_t) length, parsed)) return 0;
-    return rig->player.load (parsed, [rig] (const std::string&) { return rig->source(); }) ? 1 : 0;
+    const bool loaded = rig->player.load (parsed, [rig] (const std::string&) { return rig->source(); });
+    rig->applyFeed();
+    return loaded ? 1 : 0;
 }
 
 FC_EXPORT void fc_rig_unload (fc_rig* rig)
@@ -127,6 +140,7 @@ FC_EXPORT void fc_rig_unload (fc_rig* rig)
     if (rig == nullptr) return;
     rig->player.unload();
     rig->dropJob();
+    rig->applyFeed();
 }
 
 FC_EXPORT int fc_rig_take_job (fc_rig* rig)
@@ -259,4 +273,23 @@ FC_EXPORT int fc_rig_warm_blocks (fc_rig* rig) { return rig != nullptr ? rig->pl
 FC_EXPORT void fc_rig_clear_counters (fc_rig* rig)
 {
     if (rig != nullptr) rig->player.clearCounters();
+}
+
+// ---- ABI 2 -----------------------------------------------------------------------------------------------------------
+FC_EXPORT int fc_rig_scope_read (fc_rig* rig, float* dry, float* wet, int n)
+{
+    return rig != nullptr ? rig->player.scopeRead (dry, wet, n) : 0;
+}
+FC_EXPORT double fc_rig_scope_frames (fc_rig* rig) { return rig != nullptr ? (double) rig->player.scopeFrames() : 0.0; }
+FC_EXPORT void fc_rig_set_standby (fc_rig* rig, int on)
+{
+    if (rig != nullptr) rig->player.setStandby (on != 0);
+}
+FC_EXPORT int fc_rig_set_feed_db (fc_rig* rig, double db)
+{
+    if (rig == nullptr || ! std::isfinite (db)) return 0;
+    rig->feedSet = true;
+    rig->feedDb = db;
+    rig->applyFeed();
+    return 1;
 }
