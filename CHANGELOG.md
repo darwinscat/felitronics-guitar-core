@@ -2,6 +2,120 @@
 
 # Changelog
 
+## v0.7.0 — 2026-10-20
+
+A load at a fraction of its cost — what plays is bit-identical to v0.6.0.
+
+### Changed
+- **`NamStage` builds a `.namz` straight into NAM** (`modules/nam/src/DirectBuild.{h,cpp}`): `namz::decode` (namz
+  v4.3.0 and later; the pin is v4.4.0) hands over the parsed skeleton and the float32 weights, and NAM's own `parse_model_config_json` + `create_dsp`
+  build the network from them — a SlimmableContainer assembled from its submodels as `ContainerConfig::create` does.
+  The weights are no longer printed to JSON text and parsed back (1.0 + ~10 ms of a 22 ms load in a wasm build).
+  Direct: Linear, WaveNet whose config holds no capture of its own, SlimmableContainer of those (A2, every real
+  `.orbitrig` capture). JSON path, unchanged: raw `.nam` JSON, LSTM, ConvNet, conditioned WaveNet, a container holding
+  any of those. The gate (`felitronics_nam_load_tests`) holds every NAM v0.5.4 example model, the Linears and — with
+  `FELITRONICS_GUITAR_RIG_PACKS` — every real capture to bit equality with `get_dsp`, with a one-ulp control per fixture.
+- **Mono: one network per load on a mono host.** `NamStage::prepare (sampleRate, maxBlock, numChannels)` and
+  `prepareModel (…, numChannels, warm)`; `RigPlayer::LoadJob::channels` carries the player's. A mono model keeps its
+  bytes and builds its second network when the host re-prepares for two channels; a stereo call on a mono model is
+  refused. `NamStage::networksOf()` reads it, `NamStage::liveNetworks()` the live model's. A recurrent capture (LSTM)
+  always gets two networks — a second one built later would start from another history and play other numbers on the
+  same input. `loadModelFromMemory` builds for the stage's channel count. A new `prepareModel (shared_ptr<const
+  vector<byte>>, …)` keeps the caller's bytes for the second network instead of a copy; `RigPlayer::run` uses it.
+- **No NAM zero-prewarm on RigPlayer's loads** (`NamStage::Warm::Caller`) for a non-recurrent capture: no slot is heard
+  before `warmFor()` of live input covers the receptive field. `loadModelFromMemory` and recurrent captures keep NAM's
+  prewarm; the one block of silence that grows NAM's buffers still runs; a later re-prepare prewarms as before.
+- Measured (node, the real ABI, v0.6.0 → v0.7.0): one copy 24–28 ms → 0.35–0.46 ms; the whole-pack preload 261–310 →
+  3.9–5 ms (X88-IR Crunch, V4 Sheriff Ch1, 11 copies) and 1584–1849 → 24 ms (IR-X Ch1 PowerAmp, 66); module memory
+  41.6 → 28.9 MiB and 179.4 → 103.75 MiB (2.35 → 1.21 MiB per copy; the module's size moves in emscripten's growth
+  steps, so the ~3.9 MiB of IR-X file copies the shared bytes save do not show in it). These memory figures are
+  `rig-compare.mjs`'s, which drives the ABI directly; the worklet in the parity run (`rig-parity.mjs`) holds the
+  11-copy packs in 24.1 MiB, as much as without the set, and IR-X Ch1 PowerAmp in 103.8 MiB. 36 sessions (3 packs ×
+  preload off/on × blend, dip, PARK, dip+PARK at 48 kHz, and blend, dip at 44.1 kHz; the gain dial over 13 positions)
+  identical bit for bit (`tools/wasm-rig/rig-compare.mjs`), 3 one-ulp controls differ.
+- **The worklet fills the preload in the background** (`processorOptions.preload`): the start no longer waits for the
+  whole set — the law's ask goes first, so the start sounds as soon as the capture it needs is held, warmed and timed,
+  and the rest of the set is filled while it plays, at most one job between two renders (a job whose answer arrives
+  after one already ran waits for the next quantum). v0.6.0 prepared the whole set first, in silence: 0.35–2.3 s at
+  PLAY and at every channel. Measured (Playwright, 48 kHz, IR-X Ch1 PowerAmp, each `{ need }` answered after 40 ms):
+  the first sound at 261 ms in WebKit and 248 ms in Chromium (v0.6.0: 2656 and 3981 ms), the set filled ~2.2 s later
+  while it played, no render quantum after the first sound later than 12 ms. The messages keep their shapes; what moves is the
+  order: `{ preloaded }` usually comes after `{ calibrated }` now, nothing waits for it, and `quanta` leaves PARK out.
+  With `calibrate: false` a knob lands at once while the set fills (it waited for `{ preloaded }`). A page should hand
+  the pack's files in with it (`{ load, files }`): the player hands out one job at a time, so a fill `{ need }` out
+  holds the law's next ask back by its round trip.
+- **PARK is a bypass, and nothing loads under it**: no job runs and no `{ need }` is posted while the player stands by
+  (v0.6.0 ran every job of the set under it, and posted its `{ need }`s); an answer that arrives meanwhile is kept and
+  its job runs at the first quantum back; the fill resumes there.
+- A capture at 12 o'clock that fails to load ends the start at once with the preload too (`reason: 'load-failed'`; it
+  waited for the whole set and 16 quanta more); a copy of the fill that fails does not end it.
+
+### Added
+- **namz v4.4.0, and the float16 captures it reads** (`modules/nam/CMakeLists.txt`: `FELITRONICS_NAMZ_TAG` v4.1.0 →
+  v4.4.0, `215d164`; v0.7.0's `namz::decode` came in 4.3.0). A `.nam16z` — weights stored as IEEE-754 halves, namz's
+  lossy dtype 1, written only by `namz encode --f16` — loads and plays: namz widens each half to its float32 and the
+  stage builds from those, so it plays BIT FOR BIT what the float32 `.namz` of the same halves widened plays. Proved
+  natively on every NAM example model, the Linears and every real capture named (`felitronics_nam_load_tests`, 242 files
+  with the site's packs, each with a control: the float32 original plays other samples), and through the module, the
+  worklet and `fc_rig_render` on the fixture pack and the three site packs made `.nam16z` by namz's own CLI
+  (`rig-parity.mjs --namz=`, `fc_rig_namz`, built from the pin when the parity run is configured). The worklet takes a
+  `.nam16z` by the name rig.json gives it — asked for by `{ need }` or handed in up front — and the same bytes named
+  `.namz` play the same: the dtype byte decides, never the name. On the v4.3.0 pin every `.nam16z` is refused.
+- **The fetched namz is held to its commit**, as Eigen is: `FELITRONICS_NAMZ_COMMIT` (`215d164`, the commit
+  THIRD_PARTY_NOTICES.md names). A tag that moved, or `FELITRONICS_NAMZ_TAG` set to another release without its commit,
+  stops the configure with both commits named; a local checkout (`FELITRONICS_NAMZ_SRC`) is not held.
+- **fc_rig ABI 5**: `fc_rig_put_file (rig, id, size)` — the pack's files handed in up front; a job for them never needs
+  bytes. `RigPlayer::putFile`. The worklet takes `{ files: [{ file, bytes }, …] }` with `{ load }` or after it (and
+  `processorOptions.files`); `{ need }` stays for any file not handed in, and a `{ need }` out is answered by `{ files }`.
+  ABI 5 also marks the change of what `fc_rig_job_run` does (mono, no prewarm); the worklet refuses a module below 5.
+  `RigPlayer::wantsFile (id)`: `fc_rig_put_file` asks it before it allocates, so a bogus id or a held file costs no memory.
+
+### Fixed in review (before the release)
+- A `.namz` with a NaN or infinite weight loaded through the direct build and played NaN; v0.6.0's JSON path refused it
+  (NAM's reader throws on the `null` unpack prints). The direct build refuses it too.
+- A recurrent capture loaded for a mono host and re-prepared for two channels played different L and R (0.055 vs 0.161
+  on the decaying-cell fixture): both networks are built with the load now.
+- The worklet: a `{ files, pack }` before the module was up skipped the pack check; a setup that failed kept the files
+  it was handed.
+- `tools/wasm-rig/build.sh` restated the dependency sources on every run but not the pins: a build directory configured
+  once with another namz tag kept it from its cache and built that tag silently (one cached at v4.3.0 shipped a module
+  that refuses every `.nam16z`). It drops the pins' cache entries on every run now, so the tags the CMakeLists name win.
+
+### Changed (the start)
+- **No burst, no hold: PLAY sounds after ~55–65 ms, a channel after the dip and the warm-up** (`fcrig-worklet.js`). The start
+  times the player's own live renders of the warm-up (`Date.now` around each render that ran one network alone) and
+  decides when the sound opens, posting `{ calibrated }` in that quantum — the riff the page starts on it is heard at
+  once (it lost ~80 ms to CAL_HOLD). One decision a session per architecture (`fc_rig_signature`: the layer shape, never
+  weights or trained numbers); `{ calibrate: 'again' }` forgets them. The gain dial is no longer forced to 12 o'clock:
+  the knobs land at once, the start times the DRIVE's own capture, and a channel whose DRIVE is elsewhere no longer plays
+  the 12-o'clock capture first. Only `maxModels` waits for the decision; a capture that opens before 8 renders were
+  timed says it 8 quanta later at most. A one-model decision is SETTLED: timed on after the open (64 renders of one
+  network alone, from an open) and decided again for the architecture's next start, so a start's dozen readings — the
+  module's coldest — decide one pack at most. `{ calibrate: 'again' }` while two models sound is answered on 64 renders,
+  not on what fit in 64 quanta. Node harness, three site packs: PLAY opens at quantum 19–23 (53–64 ms) and says so
+  there; a channel change mid-riff after 57 quanta (152 ms: the dip and the live warm-up); the longest quantum of the
+  start 0.4 ms (the burst: 30.8 ms).
+- **The quiet warm** (`RigPlayer::warmQuiet`, `fc_rig_warm_quiet`, ABI 5): when the models' input has been exactly zero
+  for a warming capture's whole warm-up (a start, `reset()`, a return from PARK, a pause), the player feeds it blocks of
+  silence ahead of real time, bounded per call by the host — the worklet by an upper bound on a render's cost, kept per
+  architecture, and no job in a quantum that warmed, an answer's included — so it opens after a few quanta; what it is then heard with
+  is bit-identical to the live warm-up on silence from the moment that would have opened (RigAbiTests, rig-parity, with
+  controls). Mid-riff nothing changes. A host that never calls it plays as before (OrbitAmp).
+- ABI 5 also gains `fc_rig_audible` (the law lets a capture be heard) and `fc_rig_signature(slot)`;
+  `NamStage::architectureSignature()` and `RigPlayer::{audible, heldSignature, warmQuiet}` behind them.
+
+### Fixed
+- **The dropout right after every sound start in WebKit** (PLAY, every pack swap): the calibration burst (30 ms of
+  renders inside one render quantum) made WebKit's output stall twice — at the burst, in silence, and again 24–31 ms
+  later, after the start had released its silence. Measured with Playwright (a probe after the processor timing every
+  render quantum): with calibration off no gap at all; with it, gaps at −2.7 ms and +29 ms from the first sound. The
+  start now holds its silence for `ceil(CAL_HOLD_MS / quantum)` quanta (80 ms; 30 at 48 kHz) past the burst and opens on
+  a 5 ms raised-cosine fade. Measured on the shipped build (WebKit and Chromium, X88-IR Crunch and IR-X Ch1 PowerAmp,
+  two runs each): WebKit's two gaps at −82.7 ms (33–34 ms long, the burst) and −50.7 ms (23–24 ms) from the first sound,
+  so the second one ends ~27 ms before it; Chromium's one gap (36–37 ms) at −82.7 ms; nothing after the first sound in
+  either; no gap at all with calibration off. The first sound comes ~80 ms later. **Superseded by "No burst, no hold"
+  above:** the burst, the hold and the fade are gone; a start's longest quantum is ~0.7 ms in node.
+
 ## v0.6.0 — 2026-10-19
 
 ### rigplayer — the preload: a turn of the gain dial that never waits for a load
