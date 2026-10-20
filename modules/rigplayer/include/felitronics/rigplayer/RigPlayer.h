@@ -1502,11 +1502,13 @@ public:
             // tens of degrees between two events — so it is smoothed like every other gain here.
             rampInto(a, nch, count, chainGain_.load(std::memory_order_acquire), curChain_);
             // THE QUIET RUN (warmQuiet): how long the models' input has been exactly zero, this block included.
+            // "Not zero" is spelled with the orderings, as BlendLaw.h does, so that gcc's -Wfloat-equal has
+            // nothing to say: ±0 is quiet, anything else — a NaN included — is not.
             {
                 bool quiet = true;
                 for (int c = 0; c < nch && quiet; ++c)
                     for (int k = 0; k < count; ++k)
-                        if (a[c][k] != 0.0f) { quiet = false; break; }
+                        if (! (a[c][k] <= 0.0f && a[c][k] >= 0.0f)) { quiet = false; break; }
                 quietRun_ = quiet ? std::min(kQuietForever, quietRun_ + count) : 0;
             }
 
