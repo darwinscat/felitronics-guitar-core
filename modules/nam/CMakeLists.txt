@@ -112,10 +112,16 @@ endif()
 
 # namz is a header-only, lossless .nam codec and the .orbitrig rig model (namz_rig*.h — schema 4 with
 # `tone`, `lag_samples` and the pack's own two levels, all of which felitronics::rigplayer reads).
-# Pinned by release tag. SOURCE_SUBDIR deliberately points at a directory without CMakeLists.txt:
-# populate the headers without building namz's project or fetching nlohmann twice.
-set(FELITRONICS_NAMZ_TAG "v4.1.0" CACHE STRING
+# Pinned by release tag, and the fetched tag is held to its commit (THIRD_PARTY_NOTICES.md names it): a tag that
+# moved, or another tag set without its commit, stops the configure instead of building silently. A host that sets
+# FELITRONICS_NAMZ_TAG (OrbitAmp FORCEs it) sets FELITRONICS_NAMZ_COMMIT with it. A local checkout
+# (FELITRONICS_NAMZ_SRC, FETCHCONTENT_SOURCE_DIR_NAMZ_SRC) is its owner's choice and is not held; BUILD-INFO names it.
+# SOURCE_SUBDIR deliberately points at a directory without CMakeLists.txt: populate the headers without building
+# namz's project or fetching nlohmann twice.
+set(FELITRONICS_NAMZ_TAG "v4.4.0" CACHE STRING
     "namz release to build against")
+set(FELITRONICS_NAMZ_COMMIT "215d1640a9462e965a5bf027d4a533b1d43a9607" CACHE STRING
+    "The commit that release must be: namz v4.4.0's tag")
 set(FELITRONICS_NAMZ_SRC "" CACHE PATH
     "Local namz checkout (when empty, fetch the pin)")
 if(FELITRONICS_NAMZ_SRC AND NOT EXISTS "${FELITRONICS_NAMZ_SRC}")
@@ -135,6 +141,17 @@ else()
         SOURCE_SUBDIR  include)
 endif()
 FetchContent_MakeAvailable(namz_src)
+if(NOT FELITRONICS_NAMZ_SRC AND NOT FETCHCONTENT_SOURCE_DIR_NAMZ_SRC)
+    if(EXISTS "${namz_src_SOURCE_DIR}/.git")
+        felitronics_nam_git(namz_head "${namz_src_SOURCE_DIR}" rev-parse HEAD)
+        if(NOT namz_head STREQUAL FELITRONICS_NAMZ_COMMIT)
+            message(FATAL_ERROR "namz at ${namz_src_SOURCE_DIR} is ${namz_head}, not ${FELITRONICS_NAMZ_COMMIT} "
+                                "(FELITRONICS_NAMZ_COMMIT, namz ${FELITRONICS_NAMZ_TAG})")
+        endif()
+    else()
+        message(STATUS "namz at ${namz_src_SOURCE_DIR} is not a git checkout — its commit is not checked")
+    endif()
+endif()
 
 add_library(nam_core STATIC
     ${nam_core_src_SOURCE_DIR}/NAM/activations.cpp
@@ -162,7 +179,7 @@ target_include_directories(nam_core SYSTEM PUBLIC
     ${nam_core_src_SOURCE_DIR}/Dependencies
     ${namz_src_SOURCE_DIR}/include)
 
-add_library(felitronics_nam STATIC src/NamStage.cpp)
+add_library(felitronics_nam STATIC src/NamStage.cpp src/DirectBuild.cpp)
 add_library(felitronics::nam ALIAS felitronics_nam)
 target_include_directories(felitronics_nam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # NamStage.cpp defines NAMZ_IMPLEMENTATION exactly once. Consumers deliberately receive namz's
@@ -216,6 +233,21 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_nam_blend_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_nam_blend_tests COMMAND felitronics_nam_blend_tests)
 
+    # The load (v0.7.0): the direct build's gate against get_dsp, the mono build, Warm::Caller. It builds networks both
+    # ways itself, so it sees NAM's headers (nam_core) and NAM's own example models; FELITRONICS_GUITAR_RIG_PACKS, when
+    # it names a directory of *.orbitrig, adds every real capture in it to the gate.
+    add_executable(felitronics_nam_load_tests tests/NamLoadTests.cpp)
+    target_link_libraries(felitronics_nam_load_tests PRIVATE felitronics::nam nam_core felitronics::test_support)
+    target_compile_definitions(felitronics_nam_load_tests PRIVATE
+        FELITRONICS_NAM_EXAMPLE_MODELS="${nam_core_src_SOURCE_DIR}/example_models")
+    # …and for rigplayer's allocation gate, which plays NAM's A2 as the real packs' shape (modules/rigplayer).
+    set_property(GLOBAL PROPERTY FELITRONICS_NAM_EXAMPLE_MODELS_DIR "${nam_core_src_SOURCE_DIR}/example_models")
+    target_compile_features(felitronics_nam_load_tests PRIVATE cxx_std_20)
+    if(FELITRONICS_GUITAR_RIG_PACKS)
+        add_test(NAME felitronics_nam_load_tests COMMAND felitronics_nam_load_tests ${FELITRONICS_GUITAR_RIG_PACKS})
+    else()
+        add_test(NAME felitronics_nam_load_tests COMMAND felitronics_nam_load_tests)
+    endif()
     add_executable(felitronics_nam_rtalloc_tests tests/NamStageRtAllocTests.cpp)
     target_link_libraries(felitronics_nam_rtalloc_tests PRIVATE felitronics::nam)
     target_link_libraries(felitronics_nam_rtalloc_tests PRIVATE felitronics::test_support)

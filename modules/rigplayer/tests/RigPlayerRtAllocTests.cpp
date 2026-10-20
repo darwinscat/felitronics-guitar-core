@@ -44,7 +44,9 @@
 #include <namz.h>
 
 #include <cmath>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <cstddef>
 #include <map>
 #include <string>
@@ -143,8 +145,9 @@ struct Bench {
     int channels;
     double phase = 0.0;
 
-    Bench(const std::string& nam, double sampleRate, int nch) : fs(sampleRate), channels(nch) {
-        files = { { "early", bytesOf(nam) }, { "mid", bytesOf(nam) }, { "late", bytesOf(nam) } };
+    Bench(const std::string& nam, double sampleRate, int nch) : Bench(bytesOf(nam), sampleRate, nch) {}
+    Bench(const std::vector<std::byte>& bytes, double sampleRate, int nch) : fs(sampleRate), channels(nch) {
+        files = { { "early", bytes }, { "mid", bytes }, { "late", bytes } };
         felitronics::test::run (p.prepare(fs, kBlock, channels));
         p.load(rigOf(), [this](const std::string& id) {
             const auto it = files.find(id);
@@ -262,6 +265,77 @@ int main() {
             felitronics::test::okNoAlloc(hush == 0, std::string("…and 24 blocks of silence allocate nothing (") + std::to_string(hush)
                           + ") — " + c.name);
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // v0.7.0: THE SHAPE OF THE REAL PACKS — a .namz, built direct from namz::decode, a SlimmableContainer (NAM's A2,
+    // which every real capture is), loaded by RigPlayer::run with Warm::Caller (no NAM zero prewarm) and on a mono
+    // host with ONE network. What is measured is process() alone from the very first block, so the first blocks a
+    // fresh copy runs — warmFor()'s live input through a network that skipped NAM's prewarm — are inside it; the loads
+    // land between the measured windows (serviceHere allocates by design).
+    group("the real packs' shape — A2 as a .namz, built direct, Warm::Caller — allocates nothing in process()");
+    {
+        std::ifstream in(std::string(FELITRONICS_NAM_EXAMPLE_MODELS) + "/A2.nam", std::ios::binary);
+        const std::string raw { std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>() };
+        const auto packed = namz::pack(raw.data(), raw.size());
+        const std::vector<std::byte> a2 { reinterpret_cast<const std::byte*>(packed.data()),
+                                          reinterpret_cast<const std::byte*>(packed.data()) + packed.size() };
+        ok(! raw.empty() && namz::isNamz(a2.data(), a2.size()), "precondition: NAM's A2.nam, packed");
+        struct Case { const char* name; double fs; int nch; };
+        for (const Case c : { Case { "mono, 48 kHz (the site)", 48000.0, 1 }, Case { "stereo, 44.1 kHz (resampling)", 44100.0, 2 } }) {
+            Bench b(a2, c.fs, c.nch);
+            b.p.setDial("gain", 150.0);
+            Driver d; double ph = 0.0; d.fill(0.3, ph, c.fs);
+            long long seen = 0;
+            int landedAt = -1;
+            for (int k = 0; k < 120; ++k) {
+                seen += allocsAcross([&] { felitronics::test::run (b.p.process(d.io, c.nch, kBlock)); });
+                b.p.serviceHere();
+                if (k == 60) b.p.setDial("gain", 240.0);       // another file: a fresh copy, warmed by live input
+                if (landedAt < 0 && ! b.p.heldFileId(0).empty()) landedAt = k;
+            }
+            ok(landedAt >= 0 && landedAt < 60 && (b.p.heldFileId(0) == "late" || b.p.heldFileId(1) == "late"),
+               std::string("precondition: a capture landed early, then another — ") + c.name);
+            felitronics::test::okNoAlloc(seen == 0, std::string("120 blocks across two fresh loads allocate nothing (")
+                                         + std::to_string(seen) + ") — " + c.name);
+        }
+        // …and THE QUIET WARM, as the worklet runs it: warmQuiet() after every render, on silence, so the blocks of
+        // silence it feeds a warming copy ahead of time are inside the window with the renders around them.
+        for (const Case c : { Case { "mono, 48 kHz (the site)", 48000.0, 1 }, Case { "stereo, 44.1 kHz (resampling)", 44100.0, 2 } }) {
+            Bench b(a2, c.fs, c.nch);
+            b.p.setDial("gain", 150.0);
+            Driver d; double ph = 0.0; d.fill(0.0, ph, c.fs);
+            long long seen = 0;
+            int warmed = 0;
+            for (int k = 0; k < 120; ++k) {
+                seen += allocsAcross([&] {
+                    felitronics::test::run (b.p.process(d.io, c.nch, kBlock));
+                    warmed += b.p.warmQuiet(6);
+                });
+                b.p.serviceHere();
+                if (k == 60) b.p.setDial("gain", 240.0);       // another file: a fresh copy, warmed ahead on silence
+            }
+            ok(warmed > 0, std::string("precondition: the quiet warm ran (") + std::to_string(warmed) + " blocks) — " + c.name);
+            felitronics::test::okNoAlloc(seen == 0, std::string("120 renders on silence, each followed by warmQuiet(), allocate nothing (")
+                                         + std::to_string(seen) + ") — " + c.name);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Not an allocation on the audio thread, but memory all the same (v0.7.0): a mono copy keeps its file's bytes for a
+    // later second network, and RigPlayer::run hands it the player's own shared bytes — one more owner, not a copy.
+    group("RigPlayer::run: a mono copy shares the file's bytes with the player, a stereo one keeps none");
+    {
+        const auto bytes = std::make_shared<const std::vector<std::byte>>(bytesOf(waveNetModel(64)));
+        long owners[3] {};
+        for (const int ch : { 1, 2 }) {
+            RigPlayer::LoadJob job;
+            job.bytes = bytes; job.sampleRate = 48000.0; job.maxBlock = kBlock; job.channels = ch;
+            const auto loaded = RigPlayer::run(std::move(job));
+            owners[ch] = loaded.model != nullptr ? bytes.use_count() : -1;
+        }
+        ok(owners[1] == owners[2] + 1 && owners[2] > 0,
+           "the mono copy is one more owner of the bytes (" + std::to_string(owners[1]) + " against " + std::to_string(owners[2]) + ")");
     }
 
     // ------------------------------------------------------------------------------------------

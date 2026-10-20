@@ -115,8 +115,20 @@ if(FELITRONICS_GUITAR_BUILD_TESTS AND NOT EMSCRIPTEN)
     set(FELITRONICS_GUITAR_RIG_PACKS "" CACHE PATH "A directory of .orbitrig packs for the wasm parity run (optional)")
     if(FELITRONICS_GUITAR_RIG_WASM_DIR)
         find_program(FELITRONICS_NODE node REQUIRED)
+        # namz's own CLI at the pin (cli/namz.cpp, header-only, nlohmann from NeuralAmpModelerCore as modules/nam takes
+        # it): the parity run makes its float16 packs with it — `encode --f16`, as a pack's author would.
+        include(FetchContent)
+        FetchContent_GetProperties(namz_src SOURCE_DIR _rig_namz_cli_src)
+        FetchContent_GetProperties(nam_core_src SOURCE_DIR _rig_nam_cli_src)
+        add_executable(fc_rig_namz "${_rig_namz_cli_src}/cli/namz.cpp")
+        target_include_directories(fc_rig_namz SYSTEM PRIVATE "${_rig_namz_cli_src}/include"
+                                   "${_rig_nam_cli_src}/Dependencies/nlohmann" "${_rig_nam_cli_src}/Dependencies")
+        target_compile_features(fc_rig_namz PRIVATE cxx_std_17)
+        # --stand-in: NAM's example A2, which the start is timed on where FELITRONICS_GUITAR_RIG_PACKS gives no real pack
+        # (the fixture's captures open the sound before a start has timed enough renders to decide — rig-parity.mjs).
         add_test(NAME felitronics_rig_wasm_parity
                  COMMAND ${FELITRONICS_NODE} --experimental-vm-modules --expose-gc ${CMAKE_CURRENT_SOURCE_DIR}/rig-parity.mjs
+                         --namz=$<TARGET_FILE:fc_rig_namz> --stand-in=${_rig_nam_cli_src}/example_models/A2.nam
                          ${FELITRONICS_GUITAR_RIG_WASM_DIR} $<TARGET_FILE:fc_rig_render> ${FC_RIG_ABI_HEADER}
                          ${FELITRONICS_GUITAR_RIG_PACKS})
     endif()

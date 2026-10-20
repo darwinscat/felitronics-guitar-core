@@ -92,13 +92,24 @@ disarms; a mono call runs ONE network per sounding capture, so a guitar is prepa
 
 The jobs the preload hands out are the ordinary ones (`fc_rig_take_job` …). With the set ready, neither a turn of the
 gain dial nor a switch within the set takes one. `processorOptions.preload` (`true` = the whole pack, or a cap) turns it
-on in the processor: silent until the set is ready (`{ preloaded: { pack, total, failed, quanta } }`), then the start's
-calibration, then play — again at every `{ load }`. While it preloads, switches, dials and levels land at once — those in
-`processorOptions.knobs` and in a `{ set }` posted before the module was up too — so the set is made around the panel
-the page asked for; the gain dial (`gain`, or its name in `dial` or `switch`) and `maxModels` wait with the start. The
-whole pack is 11 copies for X88-IR Crunch and V4 Sheriff Ch1 (41.6 MiB of module memory against 24.1 MiB without), 44
-for IR-X Ch2, 66 for IR-X Ch1 PowerAmp (179.4 MiB), each prepared in its own quantum of the silent start. What the set
-is, its memory and what a copy taken again holds: the player's README, "The preload".
+on in the processor, which FILLS THE SET IN THE BACKGROUND (v0.7.0): the start does not wait for it — the law's ask
+goes first, so the start sounds as soon as the capture it needs is held, warmed and timed, as without the preload — and
+the set is filled behind it, AT MOST ONE JOB A RENDER QUANTUM (a job whose answer arrives after one already ran waits
+for the next quantum), while it plays. `{ preloaded: { pack, total, failed, quanta } }` reports the set filled
+(`quanta`: those the fill ran in, PARK's excluded); nothing waits for it, it usually comes after `{ calibrated }`, and a
+`{ load }` or `{ unload }` before it ends that fill without one. Under PARK nothing loads: no job, no `{ need }`; an
+answer that arrives meanwhile is kept and its job runs at the first quantum back. A turn of DRIVE to a copy not filled
+yet is the law's ask, and goes first — at a job's cost when the player holds the file: hand the pack's files in with it
+(`{ load, files }`, ABI 5), or a fill `{ need }` out holds the next ask back by its round trip (the player hands out one
+job at a time). Measured (Playwright, 48 kHz, IR-X Ch1 PowerAmp, the page answering each `{ need }` after 40 ms): the
+first sound at 261 ms in WebKit and 248 ms in Chromium (v0.6.0: 2656 and 3981 ms), the set filled ~2.2 s later while it
+played, and no render quantum after the first sound later than 12 ms in either. While the start decides, switches,
+dials and levels land at once — those in `processorOptions.knobs` and in a `{ set }` posted before the module was up
+too — so the set is made around the panel and the DRIVE the page asked for; only `maxModels` waits for the start. The
+whole pack is 11 copies for X88-IR Crunch and V4 Sheriff Ch1 (24.1 MiB of module memory for this worklet in the
+node parity run, `rig-parity.mjs`, as without the set; `rig-compare.mjs`, which drives the ABI directly, reads 28.9 MiB
+— the CHANGELOG's figure), 44 for IR-X Ch2, 66 for IR-X Ch1 PowerAmp (103.8 MiB). What the set is, its memory and what
+a copy taken again holds: the player's README, "The preload".
 
 ## The load job, across the boundary and across the port
 
@@ -159,8 +170,9 @@ node.port.postMessage({ dispose: true });                                   // t
 order, and queued while the start decides. `{ standby }` (PARK; `{ set: { standby } }` is the same) is NEVER queued: a
 parked player runs no network, so the start's evidence cannot come while it stands by, and a PARK held behind it held
 for ever — a `{ load }` while parked was silence for good. It is applied at once (before the module is up, as soon as
-it is); while parked the start pauses and the output is the player's own (the fade, then the input at the latency)
-whatever the start's state; `{ standby: false }` resumes the start, silent until it decides, as after any `{ load }`.
+it is); while parked the start pauses, nothing loads (no job, no `{ need }`; an answer that arrives is kept for the
+first quantum back) and the output is the player's own (the fade, then the input at the latency) whatever the start's
+state; `{ standby: false }` resumes the start, silent until it decides, as after any `{ load }`.
 
 **The scope (ABI 2; its points ABI 3's).** The page owns one `ArrayBuffer` of `2·n` floats (`n` ≤ 2048) and sends it, transferred; the
 processor copies the newest frame into it — dry in `[0, n)`, wet at the dry's RMS in `[n, 2n)` — and sends the
@@ -185,37 +197,59 @@ Linear and WaveNet only, gated by `felitronics_nam_rtalloc_tests`), and makes th
 a 48 MiB file handed in grows the memory and the next quanta still play; a render that grows it copies out bit for
 bit).
 
-## The calibration rule
+## The start (v0.7.0: no burst, no hold)
 
 A browser's audio thread may afford two networks or only one, and the only honest way to know is to time one ON it.
-At its start — and again at every `{ load }`, since another pack's captures may be another architecture and another
-cost — the processor:
+At every pack (`{ load }`, and the first one), unless `calibrate: false`, the processor:
 
-1. tells the player ONE model (`setMaxModels(1)`) before the pack loads, and turns the gain dial to the middle of its
-   sweep (150 of 300 — 12 o'clock);
-2. waits until that capture is loaded and a block ran exactly one network, warm;
-3. renders quanta of SILENCE back to back until `Date.now()` has moved at least 30 ms (a worklet has no
-   `performance.now()`; a count of quanta between two coarse ticks is biased, a 30 ms burst is within a few percent —
-   the spike's measurement). The burst is VALID only when the player's own counters say every render ran exactly
-   one network, warm, and `Date.now()` moved at least 10 ms (a 1 ms tick is then at most 10 %); a burst whose
-   counters were not clean is tried again, up to 8 times;
-4. turns the blend on (`setMaxModels(2)`) when the burst is valid and one render costs **at most a quarter of the
-   quantum** (~667 µs at 48 kHz — two then fit in half), and otherwise stays at one capture with dips — an invalid
-   burst never turns the blend on;
-5. posts `{ calibrated: { renderUs, quantumUs, share, maxModels, renders, elapsedMs, runs, pairs, warm, valid,
-   reason } }` (`reason` when not valid: `'clock'`, `'counters'`) and applies the knobs that arrived meanwhile, in
-   order. The output is silent until then.
+1. runs ONE model (`setMaxModels(1)`) — or, once the session has decided anything, the count it decided — and lands
+   every knob at once, the gain dial too: the capture timed is the DRIVE's own, so the copy that warms is the copy that
+   sounds (no 12 o'clock); only a `maxModels` waits for the decision;
+2. once a capture is held, reads its architecture signature (`fc_rig_signature(slot)`: the architecture and the shape
+   of its layers, never weights, tags or trained numbers). A session decides once per architecture: every capture held
+   already decided on → that decision stands, nothing is timed. The signatures read are those of the captures held
+   when the first one lands, so a pack that mixes architectures is decided by those (the site's packs are one each);
+3. otherwise times the player's own live renders of the warm-up — `Date.now()` around each render that ran exactly one
+   network of that architecture alone (the counters; an outgoing capture's drain is not its evidence), nothing extra
+   run for it; a mean of 0-or-1 ms readings over many renders is unbiased;
+4. ends when the sound opens — the first quantum `fc_rig_audible` is 1, the first sample of the law's 15 ms fade-in —
+   and posts `{ calibrated: { renderUs, quantumUs, share, maxModels, renders, elapsedMs, runs, pairs, warm, valid,
+   reason } }` in that quantum (a capture that opens before 8 renders were timed: 8 quanta later at most). Valid: at
+   least 8 renders and a clock seen to step by 4 ms or less; valid and one render at most a quarter of the quantum
+   (~667 µs at 48 kHz) → the blend (`setMaxModels(2)`); else one capture with dips (`reason`: `'clock'` — Date.now too
+   coarse, Firefox's resistFingerprinting — or `'short'`, too few renders timed by then);
+5. **settles** a one-model decision: after the sound opens on one model, the architecture is timed on (renders that ran
+   one network of it alone, counted from an open — the start's own are the module's first, its coldest — and across
+   the session's starts, 512 quanta a start at most) until 64 of them, and decided again from those. Nothing changes
+   and nothing is posted meanwhile: the architecture's next start posts and applies it. A one-model decision on a
+   start's dozen readings lasts one pack at most, as v0.6.0's per-pack burst did; a two-model one errs the safe way (two
+   renders of 0.8 ms still fit) and is not settled. `Date.now()` allocates its heap number at every call in V8 (~12
+   bytes a timed quantum in node), so the timed quanta are only the start's and the settle's, both bounded
+   (rig-parity's allocation group).
 
-If the capture at 12 o'clock fails to load there is nothing to time: the start ends at one model with
-`{ calibrated: { maxModels: 1, valid: false, reason: 'load-failed' } }`, and the queued knobs land.
+A start's capture that fails to load ends it at once: `{ calibrated: { maxModels, valid: false, reason: 'load-failed'
+} }`. `{ calibrate: 'again' }` forgets the session's decisions (a page that knows its next pack is another
+architecture): with a `{ load }` that pack's start times; while sounding, one model is timed over 64 renders (256
+quanta at most: a neighbour put to rest drains first) and the decision posted as at a start. Nothing here silences the output: it is the player's own, its law keeps a capture
+silent until it is warm and fades it in. `{ measure }` still times a ~30 ms burst on demand (it stalls the context).
 
-**The burst stalls the whole AudioContext once.** It runs inside one `process()` call: ~30 ms plus up to two ticks of
-`Date.now()` (the wait for the first tick, the last one) — at 48 kHz and 128 frames about a dozen quanta, and every
-other node of the context drops out with it. Where `Date.now()` is coarsened (Firefox's `resistFingerprinting`,
-100 ms) the ticks are that long. The same class as the load stall, accepted alike.
+**The quiet warm** (`fc_rig_warm_quiet`, `processorOptions.quietWarm`, on with the start). A capture is not heard
+before its receptive field of input has run through it — 51 quanta (~136 ms) of a site WaveNet at 48 kHz. When the
+input has been exactly silent for all of that (PLAY, after a PARK; in a pause only once the tone stack's tail has
+decayed to an exact 0 — hundreds of ms after the last note, wasm keeps denormals — and the field has passed again),
+the warm-up's input is known; the player feeds the warming capture blocks of silence ahead of time after each render,
+as many as fit 60 % of the quantum with the render by an UPPER BOUND on what a render of that architecture costs (the
+readings' sum plus 3 clock ticks, or √renders ticks if more, over the renders: eight readings of 0 ms say "under
+~0.4 ms", not "nothing"); one block until 8 renders are timed; the budget is the architecture's own, never the last
+one timed. A quantum that warmed runs no job — not from the fill, and not from a `{ file }` answer that arrives after
+it. Measured in the node harness on X88-IR Crunch, IR-X Ch1 PowerAmp and V4 Sheriff Ch1: PLAY sounds after 20–24
+quanta (53–64 ms; 15 with the bare mean, which a 0.3 ms render could push to 2.1 ms a quantum), 53 without it; the
+riff after it is the riff after the live warm-up, bit for bit (RigAbiTests on the fixture, rig-parity on the three
+packs, maxModels 1 and 2, with a control that differs). Mid-riff (a channel change) the input is not silence: the
+live warm-up stays — the sound is back after the dip and ~53 quanta.
 
-`{ measure: true }` runs the same burst on whatever is playing (`{ measured }` — one or two networks, counted) without
-deciding anything: for a bench, at a silent moment.
+v0.6.0's start cost every PLAY and every channel ~266 ms of silence (warm-up 135, a 30 ms burst inside one quantum,
+CAL_HOLD 80, ramp 5); the burst stalled the context and WebKit dropped out a second time 16–40 ms after it.
 
 ## Build
 
@@ -230,7 +264,7 @@ get exceptions back (below); `-O3`; linked `-sENVIRONMENT=worklet -sGROWABLE_ARR
 `createFcRig`, no eval, no file system, dlmalloc. Core is the PINNED tag, v0.61.1 (the first whose `FlushToZero.h`
 compiles for wasm under `-msse4.1`), unless `FELITRONICS_CORE_DIR` names another; NeuralAmpModelerCore v0.5.4, Eigen
 5.0.1 (from the mirror github.com/darwinscat/eigen, at the commit v0.5.4's submodule pins — no build asks gitlab.com) and
-namz v4.1.0 are `modules/nam`'s pins (`FELITRONICS_NAM_CORE_SRC` / `FELITRONICS_NAMZ_SRC` point at local checkouts of
+namz v4.4.0 are `modules/nam`'s pins (`FELITRONICS_NAM_CORE_SRC` / `FELITRONICS_NAMZ_SRC` point at local checkouts of
 them for an offline build; a local NeuralAmpModelerCore brings its own Eigen). It proves the artefact single-threaded (core's `check-no-threads.mjs`), reads the wasm features the
 module needs off the module (binaryen validation against MVP plus each candidate), refuses a glue that names
 `toResizableBuffer`, and writes `BUILD-INFO`:
@@ -240,8 +274,8 @@ felitronics-guitar-core <git describe>
 felitronics-core v0.61.1
 NeuralAmpModelerCore v0.5.4
 Eigen 5.0.1
-namz v4.1.0
-fc_rig ABI 3
+namz v4.4.0
+fc_rig ABI 5
 emscripten 6.0.9 (…)
 flags -fno-exceptions -fno-rtti -msimd128 -msse4.1; exceptions on the NAM objects only, wasm legacy EH
 wasm features sign-ext nontrapping-float-to-int simd exception-handling
@@ -342,15 +376,18 @@ the incoming capture's warm-up beside the outgoing capture's drain — on an eng
   matcher's floor; 0.0139 before a memoryless copy was drained at its landing); no allocation in `process()`; unload
   frees the set, a load makes it again; ABI 4 through the C surface, bit for bit with RigPlayer.
 - `felitronics_rig_wasm_parity` (ctest when `FELITRONICS_GUITAR_RIG_WASM_DIR` names `build.sh`'s output; real packs
-  too with `FELITRONICS_GUITAR_RIG_PACKS`; `node --experimental-vm-modules --expose-gc rig-parity.mjs <dir>
-  <fc_rig_render> <abi header> [<packs dir>]`): the processor and the glue as ES modules in a context shaped like an
+  too with `FELITRONICS_GUITAR_RIG_PACKS`; `node --experimental-vm-modules --expose-gc rig-parity.mjs [--namz=<namz
+  CLI>] [--stand-in=<A2.nam>] <dir> <fc_rig_render> <abi header> [<packs dir>]`; ctest passes `fc_rig_namz`, namz's own
+  CLI built from the pin, and NAM's example `A2.nam`, which the start is timed on where no real pack is given — the
+  fixture's captures open the sound before a start has timed enough renders to decide): the processor and the glue as
+  ES modules in a context shaped like an
   AudioWorkletGlobalScope (no fetch, URL, TextDecoder, TextEncoder, atob, setTimeout, performance; no
   toResizableBuffer), the page simulated; exports == the header; every pack rendered through the processor's own
   `process()` against `fc_rig_render` on the same schedule, within **2e-5** (law 10's contraction is stated alike, but
   Eigen spells its own multiply-add: fused on native arm64's NEON, not on SIMD128 — measured 1.2e-7 on the fixture,
   1.7e-6 … 5.5e-6 on X88-IR Crunch, IR-X Ch1 PowerAmp, V4 Sheriff Ch1, two models and one); garbage for a capture is a
-  failed load, not a trap, and growing the memory mid-stream; the start's decision with a real pack (blend on) and an
-  injected slow render (one model), the silent start, the queued knobs in order; ABI 2 — PARK never queued (a
+  failed load, not a trap, and growing the memory mid-stream; the start's decision on a real pack or the A2 stand-in, on a clock the test owns
+  (a 0.2 ms render: blend on; 2 ms: one model — the same on any machine), the silent start, the queued knobs in order; ABI 2 — PARK never queued (a
   `{ load }` while parked plays the wire bit for bit, the start resumes on the return and decides again, the knobs sent
   during it land after it in order); the `{ scope }` round trip as a page's port carries it (the reply in the
   transfer list, detached on the processor's side, the frame whole on the page's; `n` 0 before anything rendered) and every frame of a render through PARK and back against
@@ -362,7 +399,10 @@ the incoming capture's warm-up beside the outgoing capture's drain — on an eng
   BigInt knob is ignored; no module, a refused prepare, a
   foreign quantum and a trap — one error, dry, alive, only dispose ends; no allocation per quantum (under 4 bytes of
   JS heap per quantum over 15 000, no garbage collection — a boxed number per quantum reads 16.5 … 17.1); the cost of
-  one quantum with one capture and with two, reported; ABI 4 — with the preload, every pack is silent until `{ preloaded }`, calibrates after it, and a turn 0 → sweep → 0 a degree a quantum posts no `{ need }` and runs no job; the preloaded processor bit for bit with a plain one on the same input and dial path.
+  one quantum with one capture and with two, reported; ABI 4 — with the preload (filled in the background, v0.7.0), every pack, its `{ need }`s answered after 16 quanta, decides its start with copies still to fill, sounds while they fill, runs at most one job between two renders, and once filled a turn 0 → sweep → 0 a degree a quantum posts no `{ need }` and runs no job; PARK mid-fill runs no job and posts no `{ need }`, keeps the answer that arrives and runs its job at the first quantum back; a `{ load }` mid-fill says one `{ preloaded }`, for the new pack; with `calibrate: false` a knob lands at once while the set fills; the start's capture failing ends the start at once, a fill copy failing does not; the preloaded processor bit for bit with a plain one on the same input and dial path; FLOAT16 (namz 4.4.0, with
+  `--namz`) — every pack's captures made `.nam16z` by `namz encode --f16` and float32 `.namz` again from those halves
+  widened: the `.nam16z` pack plays bit for bit what the widened pack plays, in the module and natively, every `.nam16z`
+  asked for and handed in by the name rig.json gives, and the same halves named `.namz` play the same.
 
 ## What a page owes it
 
@@ -384,3 +424,18 @@ at the glue — with content-hashed names, rename the glue, rewrite that one imp
 the three in one hashed directory), and hash the worklet after the rewrite. Ship `BUILD-INFO` beside them. The ABI
 version is the `#define FC_RIG_ABI_VERSION <n>u` line of `tools/fc_rig_abi.h`. Licences: this module is AGPL-3.0;
 it compiles in NeuralAmpModelerCore (MIT), nlohmann/json (MIT), Eigen (MPL-2.0) and namz (`THIRD_PARTY_NOTICES.md`).
+
+## v0.7.0 — ABI 5: a lighter load, the files up front
+
+- `fc_rig_job_run` builds one network per capture on a mono instance and skips NAM's zero prewarm; a `.namz` of a proven
+  architecture is read without JSON. Same audio, bit for bit: `node --experimental-vm-modules rig-compare.mjs <v0.6.0
+  build> <this build> <pack.orbitrig>...` runs 12 sessions a pack through both modules (8 at 48 kHz, 4 at 44.1 kHz),
+  compares them as bits (−0 is not +0, no NaN passes) and runs a one-ulp control.
+- `fc_rig_put_file` / `{ files: [{ file, bytes }, …] }`: a page that has a pack's files hands them in with `{ load }` and
+  no load waits on a `{ need }` round trip. The processor needs ABI 5.
+- The start has no burst and no hold any more (see "The start"): it times the warm-up's own renders, posts
+  `{ calibrated }` in the quantum the sound opens, once per architecture a session (a one-model decision settled for
+  the next pack); the quiet warm opens PLAY after ~55–65 ms.
+- `fc_rig_put_file` asks the player first (`RigPlayer::wantsFile`): an id the pack does not name, or a file already
+  held, returns NULL without growing the module's memory. Before the module is up, a `{ files }` carrying a `pack` is
+  kept only with its `{ load }`; a setup that fails drops the files it was handed.

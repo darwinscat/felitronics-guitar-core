@@ -4,7 +4,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 //==============================================================================
 // felitronics::nam::NamStage — a neural amp (NAM) stage that runs IN FRONT of cab convolution
@@ -39,9 +41,14 @@
 // unpack, rate-match). This class is the stable public seam, so product adapters can simply alias it.
 //
 // Channels: a MONO stream (1 ch) runs ONE model instance on the single channel; a STEREO stream
-// (2 ch) runs TWO independent instances of the SAME capture (true stereo — L/R independent). Both
-// instances are always built on load, and prepare() configures both per-channel resamplers, so a
-// host switching the layout mono<->stereo (a re-prepare) is safe.
+// (2 ch) runs TWO independent instances of the SAME capture (true stereo — L/R independent). A load
+// builds as many instances as the stage was prepared for (prepare's numChannels, prepareModel's): one
+// on a mono host — half the memory and half the build of a load since v0.7.0 — two on a stereo one; and
+// ALWAYS two for a recurrent capture (an LSTM), whose second network built later would start from another
+// history than the first and play other numbers on the same input (NamLoadTests' recurrent group).
+// A mono model keeps the bytes it was built from, so a host that re-prepares mono -> stereo gets the
+// second instance built there, on the message thread; stereo -> mono keeps both. A call wider than the
+// model's instances is refused (process() answers false), never half-processed.
 //==============================================================================
 namespace felitronics::nam
 {
@@ -107,6 +114,10 @@ public:
     // the SAME rate and block is the common case (a host's buffer-size slider moves more often than its
     // rate one), and it is exactly the case that leaked loudest.
     void prepare (double sampleRate, int maxBlock);
+    // The same for a host of `numChannels`: 1 = a mono host, whose loads build ONE network; anything else is a
+    // stereo one (two) — the two-argument form is this with 2. A model already installed for fewer channels than
+    // this asks for gets its second network built here (it kept the bytes it was built from).
+    void prepare (double sampleRate, int maxBlock, int numChannels);
 
     // 🔴 THE STREAM RESTART, AND IT MEANS IT. Audio thread (or any thread with audio stopped): every
     // lane that carried audio is fed the digital silence it still owes, here and in full, until its
@@ -207,7 +218,7 @@ public:
     bool   loadModelFromMemory (const void* data, std::size_t size, float trimDb = 0.0f);
 
     //--- the same load, in two halves ----------------------------------------------
-    // The heavy half — the bytes parsed, both instances built, the rate-match and the prewarm
+    // The heavy half — the bytes read, the instances built, the rate-match and the prewarm
     // prepared — done ANYWHERE BUT the audio thread and touching no stage at all, so a host can run
     // it on a worker while its drawing thread stays free: a WaveNet costs some twenty milliseconds
     // here, which a hand on a knob feels as a hiccup. `sampleRate` and `maxBlock` are what the stage
@@ -215,15 +226,41 @@ public:
     // thread, at the old cost. Null = a bad or unsupported model — EVERY case loadModelFromMemory()
     // refuses, the rate contract included: acceptsModelRate() reads no stage state, so this half can
     // and does judge it. What that saves is the PREWARM and the rate configuration, not the parse: the
-    // tag is read off the built network (`GetExpectedSampleRate`), so both instances exist by the time
+    // tag is read off the built network (`GetExpectedSampleRate`), so the instances exist by the time
     // the contract can be asked. An earlier wording here said "the network is never built", which is
     // simply false and was caught by a review round rather than by a test.
     // loadModelFromMemory() IS prepareModel() followed by install(): one path, two entry points.
     struct Prepared;
     struct PreparedDeleter { void operator() (Prepared*) const noexcept; };
     using PreparedModel = std::unique_ptr<Prepared, PreparedDeleter>;
+    //
+    // `numChannels` is the host's: 1 builds ONE network (a mono host never runs a second), anything else two — and a
+    // recurrent capture two whatever it is (the Channels note above). A weight that is not finite refuses the load.
+    // `warm` says who brings a fresh network out of its zero state before it is heard:
+    //   Warm::Nam     NAM's own prewarm, inside the load — `GetPrewarmSamples()` of silence per network (4.4 ms for
+    //                 a real A2 capture in a wasm build). Right for a model heard at once: loadModelFromMemory.
+    //   Warm::Caller  the load skips NAM's prewarm for a NON-RECURRENT capture, because the caller feeds live input
+    //                 through the receptive field before the model is audible — rigplayer::RigPlayer's warmFor(),
+    //                 which never lets a slot be heard before it. After that much input a WaveNet or a Linear holds
+    //                 exactly what it would have held prewarmed, so what is heard is bit-identical. A recurrent
+    //                 capture (an LSTM) is prewarmed anyway: no finite warm-up closes a recurrent state. The one
+    //                 block of silence that grows NAM's lazy buffers still runs, so process() stays allocation-free.
+    //                 Only the load skips it: a later re-prepare (a host's new rate or block) prewarms as ever.
+    // HOW THE NETWORK IS BUILT (v0.7.0): a .namz is read with namz::decode — the skeleton parsed, the weights as
+    // float32 vectors — and, for the architectures felitronics_nam_load_tests (NamLoadTests.cpp) proves bit-identical to NAM's get_dsp of the
+    // JSON (a Linear, a WaveNet whose config holds no capture of its own, a SlimmableContainer of those), handed
+    // straight to NAM's create_dsp: the weights are never printed to JSON text and parsed back. Everything else —
+    // raw .nam JSON, an LSTM, a ConvNet, a conditioned WaveNet, a container holding any of those — takes the JSON
+    // path exactly as before.
+    enum class Warm { Nam, Caller };
     static PreparedModel prepareModel (const void* data, std::size_t size, double sampleRate, int maxBlock,
-                                       float trimDb = 0.0f);
+                                       float trimDb = 0.0f, int numChannels = 2, Warm warm = Warm::Nam);
+    // The same from bytes the caller already holds shared (rigplayer::RigPlayer keeps every file it has once): a mono
+    // model keeps THESE bytes for its later second network — one more owner — instead of a private copy of them.
+    static PreparedModel prepareModel (std::shared_ptr<const std::vector<std::byte>> bytes, double sampleRate,
+                                       int maxBlock, float trimDb = 0.0f, int numChannels = 2, Warm warm = Warm::Nam);
+    // How many networks a prepared handle holds (1 or 2; 0 for a null one) — what a mono prepare saves, readable.
+    static int networksOf (const PreparedModel& model) noexcept;
     // The light half: message thread, a pointer swap. False — and the stage untouched — for a null
     // handle, and for the one case left that a handle cannot answer on its own: a re-preparation for
     // THIS stage's host rate and block that the backend cannot honour (see prepare()'s refusal). The
@@ -390,6 +427,14 @@ public:
     // ⚠️ It is a MEMORY, not a tap count: an N-tap impulse response reaches back N−1 samples, so a
     // one-tap capture answers 0. This used to answer 0 for EVERY Linear capture, whatever its length.
     int    prewarmSamples()  const;
+    // WHAT THE LIVE MODEL COSTS TO RUN, as one number (v0.7.0): a hash of its architecture and the shape of its
+    // layers — never its weights, metadata or any trained number — so two captures of one architecture answer the same. 0 = no model. For a
+    // host that times a capture once and keeps the answer for every capture of the same architecture
+    // (tools/wasm-rig/fcrig-worklet.js: one calibration per architecture a session). Message thread, as the mirrors above.
+    std::uint32_t architectureSignature() const;
+    // How many networks the live model runs (0 = none): 1 for a non-recurrent capture loaded on a mono host, 2
+    // otherwise — and 2 once a host re-prepared it for two channels. Message thread (it reads the live model).
+    int    liveNetworks()    const noexcept;
 
     // 🔴 THE DRAIN'S ODOMETER — how many samples of digital silence this stage has fed to lanes the
     // caller STOPPED handing over, since it was CONSTRUCTED. It is not cleared by a load, a clear or a

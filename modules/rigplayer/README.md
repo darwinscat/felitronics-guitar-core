@@ -286,3 +286,23 @@ from these draws what is sounding; recomputing from the pack's ladders draws som
 The source (a loop, the jack), a cabinet IR, output routing, a pre-model trim the bench owns, level
 metering, presets — the chain AROUND the player. In OrbitCapture NAM that is `AuditionEngine`
 (the JUCE audio side) and `AuditionController` (the message-thread wiring, the pool that runs jobs).
+
+## v0.7.0 — the load
+
+`RigPlayer::run` prepares a capture with the player's channel count (`LoadJob::channels`: one network on a mono host)
+and `NamStage::Warm::Caller` (no NAM zero prewarm for a non-recurrent capture — `warmFor()` covers the receptive field
+before a slot is heard). `RigPlayer::putFile (id, bytes)` keeps a file handed in up front, as a fetched one is kept.
+`RigPlayer::run` hands the job's bytes to `NamStage::prepareModel` shared, so a mono copy keeps no private copy of its
+file; `RigPlayer::wantsFile (id)` says whether `putFile` would keep bytes, before a host makes room for them.
+
+**OrbitAmp at its guitar-core bump.** The C++ seam is compatible: `takeLoadJob` / `run` / `deliver`
+(`src/core/CapturedBlock.h`) are unchanged, and `LoadJob::channels` has a default that `takeLoadJob` fills in. The
+BUILD is not: v0.7.0 needs namz v4.4.0 (`namz::decode`, and the float16 `.nam16z` it widens), and OrbitAmp pins namz itself. At the bump it must
+- set `ORBITAMP_GUITAR_TAG` to v0.7.0 (`CMakeLists.txt`, ~122);
+- set `ORBITAMP_NAMZ_TAG` to v4.4.0 (~187) — it FORCEs `FELITRONICS_NAMZ_TAG`, so guitar-core's own pin does not reach it.
+  A fetched namz is held to `FELITRONICS_NAMZ_COMMIT` (v4.4.0's commit by default): a tag left behind stops the configure
+  with both commits named, and a later namz bump in OrbitAmp alone FORCEs `FELITRONICS_NAMZ_COMMIT` with the tag;
+- have the sibling `../namz` checkout on v4.4.0 or later: OrbitAmp FORCEs `FELITRONICS_NAMZ_SRC` to it whenever it
+  exists (~178–180), so a local build breaks with "no member named 'decode'" as soon as `../felitronics-guitar-core`
+  is at v0.7.0 and that checkout is not.
+A mono host then builds one network per capture (two for a recurrent one) and no NAM zero prewarm on its loads.

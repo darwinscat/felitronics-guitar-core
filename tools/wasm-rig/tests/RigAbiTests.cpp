@@ -542,8 +542,8 @@ void contract()
         ok (fc_rig_scope_frames (r) == frames, "stood by, the count stands still");
         fc_rig_destroy (r);
     }
-    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 4u,
-        "abi_version answers the header's 4 (the preload since v0.6.0; the scope at the app's two points since v0.5.1)");
+    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 5u,
+        "abi_version answers the header's 5 (the lighter load and the files up front since v0.7.0; the preload since v0.6.0; the scope at the app's two points since v0.5.1)");
     fc_rig* r = fc_rig_create();
     float x[4] {};
     ok (fc_rig_process (r, x, nullptr, 4) == 0, "process before prepare is refused");
@@ -627,6 +627,169 @@ void noAllocation()
 }
 } // namespace
 
+// ABI 5: the files up front. Every file but one handed in right after the load: across a sweep of the gain dial that
+// visits every capture, the only file a job ever needs bytes for is the one left out; and a job already out waiting
+// for a file takes it from fc_rig_put_file.
+void filesUpFront()
+{
+    group ("ABI 5 — the files up front (fc_rig_put_file)");
+    const auto expect = [] (bool c, const std::string& msg) { ok (c, msg); return c; };
+    const auto fixture = fc_rig_fixture::pack();
+    if (! expect (fixture.files.size() >= 3, "the fixture pack has files to hand in")) return;
+    const auto put = [] (fc_rig* r, const std::string& id, const std::vector<std::byte>& b) {
+        std::uint8_t* p = fc_rig_put_file (r, id.c_str(), (int) b.size());
+        if (p != nullptr) std::memcpy (p, b.data(), b.size());
+        return p != nullptr;
+    };
+    // A sweep of the gain dial over every capture; the files handed in up front are all but `missing` (all of them
+    // when it is empty… none, when `upFront` is false). Answers which files a job needed bytes for.
+    float io[kBlock] {};
+    const auto sweep = [&] (bool upFront, const std::string& missing, int& jobs, int& landed, int& taken) {
+        std::map<std::string, int> needed;
+        jobs = landed = taken = 0;
+        fc_rig* r = fc_rig_create();
+        test::run (fc_rig_prepare (r, kFs, kBlock, 1) == 1);
+        if (upFront) ok (! put (r, fixture.files.begin()->first, fixture.files.begin()->second), "no pack loaded: nothing taken (NULL)");
+        test::run (fc_rig_load (r, fixture.manifest.c_str(), (int) fixture.manifest.size()) == 1);
+        if (upFront)
+        {
+            for (const auto& [id, bytes] : fixture.files)
+                if (id != missing) taken += put (r, id, bytes) ? 1 : 0;
+            const auto& first = *fixture.files.begin();
+            ok (! put (r, first.first, first.second), "a file already held: NULL, the first bytes stay");
+            ok (fc_rig_put_file (r, "no-such-file.namz", 16) == nullptr, "an id the pack does not name: NULL");
+            ok (fc_rig_put_file (r, first.first.c_str(), 0) == nullptr && fc_rig_put_file (r, nullptr, 16) == nullptr
+                && fc_rig_put_file (nullptr, first.first.c_str(), 16) == nullptr, "size 0, a NULL id, no instance: NULL");
+        }
+        const double span = fc_rig_gain_dial_sweep (r);
+        for (int b = 0; b < 1300; ++b)
+        {
+            if (b % 100 == 0) (void) fc_rig_set_gain_dial (r, span * (double) ((b / 100) % 13) / 12.0);
+            std::fill (io, io + kBlock, 0.01f);
+            test::run (fc_rig_process (r, io, nullptr, kBlock) == 1);
+            if (fc_rig_take_job (r) != 1) continue;
+            ++jobs;
+            const std::string id (fc_rig_job_file (r), (std::size_t) fc_rig_job_file_length (r));
+            if (fc_rig_job_needs_bytes (r) == 1)
+            {
+                ++needed[id];
+                const auto& bytes = fixture.files.at (id);
+                std::memcpy (fc_rig_job_bytes (r, (int) bytes.size()), bytes.data(), bytes.size());
+            }
+            (void) fc_rig_job_run (r);
+            landed += fc_rig_job_deliver (r) == 1 ? 1 : 0;
+        }
+        fc_rig_destroy (r);
+        return needed;
+    };
+    int jobs = 0, landed = 0, taken = 0;
+    const auto asked = sweep (false, "", jobs, landed, taken);
+    if (! expect (asked.size() >= 2 && landed == jobs, "without the files up front, the sweep asks for "
+                  + std::to_string (asked.size()) + " files")) return;
+    const std::string missing = asked.rbegin()->first;   // one the sweep visits, never handed in
+    const auto needed = sweep (true, missing, jobs, landed, taken);
+    ok (taken == (int) fixture.files.size() - 1, "every file handed in is taken (" + std::to_string (taken) + ")");
+    ok (landed == jobs && jobs >= (int) asked.size(), "the sweep loaded captures (" + std::to_string (jobs) + " jobs, "
+        + std::to_string (landed) + " landed)");
+    ok (needed.size() == 1 && needed.count (missing) == 1,
+        "only the file not handed in ever needed bytes (" + std::to_string (needed.size()) + " distinct, " + missing + ")");
+
+    // A job out waiting for a file: handed in now, the job carries it and runs to a model.
+    fc_rig* r = fc_rig_create();
+    test::run (fc_rig_prepare (r, kFs, kBlock, 1) == 1);
+    test::run (fc_rig_load (r, fixture.manifest.c_str(), (int) fixture.manifest.size()) == 1);
+    int got = 0;
+    for (int b = 0; b < 50 && got == 0; ++b)
+    {
+        std::fill (io, io + kBlock, 0.0f);
+        test::run (fc_rig_process (r, io, nullptr, kBlock) == 1);
+        got = fc_rig_take_job (r);
+    }
+    if (expect (got == 1 && fc_rig_job_needs_bytes (r) == 1, "a job out, needing bytes"))
+    {
+        const std::string id (fc_rig_job_file (r), (std::size_t) fc_rig_job_file_length (r));
+        ok (put (r, id, fixture.files.at (id)), "its file handed in up front is taken");
+        ok (fc_rig_job_needs_bytes (r) == 0, "…and the job no longer needs bytes");
+        ok (fc_rig_job_run (r) == 1 && fc_rig_job_deliver (r) == 1, "…and runs to a model that lands");
+    }
+    fc_rig_destroy (r);
+}
+
+// THE QUIET WARM (fc_rig_warm_quiet, v0.7.0): a warming capture fed blocks of silence ahead of real time while the
+// input is silence opens after a few blocks instead of its field — and from the moment the live warm-up opens too
+// the two sessions are the same, bit for bit (riff included). Mid-riff it does nothing: the input is not silence.
+struct QuietRun { std::vector<float> out; int firstAudible = -1; long long quietBlocks = 0; };
+
+QuietRun quietSession (const fc_rig_fixture::Pack& fixture, int quietBlocks, int maxModels, double dialFrac, int riffAt,
+                       int blocks, int ulpAt = -1)
+{
+    QuietRun q;
+    fc_rig* r = fc_rig_create();
+    test::run (fc_rig_prepare (r, kFs, kBlock, 1) == 1);
+    test::run (fc_rig_load (r, fixture.manifest.c_str(), (int) fixture.manifest.size()) == 1);
+    for (const auto& [id, bytes] : fixture.files)
+        if (std::uint8_t* p = fc_rig_put_file (r, id.c_str(), (int) bytes.size()); p != nullptr)
+            std::memcpy (p, bytes.data(), bytes.size());
+    (void) fc_rig_set_max_models (r, maxModels);
+    (void) fc_rig_set_gain_dial (r, fc_rig_gain_dial_sweep (r) * dialFrac);
+    float io[kBlock] {};
+    for (int b = 0; b < blocks; ++b)
+    {
+        for (int i = 0; i < kBlock; ++i)
+        {
+            const double t = (double) ((b - riffAt) * kBlock + i) / kFs;
+            io[i] = b < riffAt ? 0.0f : (float) (0.3 * std::sin (2.0 * kPi * 82.41 * t) + 0.12 * std::sin (2.0 * kPi * 196.0 * t));
+        }
+        if (b * kBlock <= ulpAt && ulpAt < (b + 1) * kBlock)
+            io[ulpAt - b * kBlock] += 1e-5f;   // the control: -100 dB on one sample (one ulp is rounded away by the input level)
+        test::run (fc_rig_process (r, io, nullptr, kBlock) == 1);
+        q.out.insert (q.out.end(), io, io + kBlock);
+        if (q.firstAudible < 0 && fc_rig_audible (r) == 1) q.firstAudible = b;
+        if (quietBlocks > 0) q.quietBlocks += fc_rig_warm_quiet (r, quietBlocks);
+        if (fc_rig_take_job (r) == 1) { (void) fc_rig_job_run (r); (void) fc_rig_job_deliver (r); }
+    }
+    fc_rig_destroy (r);
+    return q;
+}
+
+bool sameBits (const std::vector<float>& a, const std::vector<float>& b, std::size_t from)
+{
+    return a.size() == b.size() && std::memcmp (a.data() + from, b.data() + from, (a.size() - from) * sizeof (float)) == 0;
+}
+
+void quietWarm()
+{
+    group ("ABI 5 — the quiet warm (fc_rig_warm_quiet): silence warms ahead, bit-identical to the live warm-up");
+    // The fixture with fields worth warming: two of its captures WaveNets reaching back 2000 and 1200 samples (16 and
+    // 10 blocks); the 60 capture stays a gain (no field: nothing to warm, at once either way).
+    auto fixture = fc_rig_fixture::pack();
+    fixture.files["g150.namz"] = fc_rig_fixture::packed (fc_rig_fixture::waveNet (2000));
+    fixture.files["g240.nam"]  = fc_rig_fixture::bytesOf (fc_rig_fixture::waveNet (1200));
+    constexpr int kRiffAt = 400, kBlocks = 700;
+    for (const int maxModels : { 1, 2 })
+        for (const double dial : { 0.0, 0.5, 0.8 })
+        {
+            const std::string at = "maxModels " + std::to_string (maxModels) + ", dial " + std::to_string (dial).substr (0, 3);
+            const auto live  = quietSession (fixture, 0, maxModels, dial, kRiffAt, kBlocks);
+            const auto quiet = quietSession (fixture, 3, maxModels, dial, kRiffAt, kBlocks);
+            ok (quiet.firstAudible >= 0 && (dial < 0.1 ? quiet.firstAudible == live.firstAudible && quiet.quietBlocks == 0
+                                                       : quiet.firstAudible < live.firstAudible && quiet.quietBlocks > 0),
+                at + ": opens at block " + std::to_string (quiet.firstAudible) + " with the quiet warm (" + std::to_string (quiet.quietBlocks)
+                + " blocks of silence ahead), " + std::to_string (live.firstAudible) + " without");
+            std::size_t same = live.out.size();
+            while (same > 0 && std::memcmp (&live.out[same - 1], &quiet.out[same - 1], sizeof (float)) == 0) --same;
+            ok (sameBits (live.out, quiet.out, (std::size_t) kRiffAt * kBlock),
+                at + ": the riff is bit-identical (identical from sample " + std::to_string (same) + ", block "
+                + std::to_string (same / kBlock) + "; the riff from block " + std::to_string (kRiffAt) + ")");
+            const auto control = quietSession (fixture, 3, maxModels, dial, kRiffAt, kBlocks, kRiffAt * kBlock + 1000);
+            ok (! sameBits (live.out, control.out, (std::size_t) kRiffAt * kBlock), at + ": the control (one input sample 1e-5 off) differs");
+            const auto midLive  = quietSession (fixture, 0, maxModels, dial, 0, 300);
+            const auto midQuiet = quietSession (fixture, 3, maxModels, dial, 0, 300);
+            ok (midQuiet.quietBlocks == 0 && sameBits (midLive.out, midQuiet.out, 0),
+                at + ": mid-riff (the input never silent) nothing is warmed ahead, every sample the same");
+        }
+}
+
 int main()
 {
     std::printf ("felitronics_rig_abi_tests\n");
@@ -634,6 +797,8 @@ int main()
     bitIdentity();
     feedMeaning();
     jobProtocol();
+    filesUpFront();
+    quietWarm();
     noAllocation();
     return felitronics::test::report();
 }

@@ -11,7 +11,7 @@ local checkouts via `FELITRONICS_NAM_CORE_SRC` / `FELITRONICS_NAMZ_SRC`); nothin
 | `nam` | **NeuralAmpModelerCore** `v0.5.4` at `1f42f88535884450104b8711d7595019afa0495b` (`https://github.com/sdatkinson/NeuralAmpModelerCore`) | MIT | yes |
 | `nam` | **Eigen** 5.0.1, the commit NeuralAmpModelerCore's `Dependencies/eigen` submodule pins at that release, fetched from the mirror github.com/darwinscat/eigen | MPL-2.0 | yes |
 | `nam` | **nlohmann/json**, vendored inside NeuralAmpModelerCore at that pin | MIT | yes |
-| `nam` | **namz** `v4.1.0` at `7bacfcb2a1beb48a5d95a5aa43c3b25092f0537a` (`https://github.com/darwinscat/namz`) | MIT | yes |
+| `nam` | **namz** `v4.4.0` at `215d1640a9462e965a5bf027d4a533b1d43a9607` (`https://github.com/darwinscat/namz`) | MIT | yes |
 
 `felitronics::nam` carries NAM's architecture-registration whole-archive link contract
 (`$<LINK_LIBRARY:WHOLE_ARCHIVE,nam_core>`) transitively, and exports only the namz and nlohmann include

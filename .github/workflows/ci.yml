@@ -116,7 +116,7 @@ jobs:
         run: |
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_GUITAR_BUILD_TESTS=ON \
                 -DFELITRONICS_GUITAR_RIG_WASM_DIR="$PWD/tools/wasm-rig/build"
-          cmake --build build-native --target fc_rig_render -j "$(nproc)"
+          cmake --build build-native --target fc_rig_render fc_rig_namz -j "$(nproc)"
           ctest --test-dir build-native -R felitronics_rig_wasm_parity --output-on-failure --no-tests=error
 
   # ---- nightly -------------------------------------------------------------------------------------------

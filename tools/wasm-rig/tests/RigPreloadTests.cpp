@@ -360,7 +360,7 @@ int main()
     {
         const auto pack = fc_rig_fixture::pack();
         fc_rig* r = fc_rig_create();
-        ok (fc_rig_abi_version() == 4u, "abi_version answers 4");
+        ok (fc_rig_abi_version() == 5u, "abi_version answers 5");
         ok (fc_rig_set_preload (r, -1) == 0 && fc_rig_set_preload (nullptr, 1) == 0, "a negative cap, no instance: refused");
         ok (fc_rig_set_preload (r, RigPlayer::kPreloadWholePack) == 1, "on");
         ok (fc_rig_prepare (r, 48000.0, kBlock, 1) == 1, "prepared");
