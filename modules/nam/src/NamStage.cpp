@@ -5,14 +5,17 @@
 
 #include <NAM/dsp.h>        // NAM_SAMPLE (float, via NAM_SAMPLE_FLOAT) + class ::nam::DSP
 #include "ReceptiveField.h"
+// namz's implementation lives in THIS translation unit, and its include guard covers it: so namz.h is included here,
+// with the macro, before DirectBuild.h includes it again for the declarations alone.
+#define NAMZ_IMPLEMENTATION
+#include <namz.h>           // load path accepts BOTH raw .nam JSON and packed .namz
+#include "DirectBuild.h"        // a .namz made into networks without printing its weights (v0.7.0)
 
 #include <NAM/get_dsp.h>    // ::nam::get_dsp(path|json)
 
 #include <felitronics/core/StreamResampler.h>
 #include <felitronics/neural/NeuralStage.h>   // the shared swap-safe holder extracted from AmpStage
 
-#define NAMZ_IMPLEMENTATION
-#include <namz.h>           // load path accepts BOTH raw .nam JSON and packed .namz
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +23,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace felitronics::nam
@@ -45,6 +49,135 @@ namespace
     // pending-intent slot in NamStage::Impl makes even that case lossless.
     constexpr int kMaxRetiredModels = 64;
 
+    // The zip-bomb guards of a load. The JSON path caps the text namz::unpack reconstructs; the direct path caps the
+    // floats namz::decode holds and its placeholders name — the same 64 MiB, counted as float32 rather than as text.
+    // So the direct path admits a larger model than the text cap did: ~16.8 M floats, where 64 MiB of JSON holds some
+    // 5–6 M printed ones (about 3×). Real captures are 14 k–100 k floats; the cap is a bomb guard, not a size policy.
+    constexpr std::size_t kMaxUnpackedNamBytes = 64u * 1024u * 1024u;
+    constexpr std::size_t kMaxDecodedFloats    = kMaxUnpackedNamBytes / sizeof (float);
+
+    // What a load reads off the capture's config besides the networks (the receptive-field registry's answers).
+    struct ConfigFacts
+    {
+        int  prewarm   = 0;
+        int  drainTail = 0;
+        bool recurrent = false;
+        std::uint32_t signature = 0;
+    };
+
+    // FNV-1a over a JSON value in nlohmann's own (sorted-key) order, every `weights` and `metadata` left out wherever it
+    // stands — a container nests its submodels, weights and tags (loudness, names) inside its config — and the value of
+    // every non-integer number (a WaveNet's head_scale is trained, per capture). What remains is the architecture and the
+    // shape of its layers — sizes, dilations, activations,
+    // so two captures of one architecture share it and cost the same to run, and the walk never prints a weight.
+    void hashConfig (std::uint32_t& h, const nlohmann::json& v)
+    {
+        const auto mix = [&h] (const std::string& s) {
+            for (const unsigned char c : s) { h ^= c; h *= 16777619u; }
+            h ^= 0xffu; h *= 16777619u;                       // a separator: {"ab"} is not {"a","b"}
+        };
+        if (v.is_object())
+        {
+            mix ("{");
+            for (const auto& [key, value] : v.items())
+            {
+                if (key == "weights" || key == "metadata") continue;
+                mix (key);
+                hashConfig (h, value);
+            }
+            mix ("}");
+        }
+        else if (v.is_array())
+        {
+            mix ("[");
+            for (const auto& e : v) hashConfig (h, e);
+            mix ("]");
+        }
+        else if (v.is_number_float())
+            mix ("f");                                        // a trained number (head_scale, a slope): not the shape
+        else
+            mix (v.dump());
+    }
+
+    // THE ARCHITECTURE SIGNATURE (NamStage::architectureSignature): what a capture costs to run, as one number —
+    // the architecture, its config and the rate it runs at; never its weights or its metadata. 0 is kept for "none".
+    std::uint32_t signatureOf (const nlohmann::json& j)
+    {
+        std::uint32_t h = 2166136261u;
+        for (const char* key : { "architecture", "config", "sample_rate" })
+            if (const auto it = j.find (key); it != j.end()) { hashConfig (h, nlohmann::json (key)); hashConfig (h, *it); }
+        return h == 0 ? 1u : h;
+    }
+
+    ConfigFacts factsOf (const nlohmann::json& j)
+    {
+        return { detail::receptiveFieldFromConfig (j), detail::partitionedTailSamples (j), detail::isRecurrent (j),
+                 signatureOf (j) };
+    }
+
+    // How many networks a capture gets for `count` asked: a RECURRENT capture always gets two. Its state is the whole
+    // past, so a second network built later (a mono host re-preparing for two channels) would start from another
+    // history than the first — NAM's LSTM prewarm ADDS to the cell, and the two lanes would play different numbers on
+    // the same input. Built together and prepared together, they stay one state, as in v0.6.0.
+    int networksFor (int count, const ConfigFacts& f) noexcept { return f.recurrent ? 2 : count; }
+
+    // The independent networks of the capture in `data`, into out[0 .. n), n = networksFor (count, facts) — returned.
+    // A .namz whose architecture DirectBuild proves is decoded and built from its float32 segments (namz::decode →
+    // create_dsp); everything else — raw .nam JSON, an architecture not proven — takes v0.6.0's path unchanged: unpack,
+    // parse, get_dsp. The facts come from the same tree the networks did (the skeleton reads the same: a placeholder
+    // where an array of numbers was). Throws on a bad capture; the caller catches.
+    int buildNetworks (const void* data, std::size_t size, int count, std::unique_ptr<::nam::DSP> (&out)[2],
+                       ConfigFacts& facts)
+    {
+        if (namz::isNamz (data, size))
+        {
+            auto decoded = namz::decode (data, size, kMaxDecodedFloats);
+            if (! decoded)
+                throw std::runtime_error ("namz: not a capture");
+            if (detail::directBuildable (decoded->skeleton))
+            {
+                // 🔴 A WEIGHT THAT IS NOT A NUMBER IS NOT A CAPTURE. namz stores float32 as they are and decode does
+                // not judge them; v0.6.0's path refused such a file without saying so — unpack prints NaN and ±Inf as
+                // `null`, and NAM's weight reader throws converting `null` to a float. The direct build reads the
+                // floats themselves, so the refusal is spelled here, or a corrupt file loads and plays NaN.
+                for (const auto& segment : decoded->segments)
+                    for (const float w : segment)
+                        if (! std::isfinite (w))
+                            throw std::runtime_error ("namz: a weight that is not finite");
+                facts = factsOf (decoded->skeleton);
+                const int n = networksFor (count, facts);
+                for (int i = 0; i < n; ++i)
+                    out[i] = detail::buildDirect (*decoded);
+                return n;
+            }
+        }
+        std::vector<std::uint8_t> unpacked;            // owns reconstructed JSON iff input was packed
+        const char* begin = static_cast<const char*> (data);
+        const char* end   = begin + size;
+        if (namz::isNamz (data, size))
+        {
+            unpacked = namz::unpack (data, size, kMaxUnpackedNamBytes);
+            if (unpacked.empty())
+                throw std::runtime_error ("namz: not a capture");
+            begin = reinterpret_cast<const char*> (unpacked.data());
+            end   = begin + unpacked.size();
+        }
+        const auto j = nlohmann::json::parse (begin, end);
+        facts = factsOf (j);
+        const int n = networksFor (count, facts);
+        for (int i = 0; i < n; ++i)
+            out[i] = ::nam::get_dsp (j);                // independent instances of the same capture
+        return n;
+    }
+
+    // Bytes a mono model keeps for its second network: shared with whoever owns them (RigPlayer's file) or a copy.
+    struct KeptBytes
+    {
+        std::shared_ptr<const void> owner;
+        const void*  data = nullptr;
+        std::size_t  size = 0;
+    };
+
 //==============================================================================
 // NamBackend — the NAM half of the split. The generic model-swap machinery (atomic live pointer,
 // block-counter retire, message-thread GC) lives in felitronics::neural::NeuralStage; what stays
@@ -57,17 +190,22 @@ namespace
 class NamBackend
 {
 public:
-    // Both instances always exist (built by the loader) and prepare() configures both per-channel
-    // resamplers, so a host switching the layout mono<->stereo (a re-prepare) is safe.
+    // Both instances exist once a host prepared for two channels (a load for a mono host builds one, and prepare()
+    // builds the second when the host goes stereo); prepare() configures both per-channel resamplers either way, so a
+    // host switching the layout mono<->stereo (a re-prepare) is safe.
     // The normalize flag is owned by NamStage::Impl: the audio thread stores the per-call `normalize`
     // argument there right before NeuralStage::process() reaches this backend (same thread →
     // sequenced), keeping NamStage's per-block flag without widening the shared Inference seam. It is
     // BOUND when the backend meets its stage (bindNormalize, before it goes live) — a backend can be
     // built and prepared with no stage in sight; unbound, it plays raw.
+    // m1 may be null — a model built for a mono host, never a recurrent one (networksFor) — and then `source` is the
+    // bytes it was built from, kept so that a re-prepare for two channels can build the second network (prepare()).
+    // A two-network build keeps no bytes.
     NamBackend (std::unique_ptr<::nam::DSP> m0, std::unique_ptr<::nam::DSP> m1,
                 float trimDb, int prewarmFromConfig = 0, int drainTailFromConfig = 0,
-                bool recurrentFromConfig = false)
+                bool recurrentFromConfig = false, KeptBytes source = {})
     {
+        if (m1 == nullptr) source_ = std::move (source);
         prewarm    = prewarmFromConfig;       // …raised below by NAM's own answer, where it has one
         drainTail_ = drainTailFromConfig;     // the partitioned-FFT ring, which is not the field
         recurrent_ = recurrentFromConfig;
@@ -107,12 +245,20 @@ public:
     void bindClearCounter (std::atomic<long long>& counter) noexcept { cleared_ = &counter; }
     double preparedSampleRate() const noexcept { return hostSR; }
     int    preparedMaxBlock()   const noexcept { return maxBlock; }
+    int    networks()           const noexcept { return (inst[0] != nullptr ? 1 : 0) + (inst[1] != nullptr ? 1 : 0); }
+    // NAM's zero prewarm on the next Reset, on or off for every network (prepareModel's Warm::Caller, around the
+    // load's own prepare only). Message thread, on a backend that is not live.
+    void setPrewarmOnReset (bool on)
+    {
+        for (auto& m : inst)
+            if (m != nullptr) m->SetPrewarmOnReset (on);
+    }
     ~NamBackend() noexcept { if (retireLedger != nullptr) --(*retireLedger); }
 
     //--- felitronics::neural::Inference seam --------------------------------------
     // Message thread, with audio stopped (live instance, via NeuralStage::prepare) or on a
     // not-yet-live instance (the loader). Decide the run rate, (re)configure the per-channel
-    // resamplers/scratch, and Reset both instances to it (alloc + prewarm — fine off the audio
+    // resamplers/scratch, and Reset every instance it has to it (alloc + prewarm — fine off the audio
     // thread). Both lanes are always configured — see the ctor note on mono<->stereo re-prepare.
     //
     // The Inference concept REQUIRES prepare() to be noexcept, yet the body genuinely allocates
@@ -128,11 +274,24 @@ public:
     // law 11's answer for a call that cannot be honoured, and a composite that ANDs its stages'
     // verdicts (rigplayer does) therefore reports the refused block outward. The buffer is untouched
     // either way; what the verdict adds is that the caller can tell.
-    void prepare (double sampleRate, int maxBlockIn, int /*maxChannels*/) noexcept
+    void prepare (double sampleRate, int maxBlockIn, int maxChannels) noexcept
     {
         prepared_ = false;
         try
         {
+            // A mono model asked for a second channel: its second network, built here from the bytes it kept, with
+            // NAM's default prewarm — this is a host re-preparing, not a load. A failure leaves it unprepared.
+            if (maxChannels >= 2 && inst[1] == nullptr)
+            {
+                std::unique_ptr<::nam::DSP> built[2];
+                ConfigFacts facts;
+                if (source_.data == nullptr || buildNetworks (source_.data, source_.size, 1, built, facts) != 1)
+                    return;
+                if (built[0] == nullptr || built[0]->NumInputChannels() != 1 || built[0]->NumOutputChannels() != 1)
+                    return;
+                inst[1] = std::move (built[0]);
+                source_ = {};                                 // both networks exist: nothing left to build
+            }
             hostSR   = sampleRate;
             maxBlock = std::max (1, maxBlockIn);
             // 🔴 THE RAW RATE, NOT A NORMALISED ONE. This line used to spell
@@ -154,8 +313,10 @@ public:
             // drain off, i.e. two per instance. One block of silence through each such instance grows
             // everything the audio path can ask for — it is exactly what NAM's own prewarm does for the
             // architectures that declare one, and the state it leaves is the silence state either way.
+            // The same block runs where NAM's prewarm was switched off for the load (Warm::Caller): it is what grows
+            // the buffers, and it does it in one block rather than the receptive field's worth.
             for (auto& m : inst)
-                if (m != nullptr && m->GetPrewarmSamples() <= 0)
+                if (m != nullptr && (m->GetPrewarmSamples() <= 0 || ! m->GetPrewarmOnReset()))
                 {
                     std::fill (ch[0].modelIn.begin(), ch[0].modelIn.end(), 0.0f);
                     NAM_SAMPLE* in [1] { ch[0].modelIn .data() };
@@ -242,6 +403,7 @@ public:
         if (numChannels < 0 || numSamples < 0) return false;
         if (! prepared_) return false;
         if (numChannels > 2) return false;                 // a NAM capture is mono or true-stereo; nothing else
+        if (numChannels > 1 && inst[1] == nullptr) return false;   // built for a mono host: one network, one channel
         if (numSamples == 0) return true;                  // law 11(d): no samples, no time, no edge
 
         const float g = (normalize != nullptr && normalize->load (std::memory_order_relaxed)) ? makeup : 1.0f;
@@ -396,11 +558,9 @@ public:
         for (int c = 0; c < 2; ++c)
         {
             // A lane with no instance cannot be flushed, so its ledger is left exactly as it is rather
-            // than marked clean — the same rule as the unprepared backend above. UNREACHABLE as the
-            // class stands (prepareModel refuses a model missing either instance, so a prepared backend
-            // has both), and kept honest rather than asserted, exactly like the swap refusal in
-            // tryApplyPending below. The mutation stand says so too: removing it changes nothing any
-            // test can see, which is the signature of a branch no caller can enter.
+            // than marked clean — the same rule as the unprepared backend above. REACHABLE since v0.7.0:
+            // a model loaded for a mono host has no instance 1 (prepareModel's numChannels), and its lane 1
+            // is never fed — a mono model refuses a two-channel call — so there is nothing to flush there.
             if (inst[c] == nullptr)
                 continue;
 
@@ -464,6 +624,8 @@ public:
     //--- model info (read by the loader for NamStage's UI-mirror atomics) ----------
     double reportedSampleRate()  const noexcept { return expectedSR; }
     int    reportedPrewarm()     const noexcept { return prewarm; }
+    std::uint32_t reportedSignature() const noexcept { return signature_; }
+    void   setSignature (std::uint32_t s) noexcept { signature_ = s; }
     double reportedLoudnessDb()  const noexcept { return loudnessDb; }
     bool   reportedHasLoudness() const noexcept { return hasLoudness; }
 
@@ -653,6 +815,7 @@ private:
     }
 
     std::unique_ptr<::nam::DSP> inst[2];
+    KeptBytes source_;                               // a mono build's bytes, for its second network (prepare())
     const std::atomic<bool>*  normalize = nullptr;   // NamStage::Impl's per-call flag (bindNormalize)
     std::atomic<long long>*   drained_  = nullptr;   // …and its silence odometer (bindDrainCounter)
     std::atomic<long long>*   cleared_  = nullptr;   // …and the restart's own (bindClearCounter)
@@ -674,6 +837,7 @@ private:
     int    drainSamples_  = 0;              // how long an absent lane is fed silence (configureRates)
     int    drainTail_     = 0;              // …plus what the engine holds past the field (Linear's FFT ring)
     bool   recurrent_     = false;          // …and whether the field is a bound at all (LSTM)
+    std::uint32_t signature_ = 0;           // the architecture signature (signatureOf), 0 = not known
     int    drain_[2] { 0, 0 };              // …and how much of that each lane still owes
     bool   everFed_[2] { false, false };    // …and whether it may still be holding some (see reset())
     std::vector<float> hush_;               // the silence an absent lane is fed, and where its output goes
@@ -691,6 +855,7 @@ struct NamStage::Impl
     // UI mirrors (message thread reads these) — published ONLY when a swap/clear actually lands
     // (swap first, mirrors second), so they always describe the model that is audibly live.
     std::atomic<int>    prewarmSamples { 0 };
+    std::atomic<std::uint32_t> signature { 0 };
     std::atomic<double> expectedSR  { 0.0 };
     std::atomic<double> loudnessDb  { 0.0 };
     std::atomic<bool>   hasLoudness { false };
@@ -734,16 +899,21 @@ struct NamStage::Impl
     // load / clear / prepare / the periodic collectGarbage() tick — until it lands.
     bool pendingActive = false;
     std::unique_ptr<NamBackend> pendingBackend;
+    // The live backend, observed (owned by `stage`): set where a swap lands, cleared where a clear does. Read on the
+    // message thread only (liveNetworks), where nothing else changes a backend's networks.
+    const NamBackend* liveObserved = nullptr;
 
     double hostSR   = 48000.0;
     int    maxBlock = 512;
+    int    channels = 2;     // the host's (prepare's numChannels): 1 builds one network per load, 2 two
     // There is deliberately no `modelRunSR` here any more. It existed to be the reference the
     // mid-stream rate contract compared against, and being a MUTABLE reference for a tolerance is
     // exactly what let the run rate walk: kModelSampleRate is the reference now, and it cannot move.
 
-    void publishMirrors (double sr, double ldb, bool hl, int prewarm = 0)
+    void publishMirrors (double sr, double ldb, bool hl, int prewarm = 0, std::uint32_t sig = 0)
     {
         prewarmSamples.store (prewarm, std::memory_order_relaxed);
+        signature.store (sig, std::memory_order_relaxed);
         expectedSR.store (sr, std::memory_order_relaxed);
         loudnessDb.store (ldb, std::memory_order_relaxed);
         hasLoudness.store (hl, std::memory_order_relaxed);
@@ -774,6 +944,7 @@ struct NamStage::Impl
                 ++retiredLedger;           // the cleared model just entered the retire queue
             pendingActive = false;
             publishMirrors (0.0, 0.0, false);
+            liveObserved = nullptr;
             return true;
         }
 
@@ -787,6 +958,8 @@ struct NamStage::Impl
         const double ldb = pendingBackend->reportedLoudnessDb();
         const bool   hl  = pendingBackend->reportedHasLoudness();
         const int    pw  = pendingBackend->reportedPrewarm();
+        const auto   sig = pendingBackend->reportedSignature();
+        const NamBackend* incoming = pendingBackend.get();
         pendingBackend->attachRetireLedger (&retiredLedger);
         const bool ok = stage.swapPrepared (std::move (pendingBackend));
         pendingActive = false;
@@ -794,7 +967,8 @@ struct NamStage::Impl
             return false;                  // mirrors stay untouched if it ever fired
         if (hadModel)
             ++retiredLedger;               // the replaced model just entered the retire queue
-        publishMirrors (sr, ldb, hl, pw);
+        publishMirrors (sr, ldb, hl, pw, sig);
+        liveObserved = incoming;
         return true;
     }
 };
@@ -805,16 +979,22 @@ NamStage::~NamStage() = default;   // NeuralStage frees the live + retired model
 
 void NamStage::prepare (double sampleRate, int maxBlock)
 {
+    prepare (sampleRate, maxBlock, 2);
+}
+
+void NamStage::prepare (double sampleRate, int maxBlock, int numChannels)
+{
     impl->hostSR   = sampleRate;
     impl->maxBlock = std::max (1, maxBlock);
+    impl->channels = numChannels == 1 ? 1 : 2;    // anything but a mono host is served by the stereo build
 
     // Audio is stopped here. NeuralStage re-prepares the live backend in place (it captures the live
     // pointer ONCE, so a concurrent message-thread swap can't split the rate-config from the Reset).
     // What this used to do as well was ADOPT the live model's rate as the reference for the next
     // load's rate check — which made every accepted load move the goalposts. Nothing is adopted now.
-    if (impl->pendingBackend != nullptr)                                // a parked load must follow the
-        impl->pendingBackend->prepare (sampleRate, impl->maxBlock, 2);  // new rates before it goes live
-    impl->stage.prepare ({ sampleRate, impl->maxBlock, 2 });
+    if (impl->pendingBackend != nullptr)                                             // a parked load must follow the
+        impl->pendingBackend->prepare (sampleRate, impl->maxBlock, impl->channels);  // new rates before it goes live
+    impl->stage.prepare ({ sampleRate, impl->maxBlock, impl->channels });
     impl->tryApplyPending();   // if the retire queue drained since the deferral, land the intent now
 }
 
@@ -849,54 +1029,78 @@ struct NamStage::Prepared
 
 void NamStage::PreparedDeleter::operator() (Prepared* p) const noexcept { delete p; }
 
-NamStage::PreparedModel NamStage::prepareModel (const void* data, std::size_t size,
-                                                double sampleRate, int maxBlock, float trimDb)
+namespace
 {
-    // Accept BOTH raw .nam JSON and packed .namz (weights as float32). A packed blob is unpacked
-    // to the equivalent JSON first, then the existing parse→get_dsp path runs unchanged — .namz
-    // is bit-exact to the float32 the engine computes, so the model is identical. Any thread but
-    // the audio thread: nothing here touches a stage, and the alloc/parse cost is the point.
-    constexpr std::size_t kMaxUnpackedNamBytes = 64u * 1024u * 1024u;   // zip-bomb guard on unpack
+    // prepareModel, both forms: `owner` holds `data` when the caller shares its bytes (null: a mono build copies them).
+    NamStage::PreparedModel prepareFrom (const void* data, std::size_t size, std::shared_ptr<const void> owner,
+                                         double sampleRate, int maxBlock, float trimDb, int numChannels,
+                                         NamStage::Warm warm);
+}
 
-    std::unique_ptr<::nam::DSP> m0, m1;
-    int prewarmFromConfig   = 0;
-    int drainTailFromConfig = 0;
-    bool recurrentFromConfig = false;
+NamStage::PreparedModel NamStage::prepareModel (const void* data, std::size_t size,
+                                                double sampleRate, int maxBlock, float trimDb,
+                                                int numChannels, Warm warm)
+{
+    return prepareFrom (data, size, nullptr, sampleRate, maxBlock, trimDb, numChannels, warm);
+}
+
+NamStage::PreparedModel NamStage::prepareModel (std::shared_ptr<const std::vector<std::byte>> bytes, double sampleRate,
+                                                int maxBlock, float trimDb, int numChannels, Warm warm)
+{
+    if (bytes == nullptr) return nullptr;
+    const void* data = bytes->data();
+    const std::size_t size = bytes->size();
+    return prepareFrom (data, size, std::move (bytes), sampleRate, maxBlock, trimDb, numChannels, warm);
+}
+
+namespace
+{
+NamStage::PreparedModel prepareFrom (const void* data, std::size_t size, std::shared_ptr<const void> owner,
+                                     double sampleRate, int maxBlock, float trimDb, int numChannels,
+                                     NamStage::Warm warm)
+{
+    using Prepared = NamStage::Prepared;
+    using PreparedModel = NamStage::PreparedModel;
+    // Accept BOTH raw .nam JSON and packed .namz (weights as float32). buildNetworks reads a .namz of a proven
+    // architecture straight into NAM (DirectBuild.h) and everything else down v0.6.0's unpack→parse→get_dsp path —
+    // .namz is bit-exact to the float32 the engine computes, so the model is identical either way
+    // (felitronics_nam_load_tests, NamLoadTests.cpp). Any thread but the audio thread: nothing here touches a stage,
+    // and the alloc/parse cost is the point. One network for a mono host, two for anything else (the header's
+    // Channels note) — and two for a recurrent capture whatever the host (networksFor).
+    std::unique_ptr<::nam::DSP> m[2];
+    ConfigFacts facts;
+    KeptBytes source;                                  // a mono build keeps its bytes for a later second network
+    int count = 0;
     try
     {
-        std::vector<std::uint8_t> unpacked;            // owns reconstructed JSON iff input was packed
-        const char* begin = static_cast<const char*> (data);
-        const char* end   = begin + size;
-        if (namz::isNamz (data, size))
+        count = buildNetworks (data, size, numChannels == 1 ? 1 : 2, m, facts);
+        if (count == 1)
         {
-            unpacked = namz::unpack (data, size, kMaxUnpackedNamBytes);
-            if (unpacked.empty())
-                return nullptr;
-            begin = reinterpret_cast<const char*> (unpacked.data());
-            end   = begin + unpacked.size();
+            if (owner == nullptr)                      // the caller's bytes are its own: a copy, held by the model
+            {
+                const auto* b = static_cast<const std::uint8_t*> (data);
+                auto copy = std::make_shared<const std::vector<std::uint8_t>> (b, b + size);
+                data  = copy->data();
+                owner = std::move (copy);
+            }
+            source = { std::move (owner), data, size };
         }
-        auto j = nlohmann::json::parse (begin, end);
-        m0 = ::nam::get_dsp (j);            // two independent instances of the same capture
-        m1 = ::nam::get_dsp (j);
-        prewarmFromConfig   = detail::receptiveFieldFromConfig (j);
-        drainTailFromConfig = detail::partitionedTailSamples (j);
-        recurrentFromConfig = detail::isRecurrent (j);
     }
     catch (...) { return nullptr; }
 
-    if (m0 == nullptr || m1 == nullptr)
+    if (m[0] == nullptr || (count == 2 && m[1] == nullptr))
         return nullptr;
     // prototype: mono amp captures only
-    if (m0->NumInputChannels() != 1 || m0->NumOutputChannels() != 1)
+    if (m[0]->NumInputChannels() != 1 || m[0]->NumOutputChannels() != 1)
         return nullptr;
-    const double modelSR = m0->GetExpectedSampleRate();
     // THE RATE CONTRACT, and it is settled HERE because it reads nothing but this number. It used to
     // live in install(), judged against the rate of whatever was live at the last prepare() — a
     // reference that MOVED as loads were accepted, which is the ratchet this task closed. Judging it
     // here spares a doomed model its PREWARM, which is the expensive half of everything below; it does
-    // not spare the parse or the two get_dsp() calls above, because the tag is read off the built
-    // network and there is nothing to judge until then.
-    if (! acceptsModelRate (modelSR))
+    // not spare the build above, because the tag is read off the built network and there is nothing
+    // to judge until then.
+    const double modelSR = m[0]->GetExpectedSampleRate();
+    if (! NamStage::acceptsModelRate (modelSR))
         return nullptr;
 
     // Build + prepare the new backend while it is NOT live (alloc + prewarm is fine here — and a
@@ -905,14 +1109,32 @@ NamStage::PreparedModel NamStage::prepareModel (const void* data, std::size_t si
     try
     {
         out = std::make_unique<Prepared>();
-        out->backend = std::make_unique<NamBackend> (std::move (m0), std::move (m1), trimDb, prewarmFromConfig,
-                                                     drainTailFromConfig, recurrentFromConfig);
+        out->backend = std::make_unique<NamBackend> (std::move (m[0]), std::move (m[1]), trimDb, facts.prewarm,
+                                                     facts.drainTail, facts.recurrent, std::move (source));
     }
     catch (...) { return nullptr; }
-    out->backend->prepare (sampleRate, std::max (1, maxBlock), 2);
+    out->backend->setSignature (facts.signature);
+    // Warm::Caller: NAM's zero prewarm off for THIS prepare only, and never for a recurrent capture (the header).
+    // prepare()'s grow loop still runs one block of silence through each network, so process() stays
+    // allocation-free; the flag goes back on after, so a host's later re-prepare prewarms as it always did.
+    const bool skipPrewarm = warm == NamStage::Warm::Caller && ! facts.recurrent;
+    if (skipPrewarm) out->backend->setPrewarmOnReset (false);
+    out->backend->prepare (sampleRate, std::max (1, maxBlock), count);
+    if (skipPrewarm) out->backend->setPrewarmOnReset (true);
     if (! out->backend->prepared())
         return nullptr;
     return PreparedModel (out.release());
+}
+} // namespace
+
+int NamStage::liveNetworks() const noexcept
+{
+    return impl->liveObserved != nullptr ? impl->liveObserved->networks() : 0;
+}
+
+int NamStage::networksOf (const PreparedModel& model) noexcept
+{
+    return model != nullptr && model->backend != nullptr ? model->backend->networks() : 0;
 }
 
 bool NamStage::install (PreparedModel model)
@@ -942,8 +1164,9 @@ bool NamStage::install (PreparedModel model)
     // cell. Prepared at 48000.1 and installed at 48000.2 (block 512), the decaying-cell fixture starts
     // at 0.0548291542 instead of 0.1600718498, although both configurations report zero latency.
     // A matching prepareModel+install does one prewarm; a mismatch does two. See plan 1 in the review.
-    if (backend->preparedSampleRate() != impl->hostSR || backend->preparedMaxBlock() != impl->maxBlock)
-        backend->prepare (impl->hostSR, impl->maxBlock, 2);
+    if (backend->preparedSampleRate() != impl->hostSR || backend->preparedMaxBlock() != impl->maxBlock
+            || backend->networks() < impl->channels)           // a mono build installed where two channels play
+        backend->prepare (impl->hostSR, impl->maxBlock, impl->channels);
     // 🔴 AND THE VERDICT IS CHECKED WHETHER OR NOT WE RE-PREPARED. It used to be checked only inside
     // that branch, which was safe by an invariant nobody stated: `prepareModel()` returns null for a
     // backend that failed to prepare, so an unprepared one could not reach here. `preparedSampleRate()`
@@ -967,7 +1190,8 @@ bool NamStage::install (PreparedModel model)
 bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float trimDb)
 {
     // Both halves, here, on the caller's thread — the message thread, by this class's contract.
-    return install (prepareModel (data, size, impl->hostSR, impl->maxBlock, trimDb));
+    // …for the channels this stage was prepared for (NamStage.h's Channels note), as any load is.
+    return install (prepareModel (data, size, impl->hostSR, impl->maxBlock, trimDb, impl->channels));
 }
 
 void NamStage::clearModel()
@@ -1088,6 +1312,7 @@ int NamStage::maxLatencySamples (double hostSR) noexcept
 
 int    NamStage::latencySamples()   const { return impl->stage.latencySamples(); }
 int    NamStage::prewarmSamples()   const { return impl->prewarmSamples.load (std::memory_order_relaxed); }
+std::uint32_t NamStage::architectureSignature() const { return impl->signature.load (std::memory_order_relaxed); }
 long long NamStage::drainedSamples() const { return impl->drained.load (std::memory_order_relaxed); }
 long long NamStage::clearedSamples() const { return impl->cleared.load (std::memory_order_relaxed); }
 
