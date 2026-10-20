@@ -279,10 +279,42 @@ void mono()
     ok (refused, "…and refuses a two-channel call it has no second network for");
     monoStage.prepare (kFs, kBlock, 2);                       // the host goes stereo: the second network is built here
     const auto y2 = play (monoStage, x, 2, &refused);
+    ok (! refused, "re-prepared for two channels, it plays both");
     ref.prepare (kFs, kBlock, 2);
     ok (ref.install (std::move (m2)), "a stereo build installs into a stereo stage");
     const auto r2 = play (ref, x, 2);
-    ok (! refused && sameBits (y2, r2), "re-prepared for two channels, it plays both — as a load made for two, bit for bit");
+    // WHAT "AS A LOAD MADE FOR TWO" PROMISES, LANE BY LANE — on every compiler, which one bit-for-bit check over both
+    // lanes did not (ubuntu-gcc-14, v0.7.0's CI). The RIGHT lane is the network the re-prepare built: it has played
+    // nothing, and it is the stereo load's right lane bit for bit everywhere. The LEFT lane PLAYED (y1) before the
+    // re-prepare, and that prepare restarts it as every prepare restarts a lane that carried audio: NAM's Reset, then
+    // the drain of its debt in maxBlock chunks (NamStage.cpp, reset()). That is the silence state up to the chunking's
+    // residue (the width-history note in NamStage.cpp's process()), and the residue is the matrix kernel's, not the
+    // stage's: Eigen's GEBP sums a 4-column tile in two accumulators, even taps and odd, when the rows are ONE packet,
+    // and a column outside a tile in one — so a column's last bit depends on where the chunk put it. An A2 layer is 8
+    // rows: one packet under AVX, two (one accumulator each) under SSE2 and NEON. (That this kernel path is the source
+    // is the reading of the numbers below, not a measurement isolating it.) Measured on gcc 14.2, x86-64: the left
+    // lane against the fresh load 0 at the baseline, 2.4e-07 (1990 of 24000 samples) at -march=x86-64-v3 and 1.8e-07
+    // with -mno-fma — so not FMA contraction — and the right lane 0 in all three; Apple clang, arm64: 0. So the left lane
+    // is held bit for bit to a stereo stage with its very history (played, then re-prepared), and to the fresh load
+    // within a bound four times that residue.
+    const std::size_t n = x.size();
+    const auto lane = [n] (const std::vector<float>& v, int c) {
+        return std::vector<float> (v.begin() + (std::ptrdiff_t) (c * n), v.begin() + (std::ptrdiff_t) ((c + 1) * n));
+    };
+    ok (sameBits (lane (y2, 1), lane (r2, 1)),
+        "…its second network, built by the re-prepare, plays the stereo load's right lane, bit for bit");
+    NamStage played;                                          // a stereo stage with the left lane's history
+    played.prepare (kFs, kBlock, 2);
+    ok (played.install (NamStage::prepareModel (a2.data(), a2.size(), kFs, kBlock, 0.0f, 2)), "(a second stereo load installs)");
+    (void) play (played, x, 2);
+    played.prepare (kFs, kBlock, 2);
+    ok (sameBits (lane (y2, 0), lane (play (played, x, 2), 0)),
+        "…its first, which played, restarts as a stereo stage's that played the same: bit for bit");
+    double worst = 0.0;
+    for (std::size_t i = 0; i < n; ++i) worst = std::max (worst, std::fabs ((double) y2[i] - (double) r2[i]));
+    char said[32];
+    std::snprintf (said, sizeof (said), "%.3g", worst);
+    ok (worst <= 1e-6, std::string ("…and plays the fresh load's left lane within the restart's residue (worst ") + said + ")");
     ok (sameBits ({ y1.begin(), y1.end() }, { r2.begin(), r2.begin() + (std::ptrdiff_t) x.size() }),
         "…and its mono channel played what the stereo load's left channel plays");
 
