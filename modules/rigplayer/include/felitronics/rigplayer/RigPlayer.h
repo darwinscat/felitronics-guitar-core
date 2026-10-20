@@ -326,9 +326,9 @@ public:
         channels_ = numChannels;   // validated above — law 11(b) forbids the clamp that was here
         coldAfter_.store(coldSamples(coldSeconds_), std::memory_order_release);
         dipSamples_ = std::max(1LL, (long long) std::llround(kDipSeconds * fs_));
-        for (auto& n : nam_) n.prepare(fs_, maxBlock_);
+        for (auto& n : nam_) n.prepare(fs_, maxBlock_, channels_);   // a mono host's slots run one network each
         retiredStages_.clear();                                   // never concurrent with process(): nothing runs them
-        for (auto& n : poolStages_) n->prepare(fs_, maxBlock_);   // the preload's captures, re-prepared in place
+        for (auto& n : poolStages_) n->prepare(fs_, maxBlock_, channels_);   // the preload's captures, re-prepared in place
         // Not normalised: a tone curve's broadband level is part of what the pack says, and a dry path's
         // level rides in its gain. Reference-unity RMS is for cabinets, which these are not.
         // AND THE TAPS ARE DESIGNED AT `fs_`, WHICH IS WHY THAT IS ENOUGH. The other half of an
@@ -388,7 +388,9 @@ public:
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
             dryBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
             spare_[c].assign((std::size_t) maxBlock_, 0.0f);
+            quietBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
         }
+        quietRun_ = kQuietForever;
         // The half of a restart that does not depend on the rate, spelled ONCE — see reset(), which is
         // the other caller. The two verbs used to be able to drift; a shared body is what stops them.
         clearAudioState();
@@ -475,6 +477,7 @@ public:
     // natural place is where prepareToPlay is; `prepare()` already performs this restart itself.
     void reset() noexcept {
         if (! prepared_) return;         // nothing is sized yet, so there is no state to restart
+        quietRun_ = kQuietForever;       // a restart is silence: what came before it is not heard by anything after
         // THE EXPENSIVE HALF, and the reason this verb exists. Both slots, including one the law has
         // put to SLEEP: a cold slot is handed a width-zero call rather than run, so its networks hold
         // whatever was playing when it fell asleep, and the stage's own ledger knows exactly how much
@@ -988,6 +991,7 @@ public:
         ModelSource   source;
         double        sampleRate = 48000.0;
         int           maxBlock = 512;
+        int           channels = 2;                                // the host's: 1 builds ONE network (v0.7.0)
         std::uint64_t generation = 0;                              // the load() it belongs to
         bool          preload = false;                             // a copy for the preload (setPreload), not the slot
     };
@@ -1012,13 +1016,19 @@ public:
         const auto& m = models_[(std::size_t) id - 1];
         LoadJob job;
         job.slot = (int) (ask & 1u); job.model = id; job.fileId = m.id; job.bytes = m.bytes;
-        job.source = source_; job.sampleRate = fs_; job.maxBlock = maxBlock_; job.generation = gen_;
+        job.source = source_; job.sampleRate = fs_; job.maxBlock = maxBlock_; job.channels = channels_;
+        job.generation = gen_;
         jobOut_ = true;
         return job;
     }
 
     // Any thread but the audio one. The bytes through the source when the job has none, then the heavy
     // half of a load (NamStage::prepareModel). Touches nothing of any player.
+    // Since v0.7.0 the half is lighter, on two counts. ONE network on a mono host (job.channels, the player's own
+    // channel count): a mono stream never runs a second. And NO NAM ZERO-PREWARM for a non-recurrent capture
+    // (NamStage::Warm::Caller): no slot of this player is heard before warmFor() of live input has run through it,
+    // and warmFor covers the receptive field, so the prewarm's silence was overwritten before anyone could hear it —
+    // what plays is bit-identical (tools/wasm-rig/rig-compare.mjs holds v0.6.0 and this to it, session by session).
     static Loaded run(LoadJob job) {
         Loaded out;
         out.bytes = job.bytes;
@@ -1026,9 +1036,11 @@ public:
             out.bytes = std::make_shared<const std::vector<std::byte>>(job.source(job.fileId));
             out.fetched = true;
         }
+        // The bytes go in SHARED: a mono model keeps them for a later second network as one more owner of the file
+        // this player already holds (models_[k].bytes), not as a private copy of it.
         if (out.bytes != nullptr && ! out.bytes->empty())
-            out.model = felitronics::nam::NamStage::prepareModel(out.bytes->data(), out.bytes->size(),
-                                                                 job.sampleRate, job.maxBlock);
+            out.model = felitronics::nam::NamStage::prepareModel(out.bytes, job.sampleRate, job.maxBlock, 0.0f,
+                                                                 job.channels, felitronics::nam::NamStage::Warm::Caller);
         out.job = std::move(job);
         return out;
     }
@@ -1049,6 +1061,28 @@ public:
         }
         if (job.preload) { deliverPreload(std::move(loaded)); return; }
         loadSlot(job.slot, std::move(loaded.model), job.model);
+    }
+
+    // A FILE HANDED IN UP FRONT (v0.7.0). Message thread. The pack's file `id`, kept exactly as a fetched one is
+    // (deliver): from here a job for it carries the bytes and the source is never asked for it. A host that has a
+    // pack's files in hand — a page that fetched them with the manifest — gives them here and no load waits on a
+    // fetch. True when these bytes are now the file's; false for no pack, empty bytes, an id the pack does not name,
+    // or a file already held (the first bytes stay — a file is a file). A job already out keeps what it carried.
+    // Whether putFile(id, …) would keep bytes now: a pack is loaded, it names `id`, and the file is not held yet. A host
+    // asks this BEFORE it makes room for the bytes (fc_rig_put_file), so a bogus id or size never grows its memory.
+    bool wantsFile(const std::string& id) const {
+        if (! loaded_) return false;
+        for (const auto& m : models_)
+            if (m.id == id && m.bytes == nullptr) return true;
+        return false;
+    }
+
+    bool putFile(const std::string& id, std::shared_ptr<const std::vector<std::byte>> bytes) {
+        if (! loaded_ || bytes == nullptr || bytes->empty()) return false;
+        bool kept = false;
+        for (auto& m : models_)
+            if (m.id == id && m.bytes == nullptr) { m.bytes = bytes; kept = true; }
+        return kept;
     }
 
     // service() with every job due run right here, on this thread — for a host without a worker, and
@@ -1132,6 +1166,49 @@ public:
     // holds the second at the outgoing capture's drain per change of slot. Since clearCounters().
     int   runBlocks(int slot) const { return runBlocks_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
     int   pairBlocks()        const { return pairBlocks_.load(std::memory_order_relaxed); }
+    // Whether the law let anything of the models be heard at the end of the last block run (its gain above zero):
+    // false from a load until the first capture is fed its field, true once it may be heard. Stand-by does not move it.
+    bool  audible()           const { return audible_.load(std::memory_order_relaxed); }
+    // The architecture signature (NamStage::architectureSignature) of the capture slot `slot` holds; 0 when it holds
+    // none. Message thread.
+    std::uint32_t heldSignature(int slot) const {
+        const auto i = (std::size_t) (slot & 1);
+        return held_[i].load(std::memory_order_relaxed) != 0 ? slotStage_[i].load(std::memory_order_seq_cst)->architectureSignature() : 0u;
+    }
+
+    // THE QUIET WARM (v0.7.0). A capture with a receptive field is not heard before warmFor() samples of input have
+    // run through it (THE WARM-UP LEDGER). When the models' input has been EXACTLY ZERO for at least that long — at a
+    // start, after reset(), after a stand-by (park() stops everything else to silence too), in a pause once the tone
+    // stack's tail has decayed to an exact 0 (hundreds of ms after the last note: no flush-to-zero in wasm) — that input is
+    // known in advance: silence. So the warm-up need not wait for it in real time: this feeds a warming slot's stage up
+    // to `maxBlocks` more blocks of silence (maxBlock samples each) and counts them as fed, and the slot may be heard
+    // as soon as the ledger is paid — a few calls instead of the field's length in real time. What it is then heard
+    // with is BIT-IDENTICAL to what the live warm-up would have given it: the same blocks of silence through the same
+    // stage, only sooner, and silence was what the input held over the whole stretch they stand for (quietRun_ covers
+    // the slot's whole need, so nothing it was really fed since its landing was anything but zero). Mid-riff the run
+    // is short and nothing happens: the live warm-up stays. Returns the blocks it ran (0: no slot warming, the input
+    // not quiet long enough, stood by, or maxBlocks <= 0). AUDIO THREAD, between two process() calls (it touches the
+    // law's ledger and runs the stages) — the worklet calls it after each render. A host that never calls it plays as
+    // before. No allocation. Each block costs one network render.
+    int warmQuiet(int maxBlocks) noexcept {
+        if (! prepared_ || parkedRt_ || maxBlocks <= 0 || ranNch_ <= 0) return 0;
+        const bool norm = normalize_.load(std::memory_order_acquire);
+        int ran = 0;
+        for (int i = 0; i < 2; ++i) {
+            while (ran < maxBlocks && blend_.held[i] != 0 && ! blend_.inFlight[i] && ! blend_.cold[i]
+                   && blend_.fed[i] < blend_.need[i] && quietRun_ >= blend_.need[i]) {
+                float* z[kMaxChannels];
+                for (int c = 0; c < ranNch_; ++c) {
+                    std::fill(quietBuf_[c].begin(), quietBuf_[c].end(), 0.0f);
+                    z[c] = quietBuf_[c].data();
+                }
+                if (! slotStage_[i].load(std::memory_order_seq_cst)->process(z, ranNch_, maxBlock_, norm)) return ran;
+                blend_.fed[i] += maxBlock_;
+                ++ran;
+            }
+        }
+        return ran;
+    }
     void  clearCounters() {
         warmBlocks_.store(0, std::memory_order_relaxed);
         mixJumps_.store(0, std::memory_order_relaxed);
@@ -1424,6 +1501,14 @@ public:
             // The chain's trim: past the top capture it rises with the angle, and a fast hand moves
             // tens of degrees between two events — so it is smoothed like every other gain here.
             rampInto(a, nch, count, chainGain_.load(std::memory_order_acquire), curChain_);
+            // THE QUIET RUN (warmQuiet): how long the models' input has been exactly zero, this block included.
+            {
+                bool quiet = true;
+                for (int c = 0; c < nch && quiet; ++c)
+                    for (int k = 0; k < count; ++k)
+                        if (a[c][k] != 0.0f) { quiet = false; break; }
+                quietRun_ = quiet ? std::min(kQuietForever, quietRun_ + count) : 0;
+            }
 
             // THE LAW, once per block, and the only writer of the weight. Everything it needs arrives
             // through atomics; everything it asks for leaves the same way.
@@ -1452,6 +1537,7 @@ public:
                 policy.dipDownSamples = policy.dipUpSamples = dipSamples_;
             }
             const auto law = felitronics::nam::blendStep(blend_, req, count, policy);
+            audible_.store(law.endGain > 0.0, std::memory_order_relaxed);
             // The law's ask is PUBLISHED only after both stages have run this block (below): the two-slot law asks
             // when a slot's weight ARRIVES at zero, at the block's end, and the block can begin with it audible.
             // Published here, a job thread that pre-empts this one could prepare and deliver the model before the
@@ -1744,6 +1830,7 @@ private:
     // in keeps fading), the dry ring and the per-slot delay lines. Ramps, targets, the law: untouched.
     void park() noexcept {
         parkedRt_ = true;
+        quietRun_ = kQuietForever;       // the device resumes from silence, as everything it stops here does
         for (auto& f : fir_) f.clearAudioState();
         dry_.clearAudioState();
         dryLatency_.reset();
@@ -2052,7 +2139,7 @@ private:
     // A fresh stage for every copy (retireStage says why none is reused), at the player's numbers.
     std::unique_ptr<felitronics::nam::NamStage> freshStage() const {
         auto st = std::make_unique<felitronics::nam::NamStage>();
-        if (prepared_) st->prepare(fs_, maxBlock_);
+        if (prepared_) st->prepare(fs_, maxBlock_, channels_);
         return st;
     }
 
@@ -2189,12 +2276,12 @@ private:
         dropUnwanted();                       // the copy the slot ran before, if the set has moved on without it
     }
 
-    // A JOB FOR THE SET: the law's ask first; then — only while a job costs the sound nothing — the next copy the set
-    // lacks. That is so until the set is first ready after a load (the host is silent then: the worklet is, and a host
-    // that plays through its first build opted into it), and while the host says so (setPreloadIdle). After that a copy
-    // the set lacks — a panel past the cap, a file to fetch again — waits for the law to ask for it, as it would without
-    // the preload: a switch while playing never runs more jobs than the player without it. Never before prepare():
-    // there are no numbers to prepare a copy at.
+    // A JOB FOR THE SET: the law's ask first; then the next copy the set lacks — until the set is first ready after a
+    // load, and while the host says its jobs cost nothing (setPreloadIdle). The host sets the pace: it asks for a job
+    // when it can run one (the worklet: one a render quantum, while it plays — since v0.7.0; in silence before). After
+    // that a copy the set lacks — a panel past the cap, a file to fetch again — waits for the law to ask for it, as it
+    // would without the preload: a switch while playing never runs more jobs than the player without it. Never before
+    // prepare(): there are no numbers to prepare a copy at.
     std::optional<LoadJob> takePreloadJob() {
         servePreloadAsk();
         if (! prepared_) return std::nullopt;
@@ -2226,7 +2313,8 @@ private:
         const auto& m = models_[(std::size_t) e.model - 1];
         LoadJob job;
         job.slot = e.slot; job.model = e.model; job.fileId = m.id; job.bytes = m.bytes;
-        job.source = source_; job.sampleRate = fs_; job.maxBlock = maxBlock_; job.generation = gen_;
+        job.source = source_; job.sampleRate = fs_; job.maxBlock = maxBlock_; job.channels = channels_;
+        job.generation = gen_;
         job.preload = true;
         jobOut_ = true;
         return job;
@@ -2640,6 +2728,9 @@ private:
     std::atomic<float>         liveMix_ { 0.0f };
     std::atomic<float>         liveDry_ { 0.0f }, liveWet_ { 1.0f };
     std::atomic<int>           warmBlocks_ { 0 }, mixJumps_ { 0 };
+    std::atomic<bool>          audible_ { false };          // the law's gain above zero at the last block's end
+    static constexpr long long kQuietForever = std::numeric_limits<long long>::max() / 4;
+    long long                  quietRun_ = kQuietForever;   // audio thread: samples the models' input has been exactly 0
     std::atomic<float>         biggestJump_ { 0.0f };
     std::atomic<long long>     coldAfter_ { 0 };          // coldSeconds_ at fs_, for the law; 0 = never
     std::atomic<bool>          slotCold_[2] { false, false };
@@ -2686,7 +2777,7 @@ private:
     felitronics::convolution::CabConvolver fir_[2], dry_;
     felitronics::core::DryAligner dryLatency_;   // holds the dry path back by the models' rate-match
     felitronics::core::DryAligner wire_;         // the stand-by wire: the raw input at latencySamples()
-    std::vector<float> slotB_[kMaxChannels], dryBuf_[kMaxChannels], spare_[kMaxChannels];
+    std::vector<float> slotB_[kMaxChannels], dryBuf_[kMaxChannels], spare_[kMaxChannels], quietBuf_[kMaxChannels];
 
     // stand-by: the request (message → audio) and what the audio thread made of it
     std::atomic<bool> standby_ { false }, standingBy_ { false };

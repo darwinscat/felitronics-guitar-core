@@ -25,4 +25,8 @@ if(FELITRONICS_BUILD_TESTS)
         target_compile_features(felitronics_rigplayer_${tl}_tests PRIVATE cxx_std_20)
         add_test(NAME felitronics_rigplayer_${tl}_tests COMMAND felitronics_rigplayer_${tl}_tests)
     endforeach()
+    # The allocation gate plays NAM's A2 packed as a .namz — the shape of every real pack (modules/nam sets the path).
+    get_property(_nam_examples GLOBAL PROPERTY FELITRONICS_NAM_EXAMPLE_MODELS_DIR)
+    target_compile_definitions(felitronics_rigplayer_rigplayerrtalloc_tests PRIVATE
+        FELITRONICS_NAM_EXAMPLE_MODELS="${_nam_examples}")
 endif()
