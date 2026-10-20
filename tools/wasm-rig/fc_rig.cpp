@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <new>
 #include <optional>
 #include <string>
@@ -257,6 +258,15 @@ FC_EXPORT int fc_rig_run_blocks (fc_rig* rig, int slot)
 }
 FC_EXPORT int fc_rig_pair_blocks (fc_rig* rig) { return rig != nullptr ? rig->player.pairBlocks() : 0; }
 FC_EXPORT int fc_rig_warm_blocks (fc_rig* rig) { return rig != nullptr ? rig->player.warmBlocks() : 0; }
+FC_EXPORT int fc_rig_audible (fc_rig* rig) { return rig != nullptr && rig->player.audible() ? 1 : 0; }
+FC_EXPORT uint32_t fc_rig_signature (fc_rig* rig, int slot)
+{
+    return rig != nullptr && (slot == 0 || slot == 1) ? rig->player.heldSignature (slot) : 0u;
+}
+FC_EXPORT int fc_rig_warm_quiet (fc_rig* rig, int max_blocks)
+{
+    return rig != nullptr ? rig->player.warmQuiet (max_blocks) : 0;
+}
 FC_EXPORT void fc_rig_clear_counters (fc_rig* rig)
 {
     if (rig != nullptr) rig->player.clearCounters();
@@ -298,4 +308,21 @@ FC_EXPORT int fc_rig_preload_failed (fc_rig* rig) { return rig != nullptr ? rig-
 FC_EXPORT int fc_rig_is_gain_dial (fc_rig* rig, const char* name)
 {
     return rig != nullptr && name != nullptr && ! rig->player.dialName().empty() && rig->player.dialName() == name ? 1 : 0;
+}
+
+FC_EXPORT uint8_t* fc_rig_put_file (fc_rig* rig, const char* id, int size)
+{
+    if (rig == nullptr || id == nullptr || size < 1 || size > kMaxFileBytes) return nullptr;
+    const std::string name (id);
+    if (! rig->player.wantsFile (name)) return nullptr;   // asked BEFORE the allocation: a refused file costs no memory
+    // Kept by the player before the caller writes into it: the caller writes before its next fc_rig call, and nothing
+    // reads a file's bytes outside one (the player runs jobs only inside fc_rig_job_run).
+    auto bytes = std::make_shared<std::vector<std::byte>> ((std::size_t) size);
+    if (! rig->player.putFile (name, bytes)) return nullptr;
+    if (rig->job && rig->job->bytes == nullptr && rig->job->fileId == name)
+    {
+        rig->job->bytes = bytes;   // the job out was waiting for this very file: it carries it now
+        rig->handed = {};
+    }
+    return reinterpret_cast<uint8_t*> (bytes->data());
 }

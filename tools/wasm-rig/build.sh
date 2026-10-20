@@ -26,7 +26,7 @@
 #
 # CORE IS PINNED: the tag the top-level CMakeLists names (v0.61.1 — the first whose FlushToZero.h compiles for wasm
 # under -msse4.1), fetched, unless FELITRONICS_CORE_DIR names a checkout to build against instead. NAM and namz are
-# the pins modules/nam names (NeuralAmpModelerCore v0.5.4, namz v4.1.0), fetched — or FELITRONICS_NAM_CORE_SRC /
+# the pins modules/nam names (NeuralAmpModelerCore v0.5.4, namz v4.4.0), fetched — or FELITRONICS_NAM_CORE_SRC /
 # FELITRONICS_NAMZ_SRC, checkouts of those same tags, for a build without the network. BUILD-INFO says which.
 set -euo pipefail
 
@@ -44,7 +44,11 @@ fi
 EMVER="$(emcc --version | head -1)"
 echo "emcc: $EMVER"
 
-# Stated on every run, so a build directory configured once with another source cannot keep it from its cache.
+# Stated on every run, so a build directory configured once with another source cannot keep it from its cache; and
+# the pins' own cache entries (PINS_ARG) are dropped, so one configured once with another tag gets the tags the
+# CMakeLists name again — a cached value would win over a new pin in the file.
+PINS_ARG=(-UFELITRONICS_GUITAR_FCORE_TAG -UFELITRONICS_NAM_CORE_TAG -UFELITRONICS_EIGEN_TAG -UFELITRONICS_EIGEN_COMMIT
+          -UFELITRONICS_NAMZ_TAG -UFELITRONICS_NAMZ_COMMIT)
 CORE_ARG=(-DFELITRONICS_GUITAR_FCORE_DIR=)          # empty: the pinned tag
 if [ -n "${FELITRONICS_CORE_DIR:-}" ]; then
     [ -f "$FELITRONICS_CORE_DIR/cmake/FelitronicsPolicy.cmake" ] || { echo "no felitronics-core at $FELITRONICS_CORE_DIR"; exit 1; }
@@ -65,7 +69,7 @@ emcmake cmake -S "$ROOT" -B "$BUILD" "${GEN[@]}" \
     -DFELITRONICS_GUITAR_BUILD_TESTS=OFF \
     -DFELITRONICS_WASM_ASSERTIONS=0 \
     "-DCMAKE_CXX_FLAGS=$FLAGS" \
-    "${CORE_ARG[@]}" "${DEPS_ARG[@]}" > "$OUT/configure.log" || { cat "$OUT/configure.log"; exit 1; }
+    "${PINS_ARG[@]}" "${CORE_ARG[@]}" "${DEPS_ARG[@]}" > "$OUT/configure.log" || { cat "$OUT/configure.log"; exit 1; }
 grep -E "felitronics-core:|NeuralAmpModelerCore:|Eigen:|namz:" "$OUT/configure.log" || true
 cmake --build "$BUILD" --target fcrig
 

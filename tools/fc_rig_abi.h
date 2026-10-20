@@ -28,8 +28,10 @@
 //                            at least — a worklet calls it after every render quantum)
 //   fc_rig_job_file()        which `files[].id` it wants (UTF-8, NUL-terminated, fc_rig_job_file_length() bytes)
 //   fc_rig_job_needs_bytes() 1 = the player has never had this file: the host fetches it and copies it into
-//                            fc_rig_job_bytes(size); 0 = the player kept the bytes from an earlier visit
-//   fc_rig_job_run()         the heavy half (NamStage::prepareModel — parsing, two instances, the prewarm):
+//                            fc_rig_job_bytes(size); 0 = the player kept the bytes from an earlier visit, or the host
+//                            handed the file in up front (fc_rig_put_file, ABI 5)
+//   fc_rig_job_run()         the heavy half (NamStage::prepareModel — reading the capture, one network per prepared
+//                            channel, the rate-match; since ABI 5 no NAM zero prewarm — see ABI 5):
 //                            1 = a model, 0 = not one (the bytes were not a capture, or none were handed in)
 //   fc_rig_job_deliver()     the light half, installs it: 1 = a model landed, 2 = a failure was reported to the law
 //
@@ -75,6 +77,9 @@
 //   2         + fc_rig_scope_read, fc_rig_scope_frames, fc_rig_set_standby, fc_rig_set_feed_db
 //   3         no entry point added: fc_rig_scope_read draws OrbitAmp's two points around the whole player (v0.5.1)
 //   4         + fc_rig_set_preload, fc_rig_preload_pending, fc_rig_preload_total, fc_rig_preload_failed (v0.6.0)
+//   5         + fc_rig_put_file; and fc_rig_job_run builds ONE network on a mono prepare and skips NAM's zero prewarm
+//             (ABI 5 below) — the same audio, bit for bit, at a fraction of the cost and half the memory (v0.7.0);
+//             + fc_rig_warm_quiet, fc_rig_audible, fc_rig_signature (the start without a burst: ABI 5 below)
 //
 // ====================================================================================
 // ABI 2 — THE SCOPE, PARK AND THE FEED (OrbitAmp's ScopeTap, its PARK, its block IN)
@@ -136,10 +141,44 @@
 //   fc_rig_preload_failed()   of the settled, the failed and the unfetched.
 //   fc_rig_is_gain_dial(name) 1 = `name` is the loaded pack's gain dial (the one fc_rig_set_gain_dial turns), 0 otherwise
 //                     — so a host that queues the gain dial apart from the other knobs knows it by any name.
+//
+// ====================================================================================
+// ABI 5 — A LOAD AT A FRACTION OF ITS COST, AND THE FILES UP FRONT (v0.7.0)
+// ====================================================================================
+// WHAT fc_rig_job_run DOES CHANGED, so the number moved (THE COMPATIBILITY RULE): on an instance prepared for ONE
+// channel it builds ONE network per capture (a mono stream never runs a second; ~1.2 MiB a copy instead of ~2.35 MiB for
+// the site's A2 captures; a recurrent capture still gets two), and it no longer runs NAM's zero prewarm for a non-recurrent capture — the player never
+// lets a capture be heard before it has run live input through its receptive field, so that silence was overwritten
+// unheard. A .namz of a proven architecture is also read without printing its weights to JSON (NamStage::prepareModel).
+// What plays is bit-identical to ABI 4 (tools/wasm-rig/rig-compare.mjs, at 48 and 44.1 kHz); one job costs ~0.35–0.46 ms
+// in node where it cost ~24–28 ms, so the whole-pack preload of IR-X Ch1 PowerAmp (66 copies) computes in ~24 ms, not
+// ~1.6–1.8 s (measured on this machine, node, the real ABI; the 2.7 / 16.5 ms of the profile's prototype were not
+// reproduced). A capture with a weight that is not finite is not a model (0), as it was not in ABI 4.
+//   fc_rig_put_file(id, size)  module memory for `size` bytes (1 … 256 MiB) of the loaded pack's file `id` (its
+//                     `files[].id`, NUL-terminated UTF-8). Write the file's bytes there BEFORE the next fc_rig call: the
+//                     player keeps them as it keeps a file it fetched — a job for that file carries them and never needs
+//                     bytes (fc_rig_job_needs_bytes 0), and a job already out waiting for it (needs_bytes 1) takes them
+//                     too. Hand a pack's files in right after fc_rig_load and no load ever waits on a fetch; a file not
+//                     handed in is still a job that needs bytes, as before. NULL — and nothing to write — for no
+//                     instance, no pack loaded, a NULL id, a size out of range, an id the pack does not name, or a file
+//                     the player already holds (the first bytes stay). The bytes go with the pack (fc_rig_load,
+//                     fc_rig_unload).
+//   fc_rig_warm_quiet(max_blocks)  THE QUIET WARM (RigPlayer::warmQuiet): when the models' input has been exactly zero
+//                     for a warming capture's whole warm-up (a start, a reset, a return from PARK, a pause), feeds it up
+//                     to `max_blocks` more blocks of silence now and counts them as fed — so it may be heard after a few
+//                     quanta, not after its receptive field in real time, and is then bit-identical to the live warm-up
+//                     on silence. Returns the blocks run (each costs one network render; 0 = nothing to warm). Call it
+//                     between two fc_rig_process calls, on the thread that calls fc_rig_process. Never called, nothing
+//                     changes.
+//   fc_rig_audible()  1 = the player lets a capture be heard (its law's gain above zero at the end of the last
+//                     fc_rig_process): after a load, the first quantum it is 1 is the one the sound opens in.
+//   fc_rig_signature(slot) the architecture signature of the capture the slot holds (NamStage::architectureSignature:
+//                     its architecture, layer config and rate, never its weights); 0 = none held. Two
+//                     captures with one signature cost the same to run, so a host that timed one may keep the answer.
 
 #include <stdint.h>
 
-#define FC_RIG_ABI_VERSION 4u
+#define FC_RIG_ABI_VERSION 5u
 
 #ifdef __cplusplus
 extern "C" {
@@ -207,6 +246,11 @@ int      fc_rig_preload_pending (fc_rig* rig);                 // copies not set
 int      fc_rig_preload_total (fc_rig* rig);                   // copies in the set; 0 = not preloading
 int      fc_rig_preload_failed (fc_rig* rig);                  // settled copies that failed or were not fetched
 int      fc_rig_is_gain_dial (fc_rig* rig, const char* name);  // 1 = `name` is the pack's gain dial (the crossfade one)
+// ---- ABI 5: the files up front (see ABI 5 above) -------------------------------------------------------------------
+uint8_t* fc_rig_put_file (fc_rig* rig, const char* id, int size);   // write `size` bytes of file `id` there; NULL = not taken
+int      fc_rig_warm_quiet (fc_rig* rig, int max_blocks);      // blocks of silence fed to a warming capture now
+int      fc_rig_audible (fc_rig* rig);                         // 1 = a capture may be heard (the law's gain > 0)
+uint32_t fc_rig_signature (fc_rig* rig, int slot);             // the slot's capture's architecture signature; 0 = none
 
 #ifdef __cplusplus
 }
