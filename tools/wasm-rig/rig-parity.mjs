@@ -3,8 +3,11 @@
 
 // rig-parity — the built fcrig module, run the way a page runs it, against the native render of the same ABI.
 //
-//   node --experimental-vm-modules --expose-gc tools/wasm-rig/rig-parity.mjs [--namz=<namz CLI>] <build-dir>
-//        <fc_rig_render> <abi-header> [<packs-dir>]
+//   node --experimental-vm-modules --expose-gc tools/wasm-rig/rig-parity.mjs [--namz=<namz CLI>] [--stand-in=<A2.nam>]
+//        <build-dir> <fc_rig_render> <abi-header> [<packs-dir>]
+//
+// --stand-in names NAM's example A2 (the architecture of every site pack): without a real pack, THE START and the
+// session's decisions are timed on it, packed by the namz CLI under the fixture's manifest (see `timedPack`).
 //
 // <build-dir> holds what build.sh ships (fcrig.mjs, fcrig.wasm, fcrig-worklet.js). The fixture pack (written by
 // fc_rig_render --fixture) is always played; <packs-dir>, when given, adds real packs: every one of PACKS found there
@@ -35,9 +38,13 @@ import { performance, PerformanceObserver } from 'node:perf_hooks';
 
 const NAMZ_ARG = '--namz=';
 const namzCli = (process.argv.find((a) => a.startsWith(NAMZ_ARG)) || '').slice(NAMZ_ARG.length);
-const [dir, renderBin, header, packsDir] = process.argv.slice(2).filter((a) => !a.startsWith(NAMZ_ARG));
+const STAND_IN_ARG = '--stand-in=';
+const standIn = (process.argv.find((a) => a.startsWith(STAND_IN_ARG)) || '').slice(STAND_IN_ARG.length);
+const [dir, renderBin, header, packsDir] = process.argv.slice(2)
+    .filter((a) => !a.startsWith(NAMZ_ARG) && !a.startsWith(STAND_IN_ARG));
 if (!dir || !renderBin || !header) {
-    console.error('usage: rig-parity.mjs [--namz=<namz CLI>] <build-dir> <fc_rig_render> <fc_rig_abi.h> [<packs-dir>]');
+    console.error('usage: rig-parity.mjs [--namz=<namz CLI>] [--stand-in=<A2.nam>] <build-dir> <fc_rig_render> <fc_rig_abi.h> '
+                  + '[<packs-dir>]');
     process.exit(2);
 }
 if (typeof vm.SourceTextModule !== 'function') {
@@ -302,6 +309,29 @@ if (packsDir)
         else console.log(`  (no ${p} under ${packsDir})`);
     }
 const realPack = packs.find((p) => p.name !== 'fixture') || packs[0];
+// THE PACK THE START IS TIMED ON: one whose capture warms for many quanta before it is heard, every capture one
+// architecture — what THE START's and the session's decisions are about. A real pack is one. The fixture is not, and on
+// it those decisions are not the machine's but the pack's: its captures (a receptive field of a few samples) open the
+// sound two quanta into a start, and CAL_GRACE quanta later fewer than CAL_RENDERS renders were timed — 'short', one
+// model, by design, on every machine ('nothing timable' below asserts exactly that). Where the real packs are absent
+// (CI: they are not public), NAM's example A2 — the architecture of every site pack — stands in: packed by the namz CLI
+// and put under every file name of the fixture's manifest, so the pack's controls are the fixture's and its captures
+// one architecture. Without --stand-in and --namz it is null and those groups say they were skipped.
+const timedPack = realPack !== packs[0] ? realPack : (() => {
+    if (!standIn || !namzCli) return null;
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-rig-a2-'));
+    const z = path.join(d, 'a2.namz');
+    const r = spawnSync(namzCli, ['encode', standIn, z]);
+    if (r.status !== 0) throw new Error(`namz encode ${standIn} exited ${r.status}: ${r.stderr}`);
+    const rig = JSON.parse(fs.readFileSync(path.join(fixtureDir, 'rig.json'), 'utf8'));
+    const st = rig.chain.find((s) => s.kind === 'nam');
+    for (const f of (st.device || st).files) {
+        f.file = f.file.replace(/\.nam$/, '.namz');   // the fixture's one plain .nam: the stand-in is packed
+        fs.copyFileSync(z, path.join(d, f.file));
+    }
+    fs.writeFileSync(path.join(d, 'rig.json'), JSON.stringify(rig));
+    return { name: 'A2 (NAM\'s example, standing in for a real pack)', dir: d };
+})();
 
 const w0 = await loadWorklet(48000);
 
@@ -501,49 +531,77 @@ group('exceptions where they are allowed: garbage for a capture is a failed load
 
 group('the start: the DRIVE\'s own capture timed on its live renders — the blend on when one render fits a quarter of the '
       + 'quantum, { calibrated } in the quantum the sound opens, no stall');
-async function calibrated(pack, slowMs) {
-    const calls = { max: [], gain: [] };
+/** A CLOCK THE TEST OWNS, on the next module the worklet makes: the scope's Date.now reads floor(now); `c.quantum()`
+    moves now by a quantum's length and every render by `c.cost` ms. The start's DECISION is then what the test says a
+    render costs, on any machine. The paced clock (loadWorklet) reads the host's own time, so on it a decision is the
+    machine's speed: a slow runner timing a capture fast enough elsewhere says one model, and a test asserting either
+    outcome on it fails somewhere. `spy(m)` hooks the module too; `c.renders` counts fc_rig_process calls. */
+const QUANTUM_MS = 1000 * Q / 48000;
+function ownedClock(spy) {
+    const c = { now: 1.7e12, cost: 0, renders: 0, restore: () => {} };
+    c.quantum = () => { c.now += QUANTUM_MS; };
     w0.ctx.__onRigModule = (m) => {
-        const max = m._fc_rig_set_max_models, gain = m._fc_rig_set_gain_dial, process = m._fc_rig_process;
+        w0.ctx.__onRigModule = undefined;
+        const D = vm.runInContext('Date', w0.ctx), real = D.now, process = m._fc_rig_process;
+        D.now = () => Math.floor(c.now);
+        m._fc_rig_process = (...a) => { const r = process(...a); ++c.renders; c.now += c.cost; return r; };
+        c.restore = () => { D.now = real; };
+        if (spy) spy(m);
+    };
+    return c;
+}
+async function calibrated(pack, costMs) {
+    const calls = { max: [], gain: [] };
+    const c = ownedClock((m) => {
+        const max = m._fc_rig_set_max_models, gain = m._fc_rig_set_gain_dial;
         m._fc_rig_set_max_models = (r, n) => { calls.max.push(n); return max(r, n); };
         m._fc_rig_set_gain_dial = (r, d) => { calls.gain.push(d); return gain(r, d); };
-        if (slowMs > 0)
-            m._fc_rig_process = (...a) => { const t = Date.now(); while (Date.now() - t < slowMs) { /* a slow machine */ } return process(...a); };
-    };
+    });
+    c.cost = costMs;
     const proc = await newProcessor(w0, pack.dir, { knobs: { gain: 200 } });
-    w0.ctx.__onRigModule = undefined;
     proc.port.onmessage({ data: { set: { gain: 210 } } });   // sent while it decides: lands at once, in order
     const ins = makeInput(Q * 3000, 48000, 0), oL = new Float32Array(Q), oR = new Float32Array(Q);
-    let loudBefore = 0, loudAt = 0, q = 0, cal, longest = 0;
+    let loudBefore = 0, loudAt = 0, q = 0, cal, longest = 0, most = 0;
     for (; q < 3000 && !(cal = proc.port.posted.find((m) => m.calibrated)); ++q) {
-        const t = performance.now();
+        const t = performance.now(), r0 = c.renders;
+        c.quantum();
         proc.process([[ins.subarray(q * Q, (q + 1) * Q)]], [[oL, oR]], {});
         longest = Math.max(longest, performance.now() - t);
+        most = Math.max(most, c.renders - r0);
         let peak = 0;
         for (let i = 0; i < Q; ++i) peak = Math.max(peak, Math.abs(oL[i]), Math.abs(oR[i]));
         if (proc.port.posted.find((m) => m.calibrated)) loudAt = peak; else loudBefore = Math.max(loudBefore, peak);
         answer(proc, w0, pack.dir);
     }
-    return { cal: cal && cal.calibrated, calls, loudBefore, loudAt, quanta: q, proc, longest };
+    c.restore();
+    return { cal: cal && cal.calibrated, calls, loudBefore, loudAt, quanta: q, proc, longest, most };
 }
-{
-    const fast = await calibrated(realPack, 0);
+if (!timedPack) {
+    console.log('  - skipped: no real pack, and no --stand-in with --namz to make one');
+} else {
+    // A fast render: 0.2 ms of the 2.667 ms quantum, 7.5 % (a site pack's A2 capture measured 94.5 us a quantum in
+    // node on arm64 macOS — the cost group below).
+    const fast = await calibrated(timedPack, 0.2);
     const c = fast.cal;
-    console.log(`      ${realPack.name}: one render ${c ? c.renderUs.toFixed(1) : '?'} us = ${c ? (100 * c.share).toFixed(2) : '?'} % `
+    console.log(`      ${timedPack.name}: one render ${c ? c.renderUs.toFixed(1) : '?'} us = ${c ? (100 * c.share).toFixed(2) : '?'} % `
                 + `of the ${c ? c.quantumUs.toFixed(0) : '?'} us quantum (${c ? c.renders : '?'} renders in ${c ? c.elapsedMs : '?'} ms, `
-                + `${c ? c.warm : '?'} of them warming; decided after ${fast.quanta} quanta; the longest quantum ${fast.longest.toFixed(2)} ms)`);
+                + `${c ? c.warm : '?'} of them warming; decided after ${fast.quanta} quanta; the longest quantum ${fast.longest.toFixed(2)} ms `
+                + `of this machine's time)`);
     ok(c && c.valid && c.runs === c.renders && c.pairs === 0 && c.renders >= 8, 'timed on its own renders, each one network alone');
     ok(c && c.maxModels === 2 && c.share <= 0.25, 'a fast render: the blend is turned on (maxModels 2)');
     ok(JSON.stringify(fast.calls.max) === '[1,2]', `the module was told 1 at the start and 2 after (${fast.calls.max})`);
     ok(JSON.stringify(fast.calls.gain) === '[200,210]', `the knobs land at once, in order — no 12 o'clock (${fast.calls.gain})`);
     ok(fast.loudBefore === 0 && fast.loudAt > 0, `{ calibrated } in the first quantum that sounds (peak ${fast.loudAt.toFixed(3)} in it)`);
-    ok(fast.longest < 10, `no stall: the longest quantum of the start took ${fast.longest.toFixed(2)} ms (the burst took ~30)`);
+    // NO STALL, counted rather than clocked: v0.6.0's burst ran renders back to back until Date.now moved 30 ms, i.e. as
+    // many renders in one quantum as fit there. One render a quantum is that claim on any machine; the wall time above
+    // is this machine's and is reported, not gated.
+    ok(fast.most === 1, `no stall: one render a quantum through the start, none timed back to back (at most ${fast.most})`);
     fast.proc.port.onmessage({ data: { dispose: true } });
 
-    const slow = await calibrated(packs[0], 2.0);   // every render made ~1.5 ms longer by the paced clock: over half the quantum
+    const slow = await calibrated(timedPack, 2.0);   // a slow render: 2 ms of the 2.667 ms quantum (75 %)
     const s = slow.cal;
     console.log(`      injected slow render: ${s ? s.renderUs.toFixed(0) : '?'} us = ${s ? (100 * s.share).toFixed(1) : '?'} %`);
-    ok(s && s.maxModels === 1 && s.share > 0.25, 'a slow render: it stays at one model');
+    ok(s && s.valid && s.maxModels === 1 && s.share > 0.25, 'a slow render: it stays at one model');
     ok(!slow.calls.max.includes(2), `the module was never told 2 (${slow.calls.max})`);
     slow.proc.port.onmessage({ data: { dispose: true } });
 }
@@ -670,33 +728,35 @@ group('the load protocol across the port: late, stale, unanswered and failed ans
 }
 
 group('one decision a session per architecture: the same architecture is not timed again, another is; { calibrate: \'again\' }');
-{
-    let slowMs = 0;
-    hooked((m) => {
-        const process = m._fc_rig_process;
-        m._fc_rig_process = (...a) => { if (slowMs > 0) { const t = Date.now(); while (Date.now() - t < slowMs) { /* slow */ } } return process(...a); };
-    });
-    // A real pack: every capture one architecture (the fixture mixes a WaveNet with gains, and a blend of two
+if (!timedPack) {
+    console.log('  - skipped: no real pack, and no --stand-in with --namz to make one');
+} else {
+    // The clock is the test's (ownedClock): a render costs 0.2 ms while "fast" and 2 ms while "slow", on any machine.
+    const c = ownedClock();
+    c.cost = 0.2;
+    // A pack whose captures are one architecture (the fixture mixes a WaveNet with gains, and a blend of two
     // architectures is timed as what it is). The fixture's gain capture is the other architecture.
     const rig = (dir) => w0.buffer(fs.readFileSync(path.join(dir, 'rig.json')));
-    let dir = realPack.dir;
+    let dir = timedPack.dir;
     const proc = await newProcessor(w0, dir, { knobs: { gain: 150 } });
-    play(proc, 400, () => answer(proc, w0, dir));
+    const step = () => { c.quantum(); play(proc, 1, () => answer(proc, w0, dir)); };
+    for (let q = 0; q < 400; ++q) step();
     const first = proc.port.posted.filter((m) => m.calibrated).map((m) => m.calibrated);
     const next = (data) => {
         const mark = proc.port.posted.length;
         proc.port.onmessage({ data });
-        for (let q = 0; q < 400 && after(proc, mark, (m) => m.calibrated).length === 0; ++q) play(proc, 1, () => answer(proc, w0, dir));
+        for (let q = 0; q < 400 && after(proc, mark, (m) => m.calibrated).length === 0; ++q) step();
         return after(proc, mark, (m) => m.calibrated).map((m) => m.calibrated);
     };
-    slowMs = 2.0;                                                         // slow now: a new timing would say so
+    c.cost = 2.0;                                                         // slow now: a new timing would say so
     const same = next({ load: rig(dir), set: { gain: 200 } });
     dir = fixtureDir;
     const other = next({ load: rig(dir), set: { gain: 60 } });             // a gain capture: another architecture
-    dir = realPack.dir;
+    dir = timedPack.dir;
     const forced = next({ load: rig(dir), set: { gain: 150 }, calibrate: 'again' });
-    slowMs = 0;
+    c.cost = 0.2;
     const sounding = next({ calibrate: 'again' });                         // while it plays, fast again
+    c.restore();
     ok(first.length === 1 && first[0].valid && first[0].maxModels === 2, `the first pack: timed, fast, the blend on (${JSON.stringify(first.map((c) => c.maxModels))})`);
     ok(same.length === 1 && same[0] === first[0], 'the same architecture again: not timed, its decision said as it stands');
     ok(other.length === 1 && other[0] !== first[0] && other[0].maxModels === 1 && other[0].share > 0.25,
@@ -1244,12 +1304,19 @@ group('THE START WITHOUT A BURST (v0.7.0): PLAY opens after the dip and a few qu
     const rigOf = (pack) => w0.buffer(fs.readFileSync(path.join(pack.dir, 'rig.json')));
     for (const pack of packs.filter((p) => p.name !== 'fixture')) {
         // PLAY on silence: the quanta to the first one the player lets a capture be heard, and to { calibrated }; then
-        // the riff, started on { calibrated } as the site's engine starts it.
+        // the riff, started on { calibrated } as the site's engine starts it. ON A CLOCK THE TEST OWNS (ownedClock, a
+        // render 0.1 ms — what a site pack's capture costs in node on arm64): the quiet warm's budget is a bound on what a
+        // render costs, so on the paced clock the quanta to the open were this machine's load — 19 to 26 quanta here,
+        // alone and under a parallel ctest, against the gate's 24.
         const start = async (opts) => {
+            const c = ownedClock();
+            c.cost = 0.1;
             const proc = await newProcessor(w0, pack.dir, opts);
+            const tick = (n) => { for (let k = 0; k < n; ++k) { c.quantum(); play(proc, 1, () => answer(proc, w0, pack.dir)); } };
             let q = 0, open = -1, cal = -1, longest = 0;
             for (; q < 400 && cal < 0; ++q) {
                 const t = performance.now();
+                c.quantum();
                 proc.process([[zero]], [[oL, oR]], {});
                 longest = Math.max(longest, performance.now() - t);
                 if (open < 0 && proc.m._fc_rig_audible(proc.rig) === 1) open = q;
@@ -1257,11 +1324,15 @@ group('THE START WITHOUT A BURST (v0.7.0): PLAY opens after the dip and a few qu
                 answer(proc, w0, pack.dir);
             }
             riffAt = 0;
-            const peak = play(proc, 2, () => answer(proc, w0, pack.dir));
-            return { proc, open, cal, longest, peak };
+            c.quantum();
+            let peak = play(proc, 1, () => answer(proc, w0, pack.dir));
+            c.quantum();
+            peak = Math.max(peak, play(proc, 1, () => answer(proc, w0, pack.dir)));
+            return { proc, open, cal, longest, peak, c, tick };
         };
         const quiet = await start({}), live = await start({ quietWarm: false });
         live.proc.port.onmessage({ data: { dispose: true } });
+        live.c.restore();                                    // the clock is quiet's again, until quiet.c.restore()
         console.log(`      ${pack.name}: PLAY opens at quantum ${quiet.open} (${ms(quiet.open + 1)}), { calibrated } at ${quiet.cal}; `
                     + `without the quiet warm at ${live.open} (${ms(live.open + 1)}); the longest quantum ${quiet.longest.toFixed(2)} ms`);
         ok(quiet.open >= 0 && quiet.open <= 24 && quiet.cal === quiet.open && live.open > 2 * quiet.open,
@@ -1272,7 +1343,7 @@ group('THE START WITHOUT A BURST (v0.7.0): PLAY opens after the dip and a few qu
         // A channel change mid-riff, the DRIVE far from 12 o'clock: the first capture loaded is the DRIVE's own (the one a
         // player without a start loads first), and the sound is back after the dip and the live warm-up, said in that quantum.
         const proc = quiet.proc;
-        play(proc, 200, () => answer(proc, w0, pack.dir));
+        quiet.tick(200);
         const gain = 0.9 * proc.m._fc_rig_gain_dial_sweep(proc.rig);
         const ref = await newProcessor(w0, pack.dir, { calibrate: false, maxModels: proc.maxModels, knobs: { gain } });
         play(ref, 4, () => answer(ref, w0, pack.dir));
@@ -1282,7 +1353,7 @@ group('THE START WITHOUT A BURST (v0.7.0): PLAY opens after the dip and a few qu
         proc.port.onmessage({ data: { load: rigOf(pack), set: { gain } } });
         let q = 0, open = -1, cal = -1;
         for (; q < 400 && cal < 0; ++q) {
-            play(proc, 1, () => answer(proc, w0, pack.dir));
+            quiet.tick(1);
             if (open < 0 && proc.m._fc_rig_audible(proc.rig) === 1) open = q;
             if (cal < 0 && after(proc, mark, (m) => m.calibrated).length > 0) cal = q;
         }
@@ -1294,17 +1365,19 @@ group('THE START WITHOUT A BURST (v0.7.0): PLAY opens after the dip and a few qu
 
         // PARK: a { load } while parked (the riff on), back on silence: open after a few quanta — PARK starts from silence.
         proc.port.onmessage({ data: { standby: true } });
-        play(proc, 60, () => answer(proc, w0, pack.dir));
+        quiet.tick(60);
         proc.port.onmessage({ data: { load: rigOf(pack) } });
-        play(proc, 60, () => answer(proc, w0, pack.dir));
+        quiet.tick(60);
         proc.port.onmessage({ data: { standby: false } });
         let back = 0;
         for (; back < 400 && proc.m._fc_rig_audible(proc.rig) !== 1; ++back) {
+            quiet.c.quantum();
             proc.process([[zero]], [[oL, oR]], {});
             answer(proc, w0, pack.dir);
         }
         ok(back <= 24, `${pack.name}: a { load } under PARK, back on silence: sounding after ${back} quanta (${ms(back)})`);
         proc.port.onmessage({ data: { dispose: true } });
+        quiet.c.restore();
 
         // THE QUIET WARM AGAINST THE LIVE WARM-UP, the real ABI through the worklet: 400 quanta of silence, then the riff.
         // From the riff on, every sample the same, bit for bit; the control (one input sample 1e-5 off) must differ.

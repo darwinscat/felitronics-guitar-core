@@ -377,15 +377,17 @@ the incoming capture's warm-up beside the outgoing capture's drain — on an eng
   frees the set, a load makes it again; ABI 4 through the C surface, bit for bit with RigPlayer.
 - `felitronics_rig_wasm_parity` (ctest when `FELITRONICS_GUITAR_RIG_WASM_DIR` names `build.sh`'s output; real packs
   too with `FELITRONICS_GUITAR_RIG_PACKS`; `node --experimental-vm-modules --expose-gc rig-parity.mjs [--namz=<namz
-  CLI>] <dir> <fc_rig_render> <abi header> [<packs dir>]`; ctest passes `fc_rig_namz`, namz's own CLI built from the
-  pin): the processor and the glue as ES modules in a context shaped like an
+  CLI>] [--stand-in=<A2.nam>] <dir> <fc_rig_render> <abi header> [<packs dir>]`; ctest passes `fc_rig_namz`, namz's own
+  CLI built from the pin, and NAM's example `A2.nam`, which the start is timed on where no real pack is given — the
+  fixture's captures open the sound before a start has timed enough renders to decide): the processor and the glue as
+  ES modules in a context shaped like an
   AudioWorkletGlobalScope (no fetch, URL, TextDecoder, TextEncoder, atob, setTimeout, performance; no
   toResizableBuffer), the page simulated; exports == the header; every pack rendered through the processor's own
   `process()` against `fc_rig_render` on the same schedule, within **2e-5** (law 10's contraction is stated alike, but
   Eigen spells its own multiply-add: fused on native arm64's NEON, not on SIMD128 — measured 1.2e-7 on the fixture,
   1.7e-6 … 5.5e-6 on X88-IR Crunch, IR-X Ch1 PowerAmp, V4 Sheriff Ch1, two models and one); garbage for a capture is a
-  failed load, not a trap, and growing the memory mid-stream; the start's decision with a real pack (blend on) and an
-  injected slow render (one model), the silent start, the queued knobs in order; ABI 2 — PARK never queued (a
+  failed load, not a trap, and growing the memory mid-stream; the start's decision on a real pack or the A2 stand-in, on a clock the test owns
+  (a 0.2 ms render: blend on; 2 ms: one model — the same on any machine), the silent start, the queued knobs in order; ABI 2 — PARK never queued (a
   `{ load }` while parked plays the wire bit for bit, the start resumes on the return and decides again, the knobs sent
   during it land after it in order); the `{ scope }` round trip as a page's port carries it (the reply in the
   transfer list, detached on the processor's side, the frame whole on the page's; `n` 0 before anything rendered) and every frame of a render through PARK and back against
