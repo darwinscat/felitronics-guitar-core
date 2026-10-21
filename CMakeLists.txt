@@ -5,7 +5,7 @@
 # architectures through static initialisers, and plain static linking silently drops them), so poweramp
 # alone (FELITRONICS_GUITAR_WITH_NAM=OFF) still configures on 3.22.
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_guitar_core VERSION 0.7.0 LANGUAGES CXX)
+project(felitronics_guitar_core VERSION 0.7.1 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -52,7 +52,7 @@ if(PROJECT_IS_TOP_LEVEL)
     include(FetchContent)
     set(FELITRONICS_GUITAR_FCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../felitronics-core" CACHE PATH
         "Local felitronics-core checkout (used if present); else the pinned release is fetched")
-    set(FELITRONICS_GUITAR_FCORE_TAG "v0.61.1" CACHE STRING
+    set(FELITRONICS_GUITAR_FCORE_TAG "v0.61.2" CACHE STRING
         "felitronics-core git tag to fetch when no local checkout is present")
     if(FELITRONICS_GUITAR_FCORE_DIR AND EXISTS "${FELITRONICS_GUITAR_FCORE_DIR}/CMakeLists.txt")
         message(STATUS "felitronics-core: local checkout — ${FELITRONICS_GUITAR_FCORE_DIR}")

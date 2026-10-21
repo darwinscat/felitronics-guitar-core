@@ -2,6 +2,17 @@
 
 # Changelog
 
+## v0.7.1 — 2026-10-21
+
+The echo and the room no longer click when they stand by — felitronics-core pinned to v0.61.2.
+
+### Fixed
+- **fcguitarfx: a stand-by flip no longer ticks in the repeats or clicks into the room.** The delay's and the
+  reverb's `feed` (an amp's PARK, DELAY or REVERB off) switched what enters the line at the call boundary; core
+  v0.61.2 fades it over 5 ms. Delay: the largest step where the repeats replay the flip falls from 13-16x the steady
+  echo's own to about 1x; Plate: the click above 4 kHz from about -24 dB to -64…-70 dB. With `feed` held the render
+  is bit-identical to v0.7.0's.
+
 ## v0.7.0 — 2026-10-20
 
 A load at a fraction of its cost — what plays is bit-identical to v0.6.0.
