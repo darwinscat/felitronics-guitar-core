@@ -398,7 +398,8 @@ the incoming capture's warm-up beside the outgoing capture's drain — on an eng
   polluted counters are not valid evidence (one model); a render that grows the memory copies out bit for bit; a
   BigInt knob is ignored; no module, a refused prepare, a
   foreign quantum and a trap — one error, dry, alive, only dispose ends; no allocation per quantum (under 4 bytes of
-  JS heap per quantum over 15 000, no garbage collection — a boxed number per quantum reads 16.5 … 17.1); the cost of
+  JS heap per quantum over 15 000 with no garbage collection, in two trials of up to three — a boxed number per
+  quantum reads 13.7 … 18.0); the cost of
   one quantum with one capture and with two, reported; ABI 4 — with the preload (filled in the background, v0.7.0), every pack, its `{ need }`s answered after 16 quanta, decides its start with copies still to fill, sounds while they fill, runs at most one job between two renders, and once filled a turn 0 → sweep → 0 a degree a quantum posts no `{ need }` and runs no job; PARK mid-fill runs no job and posts no `{ need }`, keeps the answer that arrives and runs its job at the first quantum back; a `{ load }` mid-fill says one `{ preloaded }`, for the new pack; with `calibrate: false` a knob lands at once while the set fills; the start's capture failing ends the start at once, a fill copy failing does not; the preloaded processor bit for bit with a plain one on the same input and dial path; FLOAT16 (namz 4.4.0, with
   `--namz`) — every pack's captures made `.nam16z` by `namz encode --f16` and float32 `.namz` again from those halves
   widened: the `.nam16z` pack plays bit for bit what the widened pack plays, in the module and natively, every `.nam16z`
