@@ -940,15 +940,25 @@ group('an error is not an end: dry, alive, one { error }; only dispose ends it')
     w0.ctx.__onRigModule = undefined;
 }
 
-// NO ALLOCATION, AS A BOUND PER QUANTUM. heapUsed moves by itself in every window, whatever its length — 12 … 37 KB
-// in node 26 on arm64 macOS, V8's own (feedback, tiering, the observer) — so the difference between a 5 000-quantum
-// and a 20 000-quantum window read −8 … +16 KB over a dozen runs: at most ~1.1 byte per quantum, and no garbage
-// collection. The smallest object JavaScript can put on V8's heap is a 16-byte HeapNumber (12 with pointer
-// compression, as in Chrome); one per quantum is 180 … 240 KB over the 15 000. The bound, 4 bytes per quantum (60 KB):
-// 3.7 times the most the noise read, a third of that object. Its control, injected into process() in a scratch copy
-// of the build and not kept: one boxed number per quantum reads 16.5 … 17.1 bytes per quantum and fails, an empty
-// object 57.1; the processor as shipped reads 0.07 … 1.04.
-const ALLOC_BYTES_PER_QUANTUM = 4;
+// NO ALLOCATION, AS A BOUND PER QUANTUM. heapUsed moves by itself in every window, whatever its length, and it is V8's:
+// read space by space around each window (200 runs), new space — where a fresh object lands — moved 7.4 … 11.8 KB in
+// every one, code and trusted space 6.5 … 31 KB (the JIT). So the gate is the difference between a 5 000-quantum and a
+// 20 000-quantum window, per quantum of the 15 000 more: as shipped a first trial reads 0.6 … 1.8 bytes in node 26 on
+// arm64 macOS (25 runs) and −0.5 … 2.3 in node 24.19.0 on Linux x64, CI's (60 runs), a second, warmer, −1.6 … 0.6, with
+// no garbage collection. The smallest object JavaScript can put on V8's heap is a 16-byte HeapNumber (12 with pointer
+// compression, as in Chrome); the bound, 4 bytes per quantum (60 KB over the 15 000), is a quarter of it. Its controls,
+// injected into process() in a scratch copy of the worklet and not kept: one boxed number a quantum reads 13.7 … 18.0
+// bytes per quantum and fails every trial, an empty object stored on the scope's global 110 … 114.
+// TWO CLEAN TRIALS OF THREE (27.10.2026). Once in a while a window's heap shrinks by up to ~110 KB with no collection
+// seen. That nightly failed so at 7.40 bytes per quantum, its 5 000 quanta reading −49.8 KB and its 20 000 +61.2 (a run
+// of 20.10: +45.0 and +60.6); on Linux x64, eight runs at a time, the 5 000 quanta did so 3 times in 600 runs, and a
+// 20 000 read −75.7 KB where +34.7 is usual. The one read space by space had heapUsed ~97 KB above its usual between
+// the gc() and the window and old space falling 87.8 KB inside it, new space as in every window: the cause is not
+// established, but a heap that shrinks with no collection is not the processor's objects. A trial is the pair of
+// windows, clean with no collection in either and under the bound; the gate holds on two clean of up to three. In the
+// 5 000 quanta an excursion fails its trial; in the 20 000 it flatters it — letting one boxed number a quantum through
+// takes ≥ 145 KB there, in two trials of three, and the one seen was 110.
+const ALLOC_BYTES_PER_QUANTUM = 4, ALLOC_TRIALS = 3, ALLOC_CLEAN = 2;
 group(`no allocation per render quantum: under ${ALLOC_BYTES_PER_QUANTUM} bytes of JS heap per quantum, no GC`);
 for (const opts of [{ calibrate: false, maxModels: 2, knobs: { gain: 165 } }, { knobs: { gain: 165 } }]) {
     // the second: the start, its timing and the quiet warm on (the site's options), measured once the start is over
@@ -969,17 +979,23 @@ for (const opts of [{ calibrate: false, maxModels: 2, knobs: { gain: 165 } }, { 
         run(n);
         return { grew: process.memoryUsage().heapUsed - before, t0, t1: performance.now() };
     };
-    const short = await windowed(5000), long = await windowed(20000);
-    await new Promise((r) => setTimeout(r, 50));
+    const trials = [];
+    const clean = () => trials.filter((r) => r.clean).length;
+    while (clean() < ALLOC_CLEAN && trials.length - clean() <= ALLOC_TRIALS - ALLOC_CLEAN) {
+        const short = await windowed(5000), long = await windowed(20000);
+        await new Promise((r) => setTimeout(r, 50));
+        const inWindows = gcs.filter((t) => (t >= short.t0 && t <= short.t1) || (t >= long.t0 && t <= long.t1)).length;
+        const extra = long.grew - short.grew, perQuantum = extra / 15000;
+        console.log(`      trial ${trials.length + 1}: the JS heap moved ${short.grew} bytes over 5 000 quanta and ${long.grew} over `
+                    + `20 000 (${extra} for the 15 000 more: ${perQuantum.toFixed(2)} bytes per quantum), ${inWindows} garbage `
+                    + `collections in either window`);
+        trials.push({ extra, perQuantum, inWindows, clean: inWindows === 0 && perQuantum < ALLOC_BYTES_PER_QUANTUM });
+    }
     obs.disconnect();
-    const inWindows = gcs.filter((t) => (t >= short.t0 && t <= short.t1) || (t >= long.t0 && t <= long.t1)).length;
-    const extra = long.grew - short.grew, perQuantum = extra / 15000;
-    console.log(`      the JS heap moved ${short.grew} bytes over 5 000 quanta and ${long.grew} over 20 000 (${extra} for `
-                + `the 15 000 more: ${perQuantum.toFixed(2)} bytes per quantum), ${inWindows} garbage collections in `
-                + `either window`);
-    ok(inWindows === 0 && perQuantum < ALLOC_BYTES_PER_QUANTUM,
-       `${JSON.stringify(opts)}: process() allocates: ${perQuantum.toFixed(2)} bytes per quantum (${extra} for 15 000 more quanta; the bound `
-       + `${ALLOC_BYTES_PER_QUANTUM}), ${inWindows} GCs`);
+    ok(clean() >= ALLOC_CLEAN,
+       `${JSON.stringify(opts)}: process() allocates: ${clean()} clean of ${trials.length} trials — `
+       + trials.map((r) => `${r.perQuantum.toFixed(2)} bytes per quantum (${r.extra} for 15 000 more quanta), ${r.inWindows} GCs`).join('; ')
+       + `; the bound ${ALLOC_BYTES_PER_QUANTUM}`);
     proc.port.onmessage({ data: { dispose: true } });
 }
 
