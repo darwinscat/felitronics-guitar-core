@@ -15,8 +15,8 @@
 //      before prepare, knobs moved mid-stream by port messages), every 128-frame quantum through the processor's own
 //      process(), against fc_guitar_fx_render driven with the same knobs at the same frames.
 //   4. NO ALLOCATION PER QUANTUM: sixty thousand quanta through process() more than a shorter window start no
-//      garbage collection and move the JS heap by less than 16 KB more, where one 16-byte object per quantum would
-//      be 960 KB.
+//      garbage collection and move the JS heap by less than 16 KB more, in two trials of up to three, where one
+//      16-byte object per quantum would be 960 KB.
 //   5. THE COST of one 128-frame stereo quantum at 48 kHz under the heaviest settings — reported, not gated.
 //   And around those: the glue may not name toResizableBuffer, and every processor runs with it deleted (the browser
 //   floor); a non-finite sample fails a comparison for good; the integer knobs' NaN and out-of-range values; the
@@ -415,15 +415,30 @@ group('no allocation per render quantum');
             const t1 = performance.now();
             return { grew: process.memoryUsage().heapUsed - before, t0, t1 };
         };
-        const short = await windowed(20000);
-        const long = await windowed(80000);
-        await new Promise((r) => setTimeout(r, 50));
+        // TWO CLEAN TRIALS OF THREE (27.10.2026), as rig-parity.mjs's gate, which measured why: once in a while a
+        // window's heap shrinks by up to ~110 KB with no collection seen, V8's and not the processor's (new space moves
+        // as in every window) — in the short window that fails a trial, in the long one it flatters it. Not seen in
+        // this gate yet: 800 runs on Linux x64 in node 24.19.0, eight and twelve at a time, read −13.9 … −5.3 KB for
+        // the 60 000 more, 21 KB under the bound, where rig-parity's excursions were 50 … 110. A trial is the pair of
+        // windows, clean with no collection in either and under 16 KB; the gate holds on two clean of up to three. Its
+        // controls, injected into process() in a scratch copy of the worklet and not kept: one boxed number a quantum
+        // reads 952 … 960 KB for the 60 000 more, an empty object starts collections; both fail every trial.
+        const ALLOC_BYTES = 16384, ALLOC_TRIALS = 3, ALLOC_CLEAN = 2;
+        const trials = [];
+        const clean = () => trials.filter((r) => r.clean).length;
+        while (clean() < ALLOC_CLEAN && trials.length - clean() <= ALLOC_TRIALS - ALLOC_CLEAN) {
+            const short = await windowed(20000);
+            const long = await windowed(80000);
+            await new Promise((r) => setTimeout(r, 50));
+            const inWindows = gcs.filter((t) => (t >= short.t0 && t <= short.t1) || (t >= long.t0 && t <= long.t1)).length;
+            const extra = long.grew - short.grew;
+            console.log(`      trial ${trials.length + 1}: the JS heap moved ${short.grew} bytes over 20 000 quanta and ${long.grew} `
+                        + `over 80 000 (${extra} for the 60 000 more), ${inWindows} garbage collections in either window`);
+            trials.push({ extra, inWindows, clean: inWindows === 0 && extra < ALLOC_BYTES });
+        }
         obs.disconnect();
-        const inWindows = gcs.filter((t) => (t >= short.t0 && t <= short.t1) || (t >= long.t0 && t <= long.t1)).length;
-        const extra = long.grew - short.grew;
-        console.log(`      the JS heap moved ${short.grew} bytes over 20 000 quanta and ${long.grew} over 80 000 `
-                    + `(${extra} for the 60 000 more), ${inWindows} garbage collections in either window`);
-        ok(inWindows === 0 && extra < 16384, `process() allocates: ${extra} bytes for 60 000 more quanta, ${inWindows} GCs`);
+        ok(clean() >= ALLOC_CLEAN, `process() allocates: ${clean()} clean of ${trials.length} trials — `
+           + trials.map((r) => `${r.extra} bytes for 60 000 more quanta, ${r.inWindows} GCs`).join('; '));
     }
 }
 
