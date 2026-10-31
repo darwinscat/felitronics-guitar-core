@@ -109,16 +109,17 @@ struct AlignmentTable {
         return std::clamp((int) std::lround((double) delayOf(fileId) * scale), 0, felitronics::nam::kBlendMaxDelay);
     }
 
-    // How LATE this file's output arrives against its DI, in HOST samples (converted as delayOf converts), plus `offset`
-    // — the host's trim, in the table's samples. A file with its own absolute reading takes it; otherwise its relative
-    // reading against `reference`, and the trim then says how late the reference trails its DI. An unknown file is the
-    // trim alone. Its lag plus its delayOf is how late a slot playing it trails the DI: what RigPlayer's crossover holds
-    // its clean leg back by.
-    int lagOf(const std::string& fileId, double hostRate, double modelRate, int offset = 0) const {
+    // How LATE this file's output arrives against its DI, in HOST samples (converted as delayOf converts). A file with
+    // its own absolute reading takes it, plus `trim`; otherwise its relative reading against `reference`, plus
+    // `referenceOffset` (how late the reference trails its DI), plus `trim` — the offset never reaches an absolute
+    // reading. Both in the table's samples; an unknown file is offset and trim alone. Its lag plus its delayOf is how
+    // late a slot playing it trails the DI: what RigPlayer's crossover holds its clean leg back by.
+    int lagOf(const std::string& fileId, double hostRate, double modelRate, int referenceOffset = 0, int trim = 0) const {
         const auto ab = absoluteLagByFile.find(fileId);
         const auto me = lagByFile.find(fileId);
-        const int own = ab != absoluteLagByFile.end() ? ab->second : me == lagByFile.end() ? 0 : me->second;
-        const double lag = (double) own + (double) offset;
+        const int own = ab != absoluteLagByFile.end() ? ab->second
+                      : (me == lagByFile.end() ? 0 : me->second) + referenceOffset;
+        const double lag = (double) own + (double) trim;
         const double at = sampleRate > 0.0 ? sampleRate : modelRate;
         const double scale = (at > 0.0 && hostRate > 0.0) ? hostRate / at : 1.0;
         return (int) std::lround(lag * scale);
@@ -135,8 +136,9 @@ struct AlignmentTable {
             if (! f.lagSamples) return AlignmentTable {};
             if (out.reference.empty()) out.reference = f.id;
             out.lagByFile[f.id] = *f.lagSamples;
-            // ← a pack field for a capture's absolute lag and polarity plugs in here:
-            //   out.absoluteLagByFile[f.id] = *f.<absolute lag>;  out.invertedByFile[f.id] = f.<inverted>;
+            // ← namz 5.0.0's per-file readings plug in here, in the file's own rate as `lag_samples` is:
+            //   if (f.inputLagSamples) out.absoluteLagByFile[f.id] = *f.inputLagSamples;   // `input_lag_samples`
+            //   if (f.polarity == -1)  out.invertedByFile[f.id] = true;                       // `polarity`
         }
         return out;
     }

@@ -610,7 +610,10 @@ public:
         // A pack without them leaves the table empty; the host may measure and setAlignment().
         align_ = AlignmentTable::fromDevice(d);
         modelRate_.assign(models_.size(), std::numeric_limits<double>::quiet_NaN());   // learned when it lands
-        rebaseCrossoverLag(align_);                      // a trim set with no pack is this pack's; another pack's is dropped
+        // THE PACK'S IDENTITY for the reference offset: its stamped rigId, else this very load (an unstamped pack cannot be
+        // told from another with the same file names and lags — a fingerprint of the table would call them one).
+        xoPack_ = ! d.rigId.empty() ? "rig:" + d.rigId : "load:" + std::to_string(gen_);
+        bindReferenceLag(align_, true);
         publishCrossoverLags();
         loaded_ = true;
         preloadCap_ = preloadNext_;                      // the set is made by the apply() below
@@ -970,7 +973,7 @@ public:
     // which lands it on every slot at once because a prepare leaves nothing to splice (see
     // restateInHostSamples). A host that has the bytes in hand should measure before it plays.
     void setAlignment(AlignmentTable table) {
-        rebaseCrossoverLag(table);
+        bindReferenceLag(table, false);
         align_ = std::move(table);
         if (loaded_) stageDelays();
         publishCrossoverLags();
@@ -1323,21 +1326,35 @@ public:
     // inverts every slot's on top of that — the host's word, for captures nothing has read. The pack's own dry part
     // (blend knob) is never inverted. Glides.
     void setCrossoverInvert(bool on) { xoInvertSet_ = on; xoInvert_.store(on, std::memory_order_release); }
-    // A HOST TRIM ON EVERY CAPTURE'S LAG, in the samples of the alignment table, 0 by default. Where a capture has an
-    // absolute reading (AlignmentTable::absoluteLagByFile) it is a trim on that; where it has only a relative one — every
-    // pack today: `lag_samples` counts from `crossoverLagReference()` (the stage's first file) — it says how late that
-    // reference trails its DI. It is the trim OF that reference: a table counted from another file rebases it when it
-    // still holds the old reference in the same samples, and drops it to 0 otherwise; a trim set with no pack loaded is
-    // the next pack's. REFUSED (false, nothing changes) past ±kMaxCrossoverLag, or once prepared if it would put a
-    // capture before its DI or past the clean leg's reach (CrossoverBlend::kMaxLagSeconds at the host rate) — and when a
-    // later table or rate does that, crossoverLagFits() says so. A slot that is heard crossfades to it.
+    // TWO NUMBERS, KEPT APART. Every capture's lag is its absolute reading (AlignmentTable::absoluteLagByFile — how late
+    // against its own DI) when it has one; otherwise its relative reading (`lag_samples`, counted from the table's
+    // reference, crossoverLagReference()) plus the REFERENCE OFFSET — how late that reference trails its DI. The HOST
+    // TRIM is then added to every capture, absolute or relative. An absolute reading never takes the offset, so a
+    // calibration of the relative table cannot be counted twice once the pack carries its own readings.
+    //
+    // setCrossoverLag(trim): the bench's, kept across load(); 0 by default.
+    // setCrossoverReferenceLag(offset): the PACK's — bound to the pack it was set on (its stamped rigId, else that very
+    // load), the reference and the table's samples; a table counted from another file rebases it when it still reads the
+    // old reference in the same samples, else drops it to 0; another pack drops it to 0. Set while nothing is loaded, it
+    // is the next pack's.
+    // Both in the table's samples. REFUSED (false, nothing changes) past ±kMaxCrossoverLag, or once prepared if it would
+    // put a capture before its DI or past the clean leg's reach (CrossoverBlend::kMaxLagSeconds at the host rate) — and
+    // when a later table or rate does that, crossoverLagFits() says so. A slot that is heard crossfades to it.
     bool setCrossoverLag(int samples) {
         if (samples < -kMaxCrossoverLag || samples > kMaxCrossoverLag) return false;
-        const int was = xoRefLag_;
-        xoRefLag_ = samples;
-        if (prepared_ && loaded_ && ! crossoverLagsFit()) { xoRefLag_ = was; return false; }
-        xoRefLagFile_ = align_.reference;
-        xoRefLagRate_ = align_.sampleRate;
+        const int was = xoTrim_;
+        xoTrim_ = samples;
+        if (prepared_ && loaded_ && ! crossoverLagsFit()) { xoTrim_ = was; return false; }
+        publishCrossoverLags();
+        return true;
+    }
+    bool setCrossoverReferenceLag(int samples) {
+        if (samples < -kMaxCrossoverLag || samples > kMaxCrossoverLag) return false;
+        const int was = xoRefOffset_;
+        xoRefOffset_ = samples;
+        if (prepared_ && loaded_ && ! crossoverLagsFit()) { xoRefOffset_ = was; return false; }
+        xoRefPending_ = ! loaded_;
+        if (loaded_) { xoRefPack_ = xoPack_; xoRefFile_ = align_.reference; xoRefRate_ = align_.sampleRate; }
         publishCrossoverLags();
         return true;
     }
@@ -1351,12 +1368,13 @@ public:
         return true;
     }
     double crossoverCleanDb() const { return xoCleanDbSet_; }
-    const std::string& crossoverLagReference() const { return xoRefLagFile_; }
+    const std::string& crossoverLagReference() const { return align_.reference; }
+    int    crossoverReferenceLag() const { return xoRefOffset_; }
     bool   crossoverLagFits() const { return xoFits_; }   // every capture's lag within [0, the reach] at this rate
     double crossoverHz()     const { return xoHzSet_; }
     double crossoverAmount() const { return xoAmountSet_; }
     bool   crossoverInvert() const { return xoInvertSet_; }
-    int    crossoverLag()    const { return xoRefLag_; }
+    int    crossoverLag()    const { return xoTrim_; }
     bool   crossoverRunning() const { return xo_.runningFlag(); }   // any thread
 
     // --------------------------------------------------------------------- the scope: OrbitAmp's ScopeTap ----
@@ -1782,11 +1800,16 @@ public:
             // THE CROSSOVER'S CLEAN LEG for this block, as the models' part was just mixed: each slot's tap through its
             // mirrored line, the same recipe. The pack's dry part joins it at the blend knob below.
             if (xo) {
+                // The per-model table is read SEQ_CST, once, as the slots' stages are read: the same proof as the preload's
+                // retired copies (retireStage) — the clock ticked seq_cst at the top of this call, the publication and the
+                // retirement stamp are seq_cst on the message thread, so a block whose tick is past the stamp reads the new
+                // pointer, and service() frees an old table only once such a block has begun.
+                const XoModels* xt = xoModelsRt_.load(std::memory_order_seq_cst);
                 const std::uint64_t held[2] { blend_.held[0], blend_.held[1] };
-                const int own[2] { ownLagRt(held[0]), ownLagRt(held[1]) };
+                const int own[2] { ownLagRt(xt, held[0]), ownLagRt(xt, held[1]) };
                 const int delay[2] { slotDelay_[0].load(std::memory_order_acquire), slotDelay_[1].load(std::memory_order_acquire) };
                 xo_.taps(held, own, law);
-                const bool inv[2] { invertRt(held[0]), invertRt(held[1]) };
+                const bool inv[2] { invertRt(xt, held[0]), invertRt(xt, held[1]) };
                 xo_.clean(nch, count, recipe, delay, inv);
             }
 
@@ -1872,15 +1895,21 @@ private:
         const double rate = k < modelRate_.size() ? modelRate_[k] : std::numeric_limits<double>::quiet_NaN();
         // Not landed yet: the rate NAM assumes for a capture that names none, as an untagged one runs (the landing corrects it).
         const double runSR = felitronics::nam::NamStage::rateMatch(fs_, std::isnan(rate) ? -1.0 : rate).modelRunSR;
-        return align_.lagOf(models_[k].id, fs_, runSR, xoRefLag_);
+        return align_.lagOf(models_[k].id, fs_, runSR, xoRefOffset_, xoTrim_);
     }
+    // Per model, for the audio thread: its lag in host samples (clamped to the reach) and whether it inverts.
+    struct XoModels {
+        explicit XoModels(std::size_t count)
+            : n(count), lag(std::make_unique<std::atomic<int>[]>(count)), inv(std::make_unique<std::atomic<bool>[]>(count)) {}
+        std::size_t n;
+        std::unique_ptr<std::atomic<int>[]>  lag;
+        std::unique_ptr<std::atomic<bool>[]> inv;
+    };
     // Audio thread: the lag of the capture a slot holds, as published.
-    int ownLagRt(std::uint64_t held) const noexcept {
-        const XoModels* t = xoModelsRt_.load(std::memory_order_acquire);
+    static int ownLagRt(const XoModels* t, std::uint64_t held) noexcept {
         return t != nullptr && held >= 1 && held <= t->n ? t->lag[(std::size_t) held - 1].load(std::memory_order_relaxed) : 0;
     }
-    bool invertRt(std::uint64_t held) const noexcept {
-        const XoModels* t = xoModelsRt_.load(std::memory_order_acquire);
+    bool invertRt(const XoModels* t, std::uint64_t held) const noexcept {
         const bool own = t != nullptr && held >= 1 && held <= t->n && t->inv[(std::size_t) held - 1].load(std::memory_order_relaxed);
         return own != xoInvert_.load(std::memory_order_acquire);
     }
@@ -1903,18 +1932,18 @@ private:
         }
         xoFits_ = fits;
     }
-    // The trim belongs to the reference it was set against, in that table's samples. Unchanged when the new table
-    // counts from the same file in the same samples; rebased when it still reads the old reference — the old one is
-    // `rel` later than the new, so the new trails its DI by trim − rel — and dropped to 0 otherwise. A trim set with no
-    // reference (before any pack) is the first table's.
-    void rebaseCrossoverLag(const AlignmentTable& t) {
-        const bool sameUnits = felitronics::core::exactlyEqual(t.sampleRate, xoRefLagRate_);
-        if (xoRefLagFile_.empty() && xoRefLagRate_ <= 0.0) { xoRefLagFile_ = t.reference; xoRefLagRate_ = t.sampleRate; return; }
-        if (t.reference == xoRefLagFile_ && sameUnits) return;
-        const auto old = t.lagByFile.find(xoRefLagFile_);
-        xoRefLag_ = old != t.lagByFile.end() && sameUnits ? xoRefLag_ - old->second : 0;
-        xoRefLagFile_ = t.reference;
-        xoRefLagRate_ = t.sampleRate;
+    // THE REFERENCE OFFSET BELONGS TO A PACK, a reference and a table's samples. load(): another pack drops it (a pending
+    // one is adopted); setAlignment(): another reference in the same samples rebases it when the new table still reads the
+    // old reference — the old one is `rel` later than the new, so the new trails its DI by offset − rel — else drops it.
+    void bindReferenceLag(const AlignmentTable& t, bool newPack) {
+        if (newPack && xoRefPending_) { xoRefPending_ = false; xoRefPack_ = xoPack_; xoRefFile_ = t.reference; xoRefRate_ = t.sampleRate; return; }
+        if (newPack && xoRefPack_ != xoPack_) xoRefOffset_ = 0;
+        const bool sameUnits = felitronics::core::exactlyEqual(t.sampleRate, xoRefRate_);
+        if (! newPack && (t.reference != xoRefFile_ || ! sameUnits)) {
+            const auto old = t.lagByFile.find(xoRefFile_);
+            xoRefOffset_ = old != t.lagByFile.end() && sameUnits ? xoRefOffset_ - old->second : 0;
+        }
+        xoRefPack_ = xoPack_; xoRefFile_ = t.reference; xoRefRate_ = t.sampleRate;
     }
     bool crossoverLagsFit() const {
         for (std::size_t k = 0; k < models_.size(); ++k)
@@ -2016,6 +2045,7 @@ private:
         const bool by = standby_.load(std::memory_order_acquire);
         fadeG_ = by ? 0.0f : 1.0f;
         parkedRt_ = by;
+        xo_.setParked(by);
         standingBy_.store(by, std::memory_order_release);
     }
 
@@ -2982,19 +3012,13 @@ private:
     // the crossover blend (setCrossoverAmount): the settings on the message thread, their atomics, the audio side
     double xoHzSet_ = 150.0, xoAmountSet_ = 0.0, xoCleanDbSet_ = 0.0;
     bool   xoInvertSet_ = false, xoFits_ = true;
-    int    xoRefLag_ = 0;                                       // the host trim (setCrossoverLag)…
-    std::string xoRefLagFile_;                                  // …the reference it was set against…
-    double xoRefLagRate_ = 0.0;                                 // …and the samples it is in (the table's rate; 0 = the models')
+    int    xoTrim_ = 0;                                         // the host trim (setCrossoverLag), the bench's
+    int    xoRefOffset_ = 0;                                    // the reference offset (setCrossoverReferenceLag)…
+    std::string xoPack_, xoRefPack_, xoRefFile_;                // …the pack, and the reference, it belongs to…
+    double xoRefRate_ = 0.0;                                    // …and the samples it is in (the table's rate; 0 = the models')
+    bool   xoRefPending_ = false;                               // set with nothing loaded: the next pack's
     std::vector<double> modelRate_;                             // message thread: each model's own rate; NaN = not landed
     std::atomic<bool> xoInvert_ { false };
-    // Per model, for the audio thread: its lag in host samples (clamped to the reach) and whether it inverts.
-    struct XoModels {
-        explicit XoModels(std::size_t count)
-            : n(count), lag(std::make_unique<std::atomic<int>[]>(count)), inv(std::make_unique<std::atomic<bool>[]>(count)) {}
-        std::size_t n;
-        std::unique_ptr<std::atomic<int>[]>  lag;
-        std::unique_ptr<std::atomic<bool>[]> inv;
-    };
     std::unique_ptr<XoModels> xoModels_;                        // message thread owns…
     std::atomic<XoModels*> xoModelsRt_ { nullptr };             // …the audio thread reads
     std::vector<std::pair<std::unique_ptr<XoModels>, std::uint64_t>> xoRetired_;   // freed once the clock is past

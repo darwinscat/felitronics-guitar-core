@@ -51,6 +51,10 @@ void ok(bool cond, const std::string& msg) {
 }
 
 constexpr int    kBlock = 128;
+// THE SWITCH'S TRUE BOUND: the quietest period of a tone through switching the split on, worst over 8 phases x 5 tones
+// x 3 crossovers, measured -3.03 dB (a 55 Hz tone at an 80 Hz crossover) — the pair swept up from 1 Hz through the
+// tone; no transition tried did better than about -3 dB. Gated with a small margin.
+constexpr double kSwitchWorstDb = -3.25;
 constexpr double kPi = 3.14159265358979323846;
 
 std::string gainModel(double w) {
@@ -286,7 +290,9 @@ struct Reference {
     float operator()(float v) { float lo = 0.0f, hi = 0.0f; x.processSample(0, v, lo, hi); return lo + hi; }
 };
 
-void cleanLegIsTheModelsMix(int maxModels) {
+// At amount 1 the low half takes the clean leg alone, and the null is exact. At a fractional amount it takes
+// (1 - a)·device + a·clean, which equals the device only up to the rounding of that sum (~6e-8): a tolerance there.
+void cleanLegIsTheModelsMix(int maxModels, double amount = 1.0) {
     group(std::string("the clean leg is the models' mix, sample for sample — a dial walk, a table handed in while playing")
           + (maxModels == 1 ? ", one-model dips" : ", crossfades"));
     // The pack carries NO table: the mid capture trails by 20 samples, the late one by 37, and nobody has said so yet.
@@ -294,7 +300,7 @@ void cleanLegIsTheModelsMix(int maxModels) {
     const std::vector<Cap> caps { { "early", gainModel(1.0), "60", std::nullopt }, { "mid", delayModel(20, 1.0), "150", std::nullopt },
                                   { "late", delayModel(37, 1.0), "240", std::nullopt } };
     auto pre0 = [maxModels](RigPlayer& p) { test::run(p.setMaxModels(maxModels)); };
-    auto pre1 = [maxModels](RigPlayer& p) { test::run(p.setMaxModels(maxModels)); crossover(150.0, 1.0)(p); };
+    auto pre1 = [maxModels, amount](RigPlayer& p) { test::run(p.setMaxModels(maxModels)); crossover(150.0, amount)(p); };
     Bench off(caps, 48000.0, 240.0, pre0), on(caps, 48000.0, 240.0, pre1);
     Reference ref(48000.0, 150.0f);
     auto step = [&](double& worst) {
@@ -320,7 +326,8 @@ void cleanLegIsTheModelsMix(int maxModels) {
     ok(held.size() >= 3 && (between || maxModels == 1), "precondition: the walk moved the slots (" + std::to_string(held.size())
        + " pairs held)" + (maxModels == 1 ? "" : ", and sounded both"));
     ok(unknown > 0.01, "precondition: with no reading the clean leg is 37 samples early (" + fmt(unknown, "%.4f") + " off)");
-    ok(known == 0.0 && on.p.crossoverRunning(), "the table handed in, then a walk across both captures (" + std::string(maxModels == 1
+    ok((amount < 1.0 ? known <= 1e-6 : known == 0.0) && on.p.crossoverRunning(), "amount " + fmt(amount, "%.1f") + ", the table "
+       "handed in, then a walk across both captures (" + std::string(maxModels == 1
        ? "dips" : "crossfades, retimes") + "): within " + fmt(known, "%.3g") + " of eq::Crossover2 on the player without it");
 }
 
@@ -725,9 +732,9 @@ void switchOnLevel() {
     const auto offY = b.play(500, sine);
     const double inDb = 20.0 * std::log10(quietestWindow(on, 0, on.size(), 320) / 0.5);
     const double outDb = 20.0 * std::log10(quietestWindow(offY, 0, offY.size(), 320) / 0.5);
-    // What is left is the swept pair's own: an LR4 whose frequency moves is not exactly an all-pass while it moves (-0.98
-    // dB here on the way up through the tone, -0.60 with a 40 ms sweep). A crossfade against the pair at 150 Hz read -12.4.
-    ok(inDb > -1.5 && outDb > -1.5 && ! b.p.crossoverRunning(), "a 150 Hz tone through the switch: on " + fmt(inDb, "%+.3f")
+    // What is left is the swept pair's own: an LR4 whose frequency moves is not exactly an all-pass while it moves. A
+    // crossfade against the pair at 150 Hz read -12.4 here; the bound over phases, tones and crossovers is kSwitchWorstDb.
+    ok(inDb > kSwitchWorstDb && outDb > kSwitchWorstDb && ! b.p.crossoverRunning(), "a 150 Hz tone through the switch: on " + fmt(inDb, "%+.3f")
        + " dB, off " + fmt(outDb, "%+.3f") + " dB at the quietest period, and stopped after");
 }
 
@@ -753,19 +760,20 @@ void anchorAndPolarityPerCapture() {
         return id == "a" ? std::vector<std::byte> {} : bytesOf(gainModel(1.0)); });
     ok(measured.reference == "b", "a measured table names the file it counted from (the first that loads): "
        + measured.reference);
-    // The trim belongs to the reference it was set against: rebased when the new table still knows it, else dropped.
+    // The reference offset belongs to the reference it was set against: rebased when the new table still knows it, else dropped.
     const std::vector<Cap> caps { { "a", gainModel(1.0), "60", 0 }, { "b", gainModel(1.0), "240", 0 } };
     Bench b(caps, 48000.0, 60.0);
     AlignmentTable ta; ta.lagByFile = { { "a", 0 }, { "b", 5 } }; ta.reference = "a";
     b.p.setAlignment(ta);
-    test::run(b.p.setCrossoverLag(20));
+    test::run(b.p.setCrossoverReferenceLag(20));
     AlignmentTable tb; tb.lagByFile = { { "a", -5 }, { "b", 0 } }; tb.reference = "b";
     b.p.setAlignment(tb);
-    const int rebased = b.p.crossoverLag();
+    const int rebased = b.p.crossoverReferenceLag();
     AlignmentTable tc; tc.lagByFile = { { "b", 0 } }; tc.reference = "b"; tc.sampleRate = 44100.0;
     b.p.setAlignment(tc);
-    ok(rebased == 25 && b.p.crossoverLagReference() == "b" && b.p.crossoverLag() == 0, "20 against a, rebased to "
-       + std::to_string(rebased) + " against b; a table in other samples drops it (" + std::to_string(b.p.crossoverLag()) + ")");
+    ok(rebased == 25 && b.p.crossoverLagReference() == "b" && b.p.crossoverReferenceLag() == 0, "reference offset 20 against a, "
+       "rebased to " + std::to_string(rebased) + " against b; a table in other samples drops it ("
+       + std::to_string(b.p.crossoverReferenceLag()) + ")");
     // MINOR 10: a trim that would put a capture before its DI is refused; a table that does says so.
     AlignmentTable tn; tn.lagByFile = { { "a", 0 }, { "b", -5 } }; tn.reference = "a";
     b.p.setAlignment(tn);
@@ -798,6 +806,143 @@ void parkedIsNotRunning() {
     ok(b.p.standingBy() == false && ! parked && b.p.crossoverRunning(), "parked: not running; back: running");
 }
 
+
+// --------------------------------------------------------------------------------------- review round 2 ----
+
+void referenceOffsetIsThePacks() {
+    group("the reference offset belongs to the pack it was set on; another pack with the same file names drops it");
+    const std::vector<Cap> late { { "a", delayModel(160, 1.0), "60", 0 }, { "b", delayModel(160, 1.0), "240", 0 } };
+    const std::vector<Cap> unity { { "a", gainModel(1.0), "60", 0 }, { "b", gainModel(1.0), "240", 0 } };
+    auto reload = [](Bench& b, const std::vector<Cap>& caps, const std::string& rigId) {
+        for (const auto& c : caps) b.files[c.id] = bytesOf(c.model);
+        auto r = rigOf(caps);
+        r.chain[0].device.rigId = rigId;
+        b.p.load(r, [&b](const std::string& id) { return b.files.at(id); });
+        (void) b.p.setDial("gain", 60.0);
+        b.settle(80);
+    };
+    Bench b(late, 48000.0, 60.0, crossover(150.0, 1.0));
+    test::run(b.p.setCrossoverReferenceLag(160));
+    b.settle(40);
+    const double first = ripple(impulseResponse(b, 32768), 48000.0);
+    reload(b, unity, "");
+    const double other = ripple(impulseResponse(b, 32768), 48000.0);
+    ok(first <= 0.1 && b.p.crossoverReferenceLag() == 0 && other <= 0.1, "set on a 160-late pack (" + fmt(first, "%.6f")
+       + " dB), then an unrelated pack with the same names: dropped to " + std::to_string(b.p.crossoverReferenceLag()) + ", "
+       + fmt(other, "%.6f") + " dB");
+    Bench s(late, 48000.0, 60.0, crossover(150.0, 1.0));
+    reload(s, late, "rig-7");
+    test::run(s.p.setCrossoverReferenceLag(160));
+    reload(s, late, "rig-7");
+    const double again = ripple(impulseResponse(s, 32768), 48000.0);
+    RigPlayer pend;
+    test::run(pend.setCrossoverReferenceLag(160));
+    ok(s.p.crossoverReferenceLag() == 160 && again <= 0.1 && pend.crossoverReferenceLag() == 160, "the same stamped rig "
+       "loaded again keeps it (" + fmt(again, "%.6f") + " dB); set with nothing loaded, it waits for the next pack");
+}
+
+void absoluteNeverTakesTheOffset() {
+    group("an absolute reading never takes the reference offset — not added to it, not moved by a rebase");
+    const std::vector<Cap> late { { "a", delayModel(160, 1.0), "60", 0 }, { "b", delayModel(160, 1.0), "240", 0 } };
+    Bench b(late, 48000.0, 60.0, crossover(150.0, 1.0));
+    test::run(b.p.setCrossoverReferenceLag(160));          // the relative table, calibrated
+    AlignmentTable t; t.reference = "a"; t.lagByFile = { { "a", 0 }, { "b", 0 } };
+    t.absoluteLagByFile = { { "a", 160 }, { "b", 160 } };   // …then the pack's own readings arrive
+    b.p.setAlignment(t);
+    b.settle(40);
+    const double both = ripple(impulseResponse(b, 32768), 48000.0);
+    AlignmentTable u = t; u.reference = "b";                 // another anchor for the relative numbers
+    b.p.setAlignment(u);
+    b.settle(40);
+    const double moved = ripple(impulseResponse(b, 32768), 48000.0);
+    ok(both <= 0.1 && moved <= 0.1, "absolute 160 after a relative calibration of 160: " + fmt(both, "%.6f") + " dB (not 320 "
+       "late); the relative anchor moved: " + fmt(moved, "%.6f") + " dB");
+}
+
+void cleanLevelSparesThePackDry() {
+    group("the clean level calibrates the captures' part only: the pack's dry part is not scaled with it");
+    const std::vector<Cap> caps { { "early", gainModel(4.0), "60", 0 }, { "late", gainModel(4.0), "240", 0 } };
+    auto level30 = [&](double amount) {
+        Bench b(caps, 48000.0, 60.0, [=](RigPlayer& p) { crossover(150.0, amount)(p); test::run(p.setCrossoverCleanDb(12.0412)); },
+                false, true);
+        (void) b.p.setDial("mix", 0.0);                      // the pack's blend knob fully dry
+        b.settle(40);
+        return 20.0 * std::log10(ratio(lockIn(b, 30.0, 0.05, 40, 120)).mag);
+    };
+    const double move = level30(1.0) - level30(0.0);
+    ok(std::abs(move) < 0.1, "a fully dry pack, the clean level at the captures' +12.04 dB: amount 0 -> 1 moves 30 Hz by "
+       + fmt(move, "%+.3f") + " dB");
+}
+
+void polarityLandsWithTheCapture() {
+    group("a capture's polarity lands with it: a walk unity / inverting / unity nulls against eq::Crossover2");
+    const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "mid", gainModel(-1.0), "150", 0 },
+                                  { "late", gainModel(1.0), "240", 0 } };
+    AlignmentTable t; t.reference = "early"; t.lagByFile = { { "early", 0 }, { "mid", 0 }, { "late", 0 } };
+    t.invertedByFile = { { "mid", true } };
+    Bench off(caps, 48000.0, 60.0, crossover(150.0, 0.0)), on(caps, 48000.0, 60.0, crossover(150.0, 1.0));
+    off.p.setAlignment(t); on.p.setAlignment(t);
+    Reference ref(48000.0, 150.0f);
+    double worst = 0.0;
+    auto step = [&] { off.settle(1); on.settle(1);
+        for (int i = 0; i < kBlock; ++i) worst = std::max(worst, (double) std::abs(ref(off.y[(std::size_t) i]) - on.y[(std::size_t) i])); };
+    for (int k = 0; k < 60; ++k) step();
+    worst = 0.0;
+    for (const double dial : { 150.0, 240.0, 150.0, 60.0, 200.0, 100.0 }) {
+        (void) off.p.setDial("gain", dial); (void) on.p.setDial("gain", dial);
+        for (int k = 0; k < 150; ++k) step();
+    }
+    ok(worst == 0.0, "through six turns: within " + fmt(worst, "%.3g"));
+}
+
+void parkedFromTheStart() {
+    group("stand-by known to the crossover from prepare() and reset(), not only from a park");
+    RigPlayer p;
+    crossover(150.0, 1.0)(p);
+    p.setStandby(true);
+    test::run(p.prepare(48000.0, kBlock, 1));
+    const bool atPrepare = p.crossoverRunning();
+    Bench b({ { "a", gainModel(1.0), "60", 0 }, { "b", gainModel(1.0), "240", 0 } }, 48000.0, 60.0, crossover(150.0, 1.0));
+    b.settle(10);
+    b.p.setStandby(true); b.settle(20);
+    b.p.setStandby(false); b.settle(20);
+    b.p.reset();
+    ok(! atPrepare && b.p.crossoverRunning(), "prepared in stand-by: not running; parked, back, reset: running");
+}
+
+/** The quietest period of a tone through a switch on and back off, over phases, tones and crossovers: the worst, in dB. */
+double switchEnvelope(double& onWorst, double& offWorst, std::string& where) {
+    onWorst = offWorst = 0.0;
+    const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "late", gainModel(1.0), "240", 0 } };
+    for (const double fc : { 80.0, 150.0, 250.0 })
+        for (const double tone : { 40.0, 55.0, 80.0, 150.0, 300.0 })
+            for (int ph = 0; ph < 8; ++ph) {
+                Bench b(caps, 48000.0, 60.0, crossover(fc, 0.0));
+                const double phase = 2.0 * kPi * ph / 8.0;
+                auto sine = [=](long i) { return (float) (0.5 * std::sin(2.0 * kPi * tone * (double) i / 48000.0 + phase)); };
+                (void) b.play(40, sine);
+                test::run(b.p.setCrossoverAmount(1.0));
+                const auto on = b.play(150, sine);
+                test::run(b.p.setCrossoverAmount(0.0));
+                const auto offY = b.play(150, sine);
+                const auto period = (std::size_t) std::lround(48000.0 / tone);
+                const double d1 = 20.0 * std::log10(quietestWindow(on, 0, on.size(), period) / 0.5);
+                const double d0 = 20.0 * std::log10(quietestWindow(offY, 0, offY.size(), period) / 0.5);
+                if (d1 < onWorst) { onWorst = d1; where = "on: tone " + fmt(tone, "%.0f") + " Hz, fc " + fmt(fc, "%.0f") + " Hz"; }
+                offWorst = std::min(offWorst, d0);
+            }
+    return std::min(onWorst, offWorst);
+}
+
+void switchEnvelopeAll() {
+    group("the switch's real envelope: 8 phases x tones 40/55/80/150/300 Hz x crossovers 80/150/250 Hz");
+    double on = 0.0, off = 0.0;
+    std::string where;
+    const double worst = switchEnvelope(on, off, where);
+    ok(worst > kSwitchWorstDb, "the quietest period through switching on " + fmt(on, "%+.2f") + " dB (" + where + "), off "
+       + fmt(off, "%+.2f") + " dB; gated at " + fmt(kSwitchWorstDb, "%+.1f"));
+}
+
 } // namespace
 
 int main() {
@@ -807,6 +952,7 @@ int main() {
     lagSumsFlat();
     cleanLegIsTheModelsMix(2);
     cleanLegIsTheModelsMix(1);
+    cleanLegIsTheModelsMix(2, 0.3);
     polarity();
     glides();
     silenceIsExact();
@@ -822,6 +968,12 @@ int main() {
     manyCaptures();
     anchorAndPolarityPerCapture();
     parkedIsNotRunning();
+    referenceOffsetIsThePacks();
+    absoluteNeverTakesTheOffset();
+    cleanLevelSparesThePackDry();
+    polarityLandsWithTheCapture();
+    parkedFromTheStart();
+    switchEnvelopeAll();
     seamOnRealCaptures();
     return test::report();
 }

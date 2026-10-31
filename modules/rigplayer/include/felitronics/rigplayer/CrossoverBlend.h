@@ -76,6 +76,10 @@ public:
     // degrees at 150 Hz), so the device can be crossfaded against it without the notch a crossfade against the pair at
     // its working frequency would leave; the frequency is then swept up from here — and down to here before it stops.
     static constexpr float  kFloorHz = 1.0f;
+    // The sweep starts once the fade at the floor is 95 % in (about 30 ms at 48 kHz; the sweep then reaches 1 % of the
+    // frequency in about 46 ms more). Waiting for 99.9 % only added 40 ms: no transition tried — 95 % or 99.9 %, a 10 or
+    // 20 ms sweep — did better than about -3 dB at the worst tone (CrossoverBlendTests' switch envelope).
+    static constexpr float  kSweepAt = 0.95f;
     static constexpr double kQ = 0.7071067811865476;           // eq::Crossover2's: 1/√2 Butterworth, cascaded = LR4
 
     // ------------------------------------------------------------------ settings (any thread: atomics) ----
@@ -119,7 +123,7 @@ public:
         const float amount = amount_.load(std::memory_order_acquire);
         run_  = amount > 0.0f;
         mix_  = run_ ? 1.0f : 0.0f;
-        dryG_ = amount * cleanG_.load(std::memory_order_acquire);
+        dryG_ = amount;
         snapSign_ = true;
         wetG_ = 1.0f - amount;
         hzRt_ = hz_.load(std::memory_order_acquire);
@@ -183,6 +187,7 @@ public:
             const double w0 = i == 0 ? 1.0 - law.beginB : law.beginB, w1 = i == 0 ? 1.0 - law.endB : law.endB;
             const bool moved = held[i] != t.held;
             t.held = held[i];
+            if (moved || (w0 <= 0.0 && w1 <= 0.0)) snapGain_[i] = true;   // its polarity and level land with it
             if (moved || (w0 <= 0.0 && w1 <= 0.0)) {
                 if (want != t.lag || t.pos < fadeLen_ || moved) { t.from = t.lag = t.next = want; t.pos = fadeLen_; }
                 continue;
@@ -201,9 +206,14 @@ public:
     void clean(int nch, int count, const MixRecipe& r, const int delay[2], const bool invert[2]) noexcept {
         const float decay = std::exp(-(float) count / (float) (0.010 * fs_));
         float signEnd[2], signStep[2];
+        const float level = cleanG_.load(std::memory_order_acquire);
         for (int i = 0; i < 2; ++i) {
-            const float want = invert[i] ? -1.0f : 1.0f;
-            if (snapSign_) sign_[i] = want;
+            // A SLOT'S GAIN on its clean tap: its capture's polarity times the clean level — the capture calibration, on
+            // the model-referenced part alone (the pack's dry part joins after). It LANDS with a new capture and on a slot
+            // silent at both ends; only an edit to a capture that is heard glides.
+            const float want = (invert[i] ? -1.0f : 1.0f) * level;
+            if (snapSign_ || snapGain_[i]) sign_[i] = want;
+            snapGain_[i] = false;
             signEnd[i]  = glideEnd(want, sign_[i], decay);
             signStep[i] = (signEnd[i] - sign_[i]) / (float) count;
         }
@@ -230,7 +240,7 @@ public:
     // prepared plane runs — a plane the host stopped carries its zeros through, so nothing it held is replayed.
     void run(float* const* a, int count) noexcept {
         const float amount  = amount_.load(std::memory_order_acquire);
-        const float wantDry = amount * cleanG_.load(std::memory_order_acquire), wantWet = 1.0f - amount;
+        const float wantDry = amount, wantWet = 1.0f - amount;
         const float target  = hz_.load(std::memory_order_acquire);
         for (int off = 0; off < count; ) {
             const int seg = grid_.segment(count - off);
@@ -239,7 +249,7 @@ public:
             // out. A turn back on halfway simply sweeps up again from wherever it had got to.
             const bool on = amount > 0.0f;
             const float wantMix = on ? 1.0f : (hzRt_ <= 1.5f * kFloorHz ? 0.0f : mix_);
-            const float wantHz  = on && mix_ >= 0.999f ? target : kFloorHz;
+            const float wantHz  = on && mix_ >= kSweepAt ? target : kFloorHz;
             const float endMix = glideEnd(wantMix, mix_, decay);
             const float endDry = glideEnd(wantDry, dryG_, decay);
             const float endWet = glideEnd(wantWet, wetG_, decay);
@@ -273,7 +283,10 @@ public:
         for (auto& f : hp_) f.healPoison();
         // OFF once every glide has ARRIVED at the player without it (glideEnd lands exactly): from the next block on
         // nothing of this runs, and the output is the player's own, bit for bit.
-        if (! (amount > 0.0f) && ! (mix_ > 0.0f || mix_ < 0.0f) && ! (dryG_ > 0.0f || dryG_ < 0.0f) && isOne(wetG_)) {
+        // Below 1e-9 of the device (-180 dB) the rest of the approach is inaudible: land it, rather than run the pair for
+        // the ~0.7 s glideEnd takes to reach 1e-30.
+        if (! (amount > 0.0f) && std::fabs(mix_) < 1e-9f && std::fabs(dryG_) < 1e-9f && std::fabs(wetG_ - 1.0f) < 1e-9f) {
+            mix_ = 0.0f; dryG_ = 0.0f; wetG_ = 1.0f;
             run_ = false;
             running_.store(false, std::memory_order_release);
         }
@@ -310,13 +323,13 @@ private:
     std::atomic<float> hz_ { 150.0f }, amount_ { 0.0f };
     std::atomic<float> cleanG_ { 1.0f };
     std::atomic<bool>  running_ { false };
-    bool   parked_ = false, snapSign_ = true;
+    bool   parked_ = false, snapSign_ = true, snapGain_[2] { true, true };
     int    maxLag_ = 2048;
     double fs_ = 48000.0;
     int    channels_ = 1;
     bool   run_ = false;
     float  mix_ = 0.0f, dryG_ = 0.0f, wetG_ = 1.0f;            // the split's fade, the clean and the device's low weights
-    float  sign_[2] { 1.0f, 1.0f };                            // each slot's clean polarity, gliding
+    float  sign_[2] { 1.0f, 1.0f };                            // each slot's clean gain: polarity × level, gliding
     float  hzRt_ = 150.0f, hzAt_ = 0.0f;                       // the frequency gliding, and the one designed
     int    fadeLen_ = 1;                                       // a tap's crossfade: 10 ms at fs_
     Tap    tap_[2];
