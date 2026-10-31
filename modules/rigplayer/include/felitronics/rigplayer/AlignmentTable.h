@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -117,12 +118,15 @@ struct AlignmentTable {
     int lagOf(const std::string& fileId, double hostRate, double modelRate, int referenceOffset = 0, int trim = 0) const {
         const auto ab = absoluteLagByFile.find(fileId);
         const auto me = lagByFile.find(fileId);
-        const int own = ab != absoluteLagByFile.end() ? ab->second
-                      : (me == lagByFile.end() ? 0 : me->second) + referenceOffset;
-        const double lag = (double) own + (double) trim;
+        // Widened before anything is added, and saturated before it is narrowed: a reading near INT_MAX must not wrap.
+        const double own = ab != absoluteLagByFile.end() ? (double) ab->second
+                         : (double) (me == lagByFile.end() ? 0 : me->second) + (double) referenceOffset;
+        const double lag = own + (double) trim;
         const double at = sampleRate > 0.0 ? sampleRate : modelRate;
         const double scale = (at > 0.0 && hostRate > 0.0) ? hostRate / at : 1.0;
-        return (int) std::lround(lag * scale);
+        const double host = lag * scale;
+        constexpr double hi = (double) std::numeric_limits<int>::max(), lo = (double) std::numeric_limits<int>::min();
+        return host >= hi ? std::numeric_limits<int>::max() : host <= lo ? std::numeric_limits<int>::min() : (int) std::lround(host);
     }
 
     // THE PACK'S OWN READING. Every distinct file of the stage must carry `lag_samples`, or the stage
@@ -136,7 +140,10 @@ struct AlignmentTable {
             if (! f.lagSamples) return AlignmentTable {};
             if (out.reference.empty()) out.reference = f.id;
             out.lagByFile[f.id] = *f.lagSamples;
-            // ← namz 5.0.0's per-file readings plug in here, in the file's own rate as `lag_samples` is:
+            // ← namz 5.0.0's per-file readings plug in here, in the file's own rate as `lag_samples` is. NOTE for that
+            //   wiring: this loop returns an empty table at the first file WITHOUT `lag_samples`, before reaching this
+            //   line — read the absolute readings first, and when the relative ones are absent derive `lagByFile` from
+            //   them (each file's absolute lag minus the reference's), so a pack carrying only the new fields is aligned.
             //   if (f.inputLagSamples) out.absoluteLagByFile[f.id] = *f.inputLagSamples;   // `input_lag_samples`
             //   if (f.polarity == -1)  out.invertedByFile[f.id] = true;                       // `polarity`
         }

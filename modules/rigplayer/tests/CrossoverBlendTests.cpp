@@ -51,10 +51,12 @@ void ok(bool cond, const std::string& msg) {
 }
 
 constexpr int    kBlock = 128;
-// THE SWITCH'S TRUE BOUND: the quietest period of a tone through switching the split on, worst over 8 phases x 5 tones
-// x 3 crossovers, measured -3.03 dB (a 55 Hz tone at an 80 Hz crossover) — the pair swept up from 1 Hz through the
-// tone; no transition tried did better than about -3 dB. Gated with a small margin.
-constexpr double kSwitchWorstDb = -3.25;
+// THE SWITCH'S TRUE BOUND: the quietest period of a tone through switching the split on, worst over 32 phases x 6 tones
+// (31 … 300 Hz) x 4 crossovers (50 … 250 Hz), each window stepped by 1/16 of a period: measured -3.47 dB (an 80 Hz tone,
+// a 150 Hz crossover, phase 13/32) — the pair swept up from 1 Hz through the tone; no transition tried did better than
+// about -3 dB. Gated with a small margin. A one-time switch transient: a host that automates the amount between 0 and a
+// little hears it each time, and should hold the amount above 0 instead.
+constexpr double kSwitchWorstDb = -3.6;
 constexpr double kPi = 3.14159265358979323846;
 
 std::string gainModel(double w) {
@@ -663,7 +665,7 @@ void seamOnRealCaptures() {
 /** The quietest one-period window (`period` samples) of y over [from, to): the level a dip would show. */
 double quietestWindow(const std::vector<float>& y, std::size_t from, std::size_t to, std::size_t period) {
     double q = 1e30;
-    for (std::size_t n = from; n + period <= to && n + period <= y.size(); n += period / 4) {
+    for (std::size_t n = from; n + period <= to && n + period <= y.size(); n += std::max<std::size_t>(1, period / 16)) {
         double m = 0.0;
         for (std::size_t k = n; k < n + period; ++k) m = std::max(m, (double) std::abs(y[k]));
         q = std::min(q, m);
@@ -914,33 +916,122 @@ void parkedFromTheStart() {
 double switchEnvelope(double& onWorst, double& offWorst, std::string& where) {
     onWorst = offWorst = 0.0;
     const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "late", gainModel(1.0), "240", 0 } };
-    for (const double fc : { 80.0, 150.0, 250.0 })
-        for (const double tone : { 40.0, 55.0, 80.0, 150.0, 300.0 })
-            for (int ph = 0; ph < 8; ++ph) {
+    for (const double fc : { 50.0, 80.0, 150.0, 250.0 })
+        for (const double tone : { 31.0, 40.0, 55.0, 80.0, 150.0, 300.0 })
+            for (int ph = 0; ph < 32; ++ph) {
                 Bench b(caps, 48000.0, 60.0, crossover(fc, 0.0));
-                const double phase = 2.0 * kPi * ph / 8.0;
+                const double phase = 2.0 * kPi * ph / 32.0;
                 auto sine = [=](long i) { return (float) (0.5 * std::sin(2.0 * kPi * tone * (double) i / 48000.0 + phase)); };
-                (void) b.play(40, sine);
+                (void) b.play(8, sine);
                 test::run(b.p.setCrossoverAmount(1.0));
-                const auto on = b.play(150, sine);
+                const auto on = b.play(60, sine);              // the fade and the sweep are over within ~80 ms
                 test::run(b.p.setCrossoverAmount(0.0));
-                const auto offY = b.play(150, sine);
+                const auto offY = b.play(110, sine);
                 const auto period = (std::size_t) std::lround(48000.0 / tone);
                 const double d1 = 20.0 * std::log10(quietestWindow(on, 0, on.size(), period) / 0.5);
                 const double d0 = 20.0 * std::log10(quietestWindow(offY, 0, offY.size(), period) / 0.5);
-                if (d1 < onWorst) { onWorst = d1; where = "on: tone " + fmt(tone, "%.0f") + " Hz, fc " + fmt(fc, "%.0f") + " Hz"; }
+                if (d1 < onWorst) { onWorst = d1; where = "on: tone " + fmt(tone, "%.0f") + " Hz, fc " + fmt(fc, "%.0f") + " Hz, phase "
+                                                          + std::to_string(ph) + "/32"; }
                 offWorst = std::min(offWorst, d0);
             }
     return std::min(onWorst, offWorst);
 }
 
 void switchEnvelopeAll() {
-    group("the switch's real envelope: 8 phases x tones 40/55/80/150/300 Hz x crossovers 80/150/250 Hz");
+    group("the switch's real envelope: 32 phases x tones 31/40/55/80/150/300 Hz x crossovers 50/80/150/250 Hz");
     double on = 0.0, off = 0.0;
     std::string where;
     const double worst = switchEnvelope(on, off, where);
     ok(worst > kSwitchWorstDb, "the quietest period through switching on " + fmt(on, "%+.2f") + " dB (" + where + "), off "
        + fmt(off, "%+.2f") + " dB; gated at " + fmt(kSwitchWorstDb, "%+.1f"));
+}
+
+
+// --------------------------------------------------------------------------------------- review round 3 ----
+
+void loadPack(Bench& b, const std::vector<Cap>& caps, const std::string& rigId) {
+    for (const auto& c : caps) b.files[c.id] = bytesOf(c.model);
+    auto r = rigOf(caps);
+    r.chain[0].device.rigId = rigId;
+    b.p.load(r, [&b](const std::string& id) { return b.files.at(id); });
+    (void) b.p.setDial("gain", 60.0);
+    b.settle(80);
+}
+
+void referenceOffsetAcrossLoads() {
+    group("the reference offset: a pending one survives a table; a same-rig reload validates its coordinates");
+    const std::vector<Cap> late { { "a", delayModel(160, 1.0), "60", 0 }, { "b", delayModel(200, 1.0), "240", 40 } };
+    {   // set with nothing loaded, then a table, then the pack: still the next pack's
+        Bench b({ { "x", gainModel(1.0), "60", 0 }, { "y", gainModel(1.0), "240", 0 } }, 48000.0, 60.0, crossover(150.0, 1.0));
+        b.p.unload();
+        test::run(b.p.setCrossoverReferenceLag(160));
+        AlignmentTable t; t.reference = "a"; t.lagByFile = { { "a", 0 }, { "b", 40 } };
+        b.p.setAlignment(t);
+        loadPack(b, late, "");
+        const double r = ripple(impulseResponse(b, 32768), 48000.0);
+        ok(b.p.crossoverReferenceLag() == 160 && r <= 0.1, "pending 160, a table, then the pack: "
+           + std::to_string(b.p.crossoverReferenceLag()) + ", " + fmt(r, "%.6f") + " dB");
+    }
+    {   // rebased a -> b (160 -> 200), then the same stamped rig again, its table counted from a: back to 160
+        Bench b(late, 48000.0, 60.0, crossover(150.0, 1.0));
+        loadPack(b, late, "rig-9");
+        test::run(b.p.setCrossoverReferenceLag(160));
+        AlignmentTable tb; tb.reference = "b"; tb.lagByFile = { { "a", -40 }, { "b", 0 } };
+        b.p.setAlignment(tb);
+        const int rebased = b.p.crossoverReferenceLag();
+        loadPack(b, late, "rig-9");
+        const double r = ripple(impulseResponse(b, 32768), 48000.0);
+        ok(rebased == 200 && b.p.crossoverReferenceLag() == 160 && r <= 0.1, "160 against a, 200 against b, the rig "
+           "reloaded (against a): " + std::to_string(b.p.crossoverReferenceLag()) + ", " + fmt(r, "%.6f") + " dB");
+    }
+    {   // an offset in a measured table's samples does not survive a reload into the pack's own
+        Bench b(late, 48000.0, 60.0, crossover(150.0, 1.0));
+        loadPack(b, late, "rig-9");
+        AlignmentTable tm; tm.reference = "a"; tm.lagByFile = { { "a", 0 }, { "b", 80 } }; tm.sampleRate = 96000.0;
+        b.p.setAlignment(tm);
+        test::run(b.p.setCrossoverReferenceLag(320));
+        loadPack(b, late, "rig-9");
+        ok(b.p.crossoverReferenceLag() == 0, "320 in 96 kHz samples, the rig reloaded in its models' samples: dropped ("
+           + std::to_string(b.p.crossoverReferenceLag()) + ")");
+    }
+}
+
+void polarityThroughOneModelWarmUp() {
+    group("one model: a polarity read while the law holds the capture muted lands there, not as it becomes audible");
+    // The middle capture inverts and has a field to warm (1500 samples); the table learns that it inverts only once the
+    // capture has landed and is being warmed at gain zero.
+    const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "mid", delayModel(1500, -1.0), "150", 1500 },
+                                  { "late", gainModel(1.0), "240", 0 } };
+    AlignmentTable t; t.reference = "early"; t.lagByFile = { { "early", 0 }, { "mid", 1500 }, { "late", 0 } };
+    auto one = [](double amount) { return [amount](RigPlayer& p) { test::run(p.setMaxModels(1)); crossover(150.0, amount)(p); }; };
+    Bench off(caps, 48000.0, 60.0, one(0.0)), on(caps, 48000.0, 60.0, one(1.0));
+    off.p.setAlignment(t); on.p.setAlignment(t);
+    Reference ref(48000.0, 150.0f);
+    double worst = 0.0;
+    auto step = [&] { off.settle(1); on.settle(1);
+        for (int i = 0; i < kBlock; ++i) worst = std::max(worst, (double) std::abs(ref(off.y[(std::size_t) i]) - on.y[(std::size_t) i])); };
+    for (int k = 0; k < 60; ++k) step();
+    (void) off.p.setDial("gain", 150.0); (void) on.p.setDial("gain", 150.0);
+    bool updated = false;
+    for (int k = 0; k < 400 && ! updated; ++k) {
+        step();
+        if ((on.p.heldFileId(0) == "mid" || on.p.heldFileId(1) == "mid") && ! on.p.audible()) {
+            t.invertedByFile = { { "mid", true } };
+            off.p.setAlignment(t); on.p.setAlignment(t);
+            updated = true;
+        }
+    }
+    worst = 0.0;
+    for (int k = 0; k < 150; ++k) step();
+    ok(updated && worst == 0.0, "the reading arrives in a muted warm-up block; from there on within " + fmt(worst, "%.3g"));
+}
+
+void lagOfSaturates() {
+    group("lagOf widens before it adds and saturates before it narrows (UBSan: no signed overflow)");
+    AlignmentTable t; t.lagByFile = { { "x", std::numeric_limits<int>::max() }, { "y", std::numeric_limits<int>::max() / 2 } };
+    const int sum = t.lagOf("x", 48000.0, 48000.0, 1, 1), scaled = t.lagOf("y", 192000.0, 48000.0);
+    ok(sum == std::numeric_limits<int>::max() && scaled == std::numeric_limits<int>::max(),
+       "INT_MAX + 1 + 1 and INT_MAX/2 x 4 both read INT_MAX (" + std::to_string(sum) + ", " + std::to_string(scaled) + ")");
 }
 
 } // namespace
@@ -974,6 +1065,9 @@ int main() {
     polarityLandsWithTheCapture();
     parkedFromTheStart();
     switchEnvelopeAll();
+    referenceOffsetAcrossLoads();
+    polarityThroughOneModelWarmUp();
+    lagOfSaturates();
     seamOnRealCaptures();
     return test::report();
 }

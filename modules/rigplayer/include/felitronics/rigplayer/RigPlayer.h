@@ -1916,30 +1916,43 @@ private:
     void publishCrossoverLags() {
         // THE TABLE IS SIZED FOR THE PACK (grow only): one a pack outgrows is retired and freed by service() once the
         // audio clock has passed — process() ticks the clock before it reads the pointer, as it does for a slot's stage.
-        if (! xoModels_ || xoModels_->n < models_.size()) {
-            auto t = std::make_unique<XoModels>(std::max<std::size_t>(models_.size(), 16));
-            xoModelsRt_.store(t.get(), std::memory_order_seq_cst);
-            if (xoModels_) xoRetired_.push_back({ std::move(xoModels_), audioClock_.load(std::memory_order_seq_cst) });
-            xoModels_ = std::move(t);
-        }
+        // A grown table is FILLED before it is published, so the audio thread never reads an entry not yet written.
+        std::unique_ptr<XoModels> grown;
+        if (! xoModels_ || xoModels_->n < models_.size())
+            grown = std::make_unique<XoModels>(std::max<std::size_t>(models_.size(), 16));
+        XoModels& into = grown ? *grown : *xoModels_;
         bool fits = true;
         for (std::size_t k = 0; k < models_.size(); ++k) {
             const int own = ownLagOf(k);
             if (prepared_ && (own < 0 || own > xo_.maxLag())) fits = false;
             const auto inv = align_.invertedByFile.find(models_[k].id);
-            xoModels_->lag[k].store(std::clamp(own, 0, xo_.maxLag()), std::memory_order_relaxed);
-            xoModels_->inv[k].store(inv != align_.invertedByFile.end() && inv->second, std::memory_order_relaxed);
+            into.lag[k].store(std::clamp(own, 0, xo_.maxLag()), std::memory_order_relaxed);
+            into.inv[k].store(inv != align_.invertedByFile.end() && inv->second, std::memory_order_relaxed);
         }
         xoFits_ = fits;
+        if (grown) {
+            xoModelsRt_.store(grown.get(), std::memory_order_seq_cst);
+            if (xoModels_) xoRetired_.push_back({ std::move(xoModels_), audioClock_.load(std::memory_order_seq_cst) });
+            xoModels_ = std::move(grown);
+        }
     }
     // THE REFERENCE OFFSET BELONGS TO A PACK, a reference and a table's samples. load(): another pack drops it (a pending
     // one is adopted); setAlignment(): another reference in the same samples rebases it when the new table still reads the
     // old reference — the old one is `rel` later than the new, so the new trails its DI by offset − rel — else drops it.
+    //
+    // A PENDING offset (set with nothing loaded) has no coordinates yet: no table rebases it, and the next load binds it
+    // as it is. A load of the SAME pack (its rigId) is a table like any other: unchanged when it counts from the same
+    // reference in the same samples, rebased or dropped otherwise — never kept in the coordinates of the last table.
     void bindReferenceLag(const AlignmentTable& t, bool newPack) {
-        if (newPack && xoRefPending_) { xoRefPending_ = false; xoRefPack_ = xoPack_; xoRefFile_ = t.reference; xoRefRate_ = t.sampleRate; return; }
-        if (newPack && xoRefPack_ != xoPack_) xoRefOffset_ = 0;
+        if (xoRefPending_) {
+            if (! newPack) return;
+            xoRefPending_ = false; xoRefPack_ = xoPack_; xoRefFile_ = t.reference; xoRefRate_ = t.sampleRate;
+            return;
+        }
+        const bool otherPack = newPack && xoRefPack_ != xoPack_;
+        if (otherPack) xoRefOffset_ = 0;
         const bool sameUnits = felitronics::core::exactlyEqual(t.sampleRate, xoRefRate_);
-        if (! newPack && (t.reference != xoRefFile_ || ! sameUnits)) {
+        if (! otherPack && (t.reference != xoRefFile_ || ! sameUnits)) {
             const auto old = t.lagByFile.find(xoRefFile_);
             xoRefOffset_ = old != t.lagByFile.end() && sameUnits ? xoRefOffset_ - old->second : 0;
         }

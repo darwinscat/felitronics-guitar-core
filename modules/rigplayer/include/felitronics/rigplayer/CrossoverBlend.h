@@ -78,7 +78,8 @@ public:
     static constexpr float  kFloorHz = 1.0f;
     // The sweep starts once the fade at the floor is 95 % in (about 30 ms at 48 kHz; the sweep then reaches 1 % of the
     // frequency in about 46 ms more). Waiting for 99.9 % only added 40 ms: no transition tried — 95 % or 99.9 %, a 10 or
-    // 20 ms sweep — did better than about -3 dB at the worst tone (CrossoverBlendTests' switch envelope).
+    // 20 ms sweep — did better than about -3 dB at the worst tone; the true worst is -3.47 dB (CrossoverBlendTests'
+    // switch envelope: 32 phases x tones 31 … 300 Hz x crossovers 50 … 250 Hz).
     static constexpr float  kSweepAt = 0.95f;
     static constexpr double kQ = 0.7071067811865476;           // eq::Crossover2's: 1/√2 Butterworth, cascaded = LR4
 
@@ -187,8 +188,11 @@ public:
             const double w0 = i == 0 ? 1.0 - law.beginB : law.beginB, w1 = i == 0 ? 1.0 - law.endB : law.endB;
             const bool moved = held[i] != t.held;
             t.held = held[i];
-            if (moved || (w0 <= 0.0 && w1 <= 0.0)) snapGain_[i] = true;   // its polarity and level land with it
-            if (moved || (w0 <= 0.0 && w1 <= 0.0)) {
+            // SILENT means nothing of the slot is heard through the block: its weight zero at both ends, or the law's own
+            // gain zero at both ends (a one-model warm-up holds the slot at weight 1 and gain 0).
+            const bool silent = (w0 <= 0.0 && w1 <= 0.0) || (law.beginGain <= 0.0 && law.endGain <= 0.0);
+            if (moved || silent) snapGain_[i] = true;   // its polarity and level land with it
+            if (moved || silent) {
                 if (want != t.lag || t.pos < fadeLen_ || moved) { t.from = t.lag = t.next = want; t.pos = fadeLen_; }
                 continue;
             }
