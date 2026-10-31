@@ -77,7 +77,7 @@ class SlotLine {
 public:
     static constexpr int kCap = felitronics::nam::kBlendMaxDelay;
     static constexpr int kPlanes = 2;
-    void clear() noexcept { for (auto& h : hist_) h.fill(0.0f); from_ = next_ = n_; pos_ = len_ = 0; }
+    void clear() noexcept { for (auto& h : hist_) h.fill(0.0f); from_ = n_ = next_; pos_ = len_ = 0; }   // the LATEST delay asked
     void clearPlane(int c) noexcept { if (c >= 0 && c < kPlanes) hist_[(std::size_t) c].fill(0.0f); }
     void set(int delay, int fade = 0) noexcept {
         delay = std::clamp(delay, 0, kCap);

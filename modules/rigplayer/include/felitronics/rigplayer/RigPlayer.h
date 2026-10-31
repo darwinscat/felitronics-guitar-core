@@ -680,6 +680,7 @@ public:
         for (auto& g : slotGain_) g.store(1.0f, std::memory_order_release);
         for (auto& p : pendDelay_) p.store(0, std::memory_order_release);
         modelRate_.clear();
+        xoFits_ = alignFits_ = true;                     // no pack, nothing out of reach
         for (auto& c : slotCold_) c.store(false, std::memory_order_release);
     }
     bool loaded() const { return loaded_; }
@@ -1955,7 +1956,7 @@ private:
         // THE SLOTS' ALIGNMENT DELAYS have a reach too (kMaxDelay host samples): a table or a rate that asks more is
         // clamped in the line — said here, not silently.
         bool lines = true;
-        for (std::size_t k = 0; k < models_.size() && prepared_; ++k) if (rawDelayOf(k) > (double) kMaxDelay + 0.5) lines = false;
+        for (std::size_t k = 0; k < models_.size() && prepared_; ++k) if (rawDelayOf(k) >= (double) kMaxDelay + 0.5) lines = false;   // as lround rounds
         alignFits_ = lines;
         if (grown) {
             xoModelsRt_.store(grown.get(), std::memory_order_seq_cst);

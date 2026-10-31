@@ -1365,6 +1365,35 @@ void alignmentReachReported() {
     ok(before && ! b.p.alignmentFits(), "a capture 200 samples late against another: alignmentFits() false");
 }
 
+
+void restartLandsTheLatestDelay() {
+    group("a restart lands a line at the LATEST delay asked of it, a queued one included");
+    SlotLine line;
+    std::vector<float> x(32, 0.0f), scratch(32);
+    line.set(64, 480);
+    line.process(0, x.data(), 32, scratch.data()); line.advance(32);
+    line.set(0, 480);                                           // queued behind the 0 -> 64 fade
+    line.clear();                                               // a restart before the first fade lands
+    ok(line.delay() == 0, "0 -> 64, then 0 queued, then a restart: the line stands at " + std::to_string(line.delay()));
+}
+
+void alignmentFitsAtTheBoundaryAndUnload() {
+    group("alignmentFits(): the rounding boundary as the line rounds it, and a clean slate after unload()");
+    const std::vector<Cap> caps { { "a", gainModel(1.0), "60", 0 }, { "b", gainModel(1.0), "240", 0 } };
+    Bench b(caps, 48000.0, 60.0);
+    AlignmentTable t; t.reference = "a"; t.lagByFile = { { "a", 0 }, { "b", 257 } }; t.sampleRate = 96000.0;
+    b.p.setAlignment(t);                                        // 257 at 96 kHz = 128.5 here: rounds to 129, held at 128
+    const bool boundary = b.p.alignmentFits();
+    t.lagByFile["b"] = 256;
+    b.p.setAlignment(t);                                        // 128 exactly: fits
+    const bool inside = b.p.alignmentFits();
+    t.lagByFile["b"] = 400;
+    b.p.setAlignment(t);
+    b.p.unload();
+    ok(! boundary && inside && b.p.alignmentFits() && b.p.crossoverLagFits(), "128.5 samples: not fitting; 128: fitting; "
+       "unload() clears both reports");
+}
+
 } // namespace
 
 int main() {
@@ -1412,6 +1441,8 @@ int main() {
     resetLandsAFadeInFlight();
     stoppedPlaneKeepsTheFadeClock();
     alignmentReachReported();
+    restartLandsTheLatestDelay();
+    alignmentFitsAtTheBoundaryAndUnload();
     seamOnRealCaptures();
     return test::report();
 }
