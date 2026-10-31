@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <tuple>
 #include <string>
@@ -133,6 +134,7 @@ double bellDb(double hz, double q, double gainDb, double f) {
 }
 /** The widest gap between the player's response and the bell, 20 Hz – 20 kHz in 1/12 octave. */
 double gapDb(const std::vector<float>& h, double hz, double q, double gainDb) {
+    for (const float v : h) if (! std::isfinite(v)) return std::numeric_limits<double>::infinity();   // a NaN is no match
     double worst = 0.0;
     for (int k = 0; 20.0 * std::pow(2.0, k / 12.0) < 20000.0; ++k) {
         const double f = 20.0 * std::pow(2.0, k / 12.0);
@@ -299,5 +301,10 @@ int main() {
     switchStatesQ();
     dialHoldsPastTheEnds();
     freqDuringCrossfadeAllocatesNothing();
+    {
+        group("gapDb fails on a non-finite sample");
+        std::vector<float> h(4096, 0.0f); h[0] = 1.0f; h[7] = std::numeric_limits<float>::quiet_NaN();
+        ok(! (gapDb(h, 800.0, 0.9, 0.0) < 0.01), "an impulse response holding a NaN is no match for any bell");
+    }
     return test::report();
 }
