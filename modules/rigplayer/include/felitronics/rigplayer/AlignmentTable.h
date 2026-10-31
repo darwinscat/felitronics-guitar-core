@@ -99,6 +99,18 @@ struct AlignmentTable {
         return std::clamp((int) std::lround((double) delayOf(fileId) * scale), 0, felitronics::nam::kBlendMaxDelay);
     }
 
+    // How LATE this file's output arrives against the stage's FIRST file — its own reading — plus `offset`, how late
+    // that first file arrives against its own DI (which no table holds: every reading here is relative), both in the
+    // table's samples, converted to HOST samples as delayOf converts. An unknown file is the offset alone. Its own lag
+    // plus its delayOf is how late a slot playing it trails the DI: what RigPlayer's crossover holds its clean leg back by.
+    int lagOf(const std::string& fileId, double hostRate, double modelRate, int offset = 0) const {
+        const auto me = lagByFile.find(fileId);
+        const double lag = (double) (me == lagByFile.end() ? 0 : me->second) + (double) offset;
+        const double at = sampleRate > 0.0 ? sampleRate : modelRate;
+        const double scale = (at > 0.0 && hostRate > 0.0) ? hostRate / at : 1.0;
+        return (int) std::lround(lag * scale);
+    }
+
     // THE PACK'S OWN READING. Every distinct file of the stage must carry `lag_samples`, or the stage
     // is not measured and the table is empty: a pair with one side unknown cannot be lined up, and a
     // half-measured table applied as if whole delays some models against nothing.

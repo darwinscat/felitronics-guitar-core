@@ -17,7 +17,7 @@ target_link_libraries(felitronics_rigplayer INTERFACE
 target_compile_features(felitronics_rigplayer INTERFACE cxx_std_20)
 
 if(FELITRONICS_BUILD_TESTS)
-    foreach(t IN ITEMS RigPlayer ModelBlend ModelAlignment BandRamp RigPlayerRtAlloc ScopeStandby)
+    foreach(t IN ITEMS RigPlayer ModelBlend ModelAlignment BandRamp RigPlayerRtAlloc ScopeStandby CrossoverBlend)
         string(TOLOWER "${t}" tl)
         add_executable(felitronics_rigplayer_${tl}_tests tests/${t}Tests.cpp)
         target_link_libraries(felitronics_rigplayer_${tl}_tests PRIVATE felitronics::rigplayer)
@@ -28,5 +28,8 @@ if(FELITRONICS_BUILD_TESTS)
     # The allocation gate plays NAM's A2 packed as a .namz — the shape of every real pack (modules/nam sets the path).
     get_property(_nam_examples GLOBAL PROPERTY FELITRONICS_NAM_EXAMPLE_MODELS_DIR)
     target_compile_definitions(felitronics_rigplayer_rigplayerrtalloc_tests PRIVATE
+        FELITRONICS_NAM_EXAMPLE_MODELS="${_nam_examples}")
+    # …and the crossover blend's bit-identity and seam readings play NAM's own example models as real captures.
+    target_compile_definitions(felitronics_rigplayer_crossoverblend_tests PRIVATE
         FELITRONICS_NAM_EXAMPLE_MODELS="${_nam_examples}")
 endif()
