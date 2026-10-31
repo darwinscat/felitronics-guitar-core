@@ -1243,15 +1243,15 @@ int main() {
             ok(b.p.appliedSlotDelay(0) == 2 && b.p.appliedSlotDelay(1) == 0, "…the early slot delayed, the late one not");
         }
         {
-            // A table that arrives MID-MIX lands at the one instant a slot is free — weight exactly zero —
-            // never as a splice on a live signal. So the comb stands until the dial visits a knot, and is
-            // gone once it has: the host that can measure before playing should.
+            // A table that arrives MID-MIX reaches the captures that are playing — the delay is theirs — through a
+            // 10 ms crossfade of each slot's line, never as a splice on a live signal (it used to wait for a slot to
+            // fall silent, so the comb stood until the dial visited a knot).
             Bench b(r);
             b.files = files;
             b.p.setDial("gain", 150.0);
             approx(b.gainAt(6000.0), std::sqrt(0.5), 0.02, "mid-mix, before the table: the comb");
             b.p.setAlignment(table);
-            approx(b.gainAt(6000.0), std::sqrt(0.5), 0.02, "…and still the comb: neither slot is silent, so nothing lands");
+            approx(b.gainAt(6000.0), 1.0, 0.02, "…and the comb gone: the playing slots crossfade to the table's delays");
             b.p.setDial("gain", 240.0);
             b.gainAt(6000.0);                                  // the top: the early capture leaves its slot at zero
             b.p.setDial("gain", 150.0);

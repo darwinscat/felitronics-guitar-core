@@ -205,7 +205,9 @@ std::vector<double> grid12() {   // 1/12 octave, 20 Hz – 20 kHz
     return f;
 }
 /** The widest excursion from 0 dB over the grid. */
+bool allFinite(const std::vector<float>& h) { for (const float v : h) if (! std::isfinite(v)) return false; return true; }
 double ripple(const std::vector<float>& h, double fs) {
+    if (! allFinite(h)) return std::numeric_limits<double>::infinity();   // a NaN must not read as flat
     double worst = 0.0;
     for (const double f : grid12()) worst = std::max(worst, std::abs(magDb(h, f, fs)));
     return worst;
@@ -447,6 +449,7 @@ void noAllocation() {
 
 /** How far the crossover's response strays from the device's own magnitude, against the device's peak, in dB. */
 double strayDb(const std::vector<float>& on, const std::vector<float>& off, double fs) {
+    if (! allFinite(on) || ! allFinite(off)) return std::numeric_limits<double>::infinity();
     double worst = 0.0, peak = 0.0;
     for (const double f : grid12()) {
         const double m1 = std::pow(10.0, magDb(on, f, fs) / 20.0), m0 = std::pow(10.0, magDb(off, f, fs) / 20.0);
@@ -1199,6 +1202,58 @@ void schema5MixedRatesAndJson() {
     }
 }
 
+
+// ------------------------------------------------------------------------------------ retimes of a playing slot ----
+
+void audibleRetimeCrossfades() {
+    group("a corrected delay reaches a slot that is heard — crossfaded over 10 ms, not held until it falls silent");
+    const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "late", delayModel(37, 1.0), "240", 0 } };
+    Bench off(caps, 48000.0, 150.0, crossover(150.0, 0.0)), on(caps, 48000.0, 150.0, crossover(150.0, 1.0));
+    off.settle(80); on.settle(80);                            // both heard, half and half; the table says both are on time
+    AlignmentTable t; t.reference = "early"; t.lagByFile = { { "early", 0 }, { "late", 37 } };
+    off.p.setAlignment(t); on.p.setAlignment(t);              // …then the late one is read 37 late
+    Reference ref(48000.0, 150.0f);
+    double worst = 0.0;
+    for (int k = 0; k < 80; ++k) {
+        off.settle(1); on.settle(1);
+        double w = 0.0;
+        for (int i = 0; i < kBlock; ++i) w = std::max(w, (double) std::abs(ref(off.y[(std::size_t) i]) - on.y[(std::size_t) i]));
+        if (k >= 40) worst = std::max(worst, w);
+    }
+    ok(on.p.liveMix() > 0.2f && on.p.liveMix() < 0.8f && on.p.appliedSlotDelay(0) == 37 && worst <= 1e-5, "still both heard ("
+       + fmt(on.p.liveMix(), "%.2f") + "): the early slot now held back " + std::to_string(on.p.appliedSlotDelay(0))
+       + ", the crossover within " + fmt(worst, "%.3g") + " of eq::Crossover2");
+}
+
+void retimeWaitsForBothEnds() {
+    group("a slot changing capture is retimed only once it is silent at BOTH ends of a block — no splice on its way out");
+    // early 20 behind, mid on time, late 10 behind: a turn from between mid and late to between early and mid takes
+    // slot 0 from late (delay 10) to early (delay 20), and its weight leaves in one block. Every capture has a 40-sample
+    // field, so the one that lands is fed past its line before it is heard (a capture with no field is heard at once,
+    // its line still empty — the landing's own corner, not this one).
+    auto field = [](int d) {
+        std::string w = "[";
+        for (int i = 0; i < 40; ++i) w += (i == d ? "1.0" : "0.0") + std::string(i < 39 ? "," : "]");
+        return R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":40,"bias":false,"implementation":"direct"},"weights":)"
+               + w + R"(,"sample_rate":48000})";
+    };
+    const std::vector<Cap> caps { { "early", field(0), "60", 0 }, { "mid", field(20), "150", 20 }, { "late", field(10), "240", 10 } };
+    Bench b(caps, 48000.0, 172.5, crossover(150.0, 0.0));
+    for (int k = 0; k < 120; ++k) b.block([](long) { return 0.5f; });
+    (void) b.p.setDial("gain", 140.0);
+    double low = 1.0;
+    for (int k = 0; k < 60; ++k) { b.block([](long) { return 0.5f; }); for (const float v : b.y) low = std::min(low, (double) v); }
+    ok(low >= 0.4999, "a constant 0.5 through the turn: the lowest sample " + fmt(low, "%.6f"));
+}
+
+void settledChecksSeeNaN() {
+    group("the settled-response helpers fail on a non-finite sample rather than reading it as flat");
+    std::vector<float> h(4096, 0.0f); h[0] = 1.0f; h[100] = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> clean(4096, 0.0f); clean[0] = 1.0f;
+    ok(! (ripple(h, 48000.0) <= 0.1) && ! (strayDb(h, clean, 48000.0) < -60.0) && ripple(clean, 48000.0) <= 0.1,
+       "an impulse response holding a NaN is not flat, and does not match");
+}
+
 } // namespace
 
 int main() {
@@ -1238,6 +1293,9 @@ int main() {
     rebaseSaturates();
     schema5Readings();
     schema5MixedRatesAndJson();
+    audibleRetimeCrossfades();
+    retimeWaitsForBothEnds();
+    settledChecksSeeNaN();
     seamOnRealCaptures();
     return test::report();
 }
