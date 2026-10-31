@@ -26,7 +26,7 @@ Signal order, per block:
 |---|---|
 | `prepare(rate, maxBlock, channels ≤ 2, scopeSamples = 2048)` | message, never while `process()` runs |
 | `load(rig, source)` / `unload()` | message |
-| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setPreload` / `setPreloadIdle` / `setStandby` / `setFeedDb` / `setCrossoverHz` / `setCrossoverAmount` / `setCrossoverInvert` / `setCrossoverLag` / `setCrossoverCleanDb` | message |
+| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setPreload` / `setPreloadIdle` / `setStandby` / `setFeedDb` / `setCrossoverHz` / `setCrossoverAmount` / `setCrossoverInvert` / `setCrossoverLag` / `setCrossoverReferenceLag` / `setCrossoverCleanDb` | message |
 | `service()` then `takeLoadJob()` | message, from a timer — a few times a second at least |
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
@@ -217,21 +217,30 @@ player says when; `CrossoverBlend.h` holds the mechanism (ring, taps, mirrored l
 
 - `setCrossoverHz(hz)` — 20 … 2000 Hz (clamped), 150 by default; `setCrossoverAmount(a)` — 0 … 1, 0 by default;
   `setCrossoverCleanDb(db)` — the clean leg's level, ±24 dB, 0 by default; `setCrossoverInvert(on)`;
-  `setCrossoverLag(samples)` — a trim, below. A non-finite value is refused (false). Message thread; the four settings
-  are kept across `load()` and `unload()`. `crossoverRunning()` (any thread) says whether it runs — false while parked.
+  `setCrossoverLag(samples)` — the host trim, and `setCrossoverReferenceLag(samples)` — the pack's reference offset,
+  below. A non-finite value is refused (false). Message thread; all but the reference offset are the bench's and kept
+  across `load()` and `unload()`. `crossoverRunning()` (any thread) says whether it runs — false while parked, from
+  `prepare()` and `reset()` in stand-by too.
 - **Amount 0 is the player without it** — checked byte for byte against the player before the feature (NAM's A2 beside
   a Linear capture, 48 and 44.1 kHz, a dial walk, narrow calls, a park) — and costs one atomic load a block. Turning it
-  up fades the pair in at 1 Hz, where its all-pass is a wire across the audible band, then sweeps it up to the
-  frequency; turning it to 0 sweeps down, fades out and stops. (A crossfade against the pair at its working frequency
-  would null there: −12.4 dB through the switch on a 150 Hz tone; the sweep leaves −0.98 dB, the moving pair's own.)
+  up fades the pair in at 1 Hz, where its all-pass is a wire across the audible band, then — once that fade is 95 % in,
+  about 30 ms — sweeps it up to the frequency (within 1 % about 46 ms later); turning it to 0 sweeps down, fades out
+  and stops once the fade is below −180 dB. A crossfade against the pair at its working frequency would null there
+  (−12.4 dB through the switch on a 150 Hz tone). THE TRUE BOUND of the sweep, over 8 phases × tones 40/55/80/150/300 Hz
+  × crossovers 80/150/250 Hz: the quietest period of the tone dips −3.03 dB switching on (a 55 Hz tone at an 80 Hz
+  crossover — the pair swept up through the tone) and −0.49 dB switching off; a 20 ms sweep or waiting for 99.9 % did
+  no better. A one-time switch transient.
   The amount, the frequency, the clean level and the polarity glide (10 ms); a lag crossfades its tap (10 ms), and a
   second lag asked mid-fade waits for the first.
 - **One pair splits both sides**: core's `eq::Crossover2` (two Butterworth SVFs a side, a 4th-order Linkwitz–Riley).
   A device that is a wire sums to that pair's all-pass: flat within 0.000002 dB at 80, 150 and 250 Hz; with captures
-  that trail by `lag_samples` the output equals `eq::Crossover2` run on the player without it, bit for bit, through
-  crossfades, retimes, one-model dips and a table handed in while playing. The clean leg is the dry copy (the input at
-  the pack's input level and the feed, before the pre tone) held back by the rate-match and each slot's capture lag and
-  alignment delay; it sits after the blend knob and before the pack's output level, so that level rides both bands.
+  that trail by `lag_samples` the output equals `eq::Crossover2` run on the player without it — bit for bit at amount
+  1, within 1e-6 at a fractional amount (the low half's input is then `(1 − a)·device + a·clean`, a rounded sum) —
+  through crossfades, retimes, one-model dips, a table handed in while playing and a walk across an inverting capture.
+  The clean leg is the dry copy (the input at the pack's input level and the feed, before the pre tone) held back by
+  the rate-match and each slot's capture lag and alignment delay; it takes neither tone (pre nor post — the device's
+  tone near the seam is the device's), and sits after the blend knob and before the pack's output level, so that level
+  rides both bands.
 - **The pack's blend knob** is part of the device, so its dry part is part of the clean leg too, with the knob's own
   ramps: fully dry, half and fully wet, the sum keeps the device's magnitude within −131 dB of its peak.
 - **A plane the host stops** (a zero-width call, stereo → mono) leaves nothing: its lines, its ring and the pair's memory
@@ -240,21 +249,29 @@ player says when; `CrossoverBlend.h` holds the mechanism (ring, taps, mirrored l
 What the player reads per capture, and what the host decides:
 
 - **Each capture's lag and polarity** come from the alignment table (`AlignmentTable`): its `absoluteLagByFile` reading
-  (how late against its DI) when it has one, else its relative `lagByFile` reading plus the trim; and `invertedByFile`,
-  applied to that capture's slot alone. No pack carries the absolute readings yet — `AlignmentTable::fromDevice` is
-  where they plug in, and nothing else changes. `setCrossoverInvert(true)` inverts every slot on top (the host's word
-  for captures nothing has read): a device that inverts notches the sum at the crossover (−132 dB at 150 Hz on an
-  inverting wire) where the bands should meet.
-- **`setCrossoverLag` is a trim**, in the table's samples, 0 by default. With relative readings — every pack today —
-  it says how late the table's reference (`crossoverLagReference()`: the pack's first file, or the first that loaded
-  when measured) trails its DI; a host can measure that as `measureAlignment` does, the probe through the file against
-  the probe itself. The trim belongs to that reference: a table counted from another file rebases it (or drops it to 0
-  when it cannot). It is refused if it would put a capture before its DI or past the clean leg's reach — a TIME,
-  2048 samples at 48 kHz, sized for the host rate — and `crossoverLagFits()` turns false when a later table or rate
-  does that. At bass frequencies a few samples hardly matter (5 samples are 5.6° at 150 Hz); tens do.
+  (how late against its DI) when it has one, else its relative `lagByFile` reading plus the reference offset; then the
+  host trim on every capture. An absolute reading never takes the reference offset. `invertedByFile` inverts that
+  capture's slot alone, and a capture's polarity and clean level LAND with it (a landing, a silent slot); only an edit
+  to a capture that is heard glides. `setCrossoverInvert(true)` inverts every slot on top — the host's word for
+  captures nothing has read: an inverting device notches the sum at the crossover (−132 dB at 150 Hz on an inverting
+  wire) where the bands should meet. No pack carries the per-capture readings yet: namz 5.0.0's
+  `files[].input_lag_samples` and `files[].polarity` plug in at the marked line of `AlignmentTable::fromDevice`
+  (`absoluteLagByFile` / `invertedByFile`), and nothing else changes.
+- **`setCrossoverReferenceLag(offset)`** says how late the table's reference (`crossoverLagReference()`: the pack's
+  first file, or the first that loaded when measured) trails its DI — the relative readings' missing number; a host
+  can measure it as `measureAlignment` does, the probe through the file against the probe itself. It is the PACK's: kept
+  when the same stamped rig (`rigId`) is loaded again, dropped to 0 by any other load (an unstamped pack cannot be told
+  from another with the same file names and lags), rebased by a table counted from another reference in the same
+  samples when it still reads the old one, else dropped; a table in other samples drops it too — a measured table
+  (its probe's rate) and a pack's (the models' rate, 0) count as different even when the models are 48 kHz. Set with
+  nothing loaded, it is the next pack's. **`setCrossoverLag(trim)`** is the bench's trim on every capture.
+  Both are refused if they would put a capture before its DI or past the clean leg's reach — a TIME, 2048 samples at
+  48 kHz, sized for the host rate — and `crossoverLagFits()` turns false when a later table or rate does that. At
+  bass frequencies a few samples hardly matter (5 samples are 5.6° at 150 Hz); tens do.
 - **The clean level.** `measureLowBandGainDb(bytes, hz)` reads, offline, what a capture does to its low end against
   the probe (its gain below `hz`); proposed as `setCrossoverCleanDb`, the amount then trades the low end instead of
-  also turning it up or down (a gain-4 capture: −12.0 dB of 30 Hz swing at 0 dB, 0.000 at its reading). Not an AGC.
+  also turning it up or down (a gain-4 capture: −12.0 dB of 30 Hz swing at 0 dB, 0.000 at its reading). It calibrates
+  the captures' part of the clean leg only — the pack's dry part joins after it (a fully dry pack: 0.000 dB). Not an AGC.
 - **The device's own phase near the seam** (coupling caps, a tone stack) is in the capture and no setting moves it. The
   suite prints it for NAM's example models (and any capture named in `FELITRONICS_GUITAR_CROSSOVER_CAPTURES`).
 - Not handled here, as for the blend knob's dry path: the rate-match delay is one number for both slots, so two

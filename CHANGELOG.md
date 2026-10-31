@@ -6,17 +6,20 @@
 
 ### Added
 - **rigplayer: the crossover blend — a bass amp's clean low end.** `RigPlayer::setCrossoverHz` / `setCrossoverAmount` /
-  `setCrossoverCleanDb` / `setCrossoverInvert` / `setCrossoverLag`: below the frequency the output carries the clean
+  `setCrossoverCleanDb` / `setCrossoverInvert` / `setCrossoverLag` / `setCrossoverReferenceLag`: below the frequency the output carries the clean
   input, above it the device, `HP4(device) + LP4((1 − amount) · device + amount · clean)`, split by core's
   `eq::Crossover2` pair (4th-order Linkwitz–Riley) on both sides; the mechanism is `rigplayer/CrossoverBlend.h`, and
   `mixSlots` is now the one spelling of how the law mixes two slots, for the models and the clean leg alike. The clean
   leg is held back by what the device carries — the rate-match, each capture's lag and polarity and its slot's
   alignment delay through mirrored lines — and carries the pack blend knob's dry part as the device does: a wire sums
-  flat (±0.000002 dB at 80/150/250 Hz, with captures 5 and 37 samples late too), pure-delay captures null bit for bit
-  against `eq::Crossover2` on the player without it (crossfades, one-model dips, a table handed in while playing), the
-  blend knob dry, half and wet keeps the device's magnitude within −131 dB of its peak. Switching on fades the pair in
-  at 1 Hz and sweeps it up (−0.98 dB at the seam through the switch, where a plain crossfade read −12.4). A stopped plane
-  and `unload()` leave nothing of it. Amount 0 is the player without it, byte for byte against the player before it
+  flat (±0.000002 dB at 80/150/250 Hz, with captures 5 and 37 samples late too), pure-delay captures null against
+  `eq::Crossover2` on the player without it — bit for bit at amount 1, within 1e-6 at 0.3 — through crossfades,
+  one-model dips, a table handed in while playing and an inverting capture; the blend knob dry, half and wet keeps the
+  device's magnitude within −131 dB of its peak. Switching on fades the pair in at 1 Hz and sweeps it up: the worst
+  dip of a tone through the switch is −3.03 dB over 8 phases × 5 tones × 3 crossovers (a plain crossfade read −12.4 at
+  one). A stopped plane and `unload()` leave nothing of it. A capture's lag is its absolute reading, or its relative
+  one plus the pack's reference offset (bound to the pack: its `rigId`, else that load), plus the bench's trim; its
+  polarity and the clean level (captures' part only) land with it. Amount 0 is the player without it, byte for byte against the player before it
   (NAM's A2, 48 and 44.1 kHz, a dial walk, narrow calls, a park), and costs one atomic load a block.
   `AlignmentTable` names its `reference` and can carry each capture's `absoluteLagByFile` / `invertedByFile` (filled
   by nothing yet); `lagOf` reads a file's lag in host samples; `measureLowBandGainDb` reads a capture's low-band gain
