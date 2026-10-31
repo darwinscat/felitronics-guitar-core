@@ -9,7 +9,7 @@ Signal order, per block:
 
     in → dry copy → pre tone (bands, curve) → chain trim → ┬→ trim A → model A → align ─┐
                                                            └→ trim B → model B → align ─┴→ mix
-       → post tone (bands, curve) → dry/wet blend → out
+       → post tone (bands, curve) → dry/wet blend → crossover blend → out
 
 - WHICH files sound is `namz::rig`'s policy (a turned control is law) joined to `pickBlend` along
   the gain dial — `RigSelection.h`, pure.
@@ -26,7 +26,7 @@ Signal order, per block:
 |---|---|
 | `prepare(rate, maxBlock, channels ≤ 2, scopeSamples = 2048)` | message, never while `process()` runs |
 | `load(rig, source)` / `unload()` | message |
-| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setPreload` / `setPreloadIdle` / `setStandby` / `setFeedDb` | message |
+| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` / `setMaxModels` / `setPreload` / `setPreloadIdle` / `setStandby` / `setFeedDb` / `setCrossoverHz` / `setCrossoverAmount` / `setCrossoverInvert` / `setCrossoverLag` | message |
 | `service()` then `takeLoadJob()` | message, from a timer — a few times a second at least |
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
@@ -204,6 +204,49 @@ when PARK came (0.399 out of digital silence on a 1500-sample capture, measured)
 11c): when the fade ends the filters, convolvers, the dry ring and the slot delay lines are stopped (`clearAudioState`,
 not a restart), and both stages get the width-zero call every stood-by block — each drains what it owes once, as a
 cold slot does, and costs nothing after.
+
+## The crossover blend — a bass amp's clean low end
+
+The host's setting, not the pack's: below a frequency the output carries the CLEAN input, above it the device — the low
+end stays clean, only the top is driven. Nothing in the pack format, `rig.json` or namz is read or written for it.
+
+    out = HP4(device) + LP4((1 − amount) · device + amount · ±clean)
+
+- `setCrossoverHz(hz)` — 20 … 2000 Hz (clamped), 150 by default; `setCrossoverAmount(a)` — 0 … 1 (clamped), 0 by
+  default; `setCrossoverInvert(on)`; `setCrossoverLag(samples)`. A non-finite value is refused (false). Message thread;
+  kept across `load()` and `unload()`. `crossoverRunning()` (any thread) says whether it runs.
+- **Amount 0 is the player without it, bit for bit, and costs one atomic load a block.** Leaving 0 fades the split in
+  over ~10 ms; returning to 0 glides it out, and once every glide has arrived it stops. The amount, the frequency, the
+  polarity and the lag all glide — no step larger than the settled sound's own.
+- **One pair splits both sides**: core's `eq::Crossover2` (two Butterworth SVFs a side, a 4th-order Linkwitz–Riley) —
+  the low half on the clean leg, the high half on the device. A device that is a wire sums to that pair's all-pass:
+  flat within 0.000002 dB at 80, 150 and 250 Hz.
+- **The clean leg is the dry copy** — the input at the pack's input level (and the host's, the feed), before the pre
+  tone — **held back by what the device's output carries**: the rate-match (`latencySamples()`), then per slot the
+  capture's own lag (its `lag_samples`, plus `setCrossoverLag`) and the slot's alignment delay, through lines that
+  mirror the slots' own; the two taps are mixed by the law's weight and gain as the models are. So the bands meet in
+  time while two captures blend, through a one-model dip, across a landing or a retime: with pure-delay captures the
+  output equals `eq::Crossover2` run on the player without it, bit for bit. A capture's lag that changes while it is
+  heard (a table handed in, `setCrossoverLag`) crossfades the tap over 10 ms. It sits after the blend knob and before
+  the pack's output level, so that level rides both bands.
+
+What the player cannot know, and the host decides:
+
+- **How late the stage's FIRST file trails its DI.** `lag_samples` is relative to that file (NAMZ-FORMAT.md), so the
+  player knows how far the captures stand apart, not how far the first one trails the guitar: `setCrossoverLag` says
+  it, in the samples `lag_samples` is written in (0 = on time). A host can measure it as `measureAlignment` does — the
+  alignment probe through the file, `bestLag` against the probe itself. At bass frequencies a few samples hardly
+  matter (5 samples are 5.6° at 150 Hz, 0.014 dB); tens do.
+- **Polarity.** A device that inverts puts its low band against the clean one, and the sum notches at the crossover
+  (−132 dB at 150 Hz on an inverting wire) instead of meeting; `setCrossoverInvert(true)` sums it flat again. Decide it
+  from the device's phase near the crossover against the clean leg as held back — a quiet sine at the crossover
+  through the device, its phase against the input delayed by the lag: beyond ±90° invert. Or by ear: the setting with
+  more low end at the seam.
+- **The device's own phase near the seam** (coupling caps, a tone stack) is in the capture and no setting moves it. The
+  suite prints it for NAM's example models (`felitronics_rigplayer_crossoverblend_tests`, and for any capture named in
+  `FELITRONICS_GUITAR_CROSSOVER_CAPTURES`): how deep the sum dips against the two bands added in phase.
+- **The level of the clean band against the device's.** The clean leg is the dry at the pack's input level; a
+  capture's level (its gain, its loudness tag under `setNormalize`) is the device's. Nothing matches them.
 
 ## What a host must do
 

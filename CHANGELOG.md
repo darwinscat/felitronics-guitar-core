@@ -2,6 +2,20 @@
 
 # Changelog
 
+## Unreleased
+
+### Added
+- **rigplayer: the crossover blend — a bass amp's clean low end.** `RigPlayer::setCrossoverHz` / `setCrossoverAmount` /
+  `setCrossoverInvert` / `setCrossoverLag`: below the frequency the output carries the clean input, above it the device,
+  `HP4(device) + LP4((1 − amount) · device + amount · ±clean)`, split by core's `eq::Crossover2` pair (4th-order
+  Linkwitz–Riley) on both sides. The clean leg is held back by what the device carries — the rate-match, each slot's
+  capture lag and alignment delay through lines that mirror the slots', mixed by the law's weight and gain — so a wire
+  sums flat (±0.000002 dB at 80/150/250 Hz, with captures 5 and 37 samples late too) and pure-delay captures null
+  bit for bit against `eq::Crossover2` on the player without it, through crossfades, one-model dips and a table handed
+  in while playing. Amount 0 is the player without it, bit for bit (checked against the player before it on NAM's A2,
+  48 and 44.1 kHz, a dial walk, narrow calls, a park), and costs one atomic load a block; everything glides. A host setting: no pack field.
+  `AlignmentTable::lagOf` reads a file's own lag in host samples.
+
 ## v0.7.1 — 2026-10-21
 
 The echo and the room no longer click when they stand by — felitronics-core pinned to v0.61.2.
