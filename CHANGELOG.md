@@ -16,7 +16,13 @@ namz v5.0.0 — the `.orbitrig` schema 5 — played; schema-4 packs load and pla
   its line (`SlotLine`, which keeps its last 128 samples; for a delay that holds, its samples are `nam::blendDelay`'s,
   checked byte for byte) — it used to wait until the slot fell silent, so the comb stood until the dial visited a knot.
   A slot changing capture is retimed only once it is silent at BOTH ends of a block: a constant 0.5 through such a turn
-  read 0.376 (a quarter of the sound spliced to zeros) and reads 0.5 now. The rest of the player is unchanged.
+  read 0.376 (a quarter of the sound spliced to zeros) and reads 0.5 now. The move is the SLOT's: one delay and one
+  fade clock for every plane, run on audio time, so a plane the host stops and hands back finds the fade where the
+  others have it; a delay asked mid-fade waits for the fade under way; `reset()` lands a fade in flight; the staged
+  delay is published together with the capture it belongs to, so an edit between the request and the delay cannot
+  retime the capture still playing. `SlotLine` nulls `nam::blendDelay` bit for bit over 366150 samples (delays 0 … 128,
+  blocks of 1 … 300). `RigPlayer::alignmentFits()` reports a table or rate that asks a slot for more than its 128-sample
+  reach (the line holds it at 128). The rest of the player is unchanged.
 
 ### Added
 - **rigplayer: the frequency knob.** A band whose `hz_by` names a knob takes its frequency — and its Q, where that knob
