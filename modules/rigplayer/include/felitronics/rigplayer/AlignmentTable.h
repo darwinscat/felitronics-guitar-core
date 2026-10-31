@@ -84,9 +84,9 @@ struct AlignmentTable {
     // stage's first file"), or the first whose bytes loaded when measured. One definition, carried with the numbers.
     std::string reference;
     // A capture's OWN reading, when something measured it against its DI: how late its output arrives (in the table's
-    // samples) and whether it hands its input back inverted. Empty today — no pack carries them yet; when one does,
-    // fromDevice fills these two from its files and nothing downstream changes. lagOf prefers the absolute lag to the
-    // relative one plus the reference's offset; RigPlayer applies the polarity per slot.
+    // samples) and whether it hands its input back inverted — namz 5's `input_lag_samples` and `polarity`, which
+    // fromDevice reads, or a host's measurement. lagOf prefers the absolute lag to the relative one plus the reference's
+    // offset; RigPlayer applies the polarity per slot.
     std::map<std::string, int>  absoluteLagByFile;
     std::map<std::string, bool> invertedByFile;
 
@@ -129,24 +129,39 @@ struct AlignmentTable {
         return host >= hi ? std::numeric_limits<int>::max() : host <= lo ? std::numeric_limits<int>::min() : (int) std::lround(host);
     }
 
-    // THE PACK'S OWN READING. Every distinct file of the stage must carry `lag_samples`, or the stage
-    // is not measured and the table is empty: a pair with one side unknown cannot be lined up, and a
-    // half-measured table applied as if whole delays some models against nothing.
+    // THE PACK'S OWN READINGS. The relative table needs every distinct file measured — a pair with one side unknown
+    // cannot be lined up, and a half-measured table applied as if whole delays some models against nothing — from
+    // `lag_samples`, or derived from `input_lag_samples` when every file has that instead (namz 5). A file's absolute
+    // lag and polarity are read wherever stated. Nothing stated at all: the table is empty.
     static AlignmentTable fromDevice(const namz::rig::Device& d) {
         AlignmentTable out;
         out.fromPack = true;
+        // namz 5's per-capture readings FIRST, in the file's own rate as `lag_samples` is: `input_lag_samples` (how late
+        // the model's output arrives against its own DI) and `polarity` (-1: it hands its input back inverted). Not
+        // stated = not measured: such a file has no absolute reading and plays by its relative one.
+        bool allRelative = true, allAbsolute = true;
         for (const auto& f : d.files) {
             if (f.id.empty()) continue;
-            if (! f.lagSamples) return AlignmentTable {};
             if (out.reference.empty()) out.reference = f.id;
-            out.lagByFile[f.id] = *f.lagSamples;
-            // ← namz 5.0.0's per-file readings plug in here, in the file's own rate as `lag_samples` is. NOTE for that
-            //   wiring: this loop returns an empty table at the first file WITHOUT `lag_samples`, before reaching this
-            //   line — read the absolute readings first, and when the relative ones are absent derive `lagByFile` from
-            //   them (each file's absolute lag minus the reference's), so a pack carrying only the new fields is aligned.
-            //   if (f.inputLagSamples) out.absoluteLagByFile[f.id] = *f.inputLagSamples;   // `input_lag_samples`
-            //   if (f.polarity == -1)  out.invertedByFile[f.id] = true;                       // `polarity`
+            if (f.inputLagSamples) out.absoluteLagByFile[f.id] = *f.inputLagSamples;
+            if (f.polarity && *f.polarity == -1) out.invertedByFile[f.id] = true;
+            allRelative = allRelative && f.lagSamples.has_value();
+            allAbsolute = allAbsolute && f.inputLagSamples.has_value();
         }
+        // The relative table: the pack's own `lag_samples` when every file states one (schema 4, and 5 with both); else,
+        // when every file states its absolute lag, derived from those — each against the reference's — so a pack that
+        // carries only the new readings is aligned as well. Neither whole: no relative table, as before.
+        if (allRelative) {
+            for (const auto& f : d.files) if (! f.id.empty()) out.lagByFile[f.id] = *f.lagSamples;
+        } else if (allAbsolute && ! out.reference.empty()) {
+            const long long ref = out.absoluteLagByFile[out.reference];
+            for (const auto& [id, lag] : out.absoluteLagByFile) {
+                const long long rel = (long long) lag - ref;
+                if (rel < std::numeric_limits<int>::min() || rel > std::numeric_limits<int>::max()) { out.lagByFile.clear(); break; }
+                out.lagByFile[id] = (int) rel;
+            }
+        }
+        if (out.lagByFile.empty() && out.absoluteLagByFile.empty() && out.invertedByFile.empty()) return AlignmentTable {};
         return out;
     }
 };

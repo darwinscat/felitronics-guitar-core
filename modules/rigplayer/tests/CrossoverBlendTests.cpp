@@ -1116,6 +1116,45 @@ void rebaseSaturates() {
     ok(p.crossoverReferenceLag() == 0, "-2 rebased by a reference INT_MAX away: dropped (" + std::to_string(p.crossoverReferenceLag()) + ")");
 }
 
+
+// ------------------------------------------------------------------------------------- namz 5: per-capture readings ----
+
+namz::rig::Rig schema5(const std::vector<Cap>& caps, std::vector<std::optional<int>> inputLag, std::vector<std::optional<int>> polarity) {
+    auto r = rigOf(caps);
+    for (std::size_t i = 0; i < caps.size(); ++i) {
+        r.chain[0].device.files[i].inputLagSamples = inputLag[i];
+        r.chain[0].device.files[i].polarity = polarity[i];
+    }
+    return r;
+}
+
+void schema5Readings() {
+    group("namz 5's per-capture readings: input_lag_samples and polarity, read into the alignment table");
+    const std::vector<Cap> rel { { "a", "", "60", 0 }, { "b", "", "240", 40 } };
+    const std::vector<Cap> none { { "a", "", "60", std::nullopt }, { "b", "", "240", std::nullopt } };
+    const auto onlyAbs = AlignmentTable::fromDevice(schema5(none, { 160, 200 }, { 1, -1 }).chain[0].device);
+    const auto onlyRel = AlignmentTable::fromDevice(schema5(rel, { std::nullopt, std::nullopt }, { std::nullopt, std::nullopt }).chain[0].device);
+    const auto both    = AlignmentTable::fromDevice(schema5(rel, { 160, 200 }, { 1, -1 }).chain[0].device);
+    const std::map<std::string, int> relLags { { "a", 0 }, { "b", 40 } }, absLags { { "a", 160 }, { "b", 200 } };
+    const std::map<std::string, bool> inv { { "b", true } };
+    ok(onlyAbs.lagByFile == relLags && onlyAbs.absoluteLagByFile == absLags && onlyAbs.invertedByFile == inv
+       && onlyAbs.reference == "a", "only absolute readings: the relative table derived from them (b 40 after a), b inverted");
+    ok(onlyRel.lagByFile == relLags && onlyRel.absoluteLagByFile.empty() && onlyRel.invertedByFile.empty(),
+       "only relative readings: as schema 4");
+    ok(both.lagByFile == relLags && both.absoluteLagByFile == absLags && both.invertedByFile == inv, "both: both");
+    // A pack carrying only the new readings, played: a plain capture 160 samples late, an inverting one 200 late.
+    const std::vector<Cap> caps { { "a", delayModel(160, 1.0), "60", std::nullopt }, { "b", delayModel(200, -1.0), "240", std::nullopt } };
+    for (const double dial : { 60.0, 240.0 }) {
+        Bench b(caps, 48000.0, dial, crossover(150.0, 1.0));
+        b.p.load(schema5(caps, { 160, 200 }, { 1, -1 }), [&b](const std::string& id) { return b.files.at(id); });
+        (void) b.p.setDial("gain", dial);
+        b.settle(80);
+        const double r = ripple(impulseResponse(b, 32768), 48000.0);
+        ok(r <= 0.1, "only absolute readings, dial at " + fmt(dial, "%.0f") + (dial == 60.0 ? " (160 late)" : " (inverting, 200 late)")
+           + ": " + fmt(r, "%.6f") + " dB");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1153,6 +1192,7 @@ int main() {
     recapturedRigDropsTheOffset();
     mutedSnapReachesTheLine();
     rebaseSaturates();
+    schema5Readings();
     seamOnRealCaptures();
     return test::report();
 }
