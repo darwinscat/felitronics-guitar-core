@@ -86,6 +86,7 @@ namz::rig::Rig rigOf(const std::vector<Cap>& caps, bool tone = false, bool blend
     namz::rig::Rig r;
     namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam"; st.slot = "pedal";
     namz::rig::Control g; g.name = "gain"; g.role = namz::rig::Role::Gain; g.sweep = 300;
+    for (const auto& c : caps) g.sweep = std::max(g.sweep, std::atoi(c.at.c_str()));
     for (const auto& c : caps) {
         g.values.push_back(c.at);
         namz::rig::FileEntry fe; fe.id = c.id; fe.settings = { { "gain", c.at } }; fe.lagSamples = c.lag;
@@ -239,8 +240,8 @@ void amountZeroIsThePlayer() {
     ok(! set.p.crossoverRunning() && same == total, "frequency 80, inverted, lag 7, amount 0: " + std::to_string(same)
        + " of " + std::to_string(total) + " samples identical, and nothing runs");
     ok(ranWhileUp && during > 10000, "precondition: amount 0.8 changes the sound (" + std::to_string(during) + " samples differ)");
-    ok(stopped && after > 40000 && sameAfter == after, "back to 0: stopped, then " + std::to_string(sameAfter) + " of "
-       + std::to_string(after) + " samples identical to the player that never had it");
+    ok(stopped && after > 40000 && sameAfter == after, "back to 0: it STOPS (nothing of it runs), and from then on "
+       + std::to_string(sameAfter) + " of " + std::to_string(after) + " samples match the player that never had it");
 }
 
 void wireSumsFlat() {
@@ -319,7 +320,7 @@ void cleanLegIsTheModelsMix(int maxModels) {
     ok(held.size() >= 3 && (between || maxModels == 1), "precondition: the walk moved the slots (" + std::to_string(held.size())
        + " pairs held)" + (maxModels == 1 ? "" : ", and sounded both"));
     ok(unknown > 0.01, "precondition: with no reading the clean leg is 37 samples early (" + fmt(unknown, "%.4f") + " off)");
-    ok(known <= 1e-5 && on.p.crossoverRunning(), "the table handed in, then a walk across both captures (" + std::string(maxModels == 1
+    ok(known == 0.0 && on.p.crossoverRunning(), "the table handed in, then a walk across both captures (" + std::string(maxModels == 1
        ? "dips" : "crossfades, retimes") + "): within " + fmt(known, "%.3g") + " of eq::Crossover2 on the player without it");
 }
 
@@ -431,6 +432,104 @@ void noAllocation() {
     }
     ok(ran && stopped, "precondition: it ran, and stopped once back at 0");
     test::okNoAlloc(seen == 0, "600 blocks allocate nothing (" + std::to_string(seen) + ")");
+}
+
+
+/** How far the crossover's response strays from the device's own magnitude, against the device's peak, in dB. */
+double strayDb(const std::vector<float>& on, const std::vector<float>& off, double fs) {
+    double worst = 0.0, peak = 0.0;
+    for (const double f : grid12()) {
+        const double m1 = std::pow(10.0, magDb(on, f, fs) / 20.0), m0 = std::pow(10.0, magDb(off, f, fs) / 20.0);
+        worst = std::max(worst, std::abs(m1 - m0)); peak = std::max(peak, m0);
+    }
+    return 20.0 * std::log10(std::max(worst, 1e-30) / peak);
+}
+
+void packBlendKnob() {
+    group("the pack's own blend knob: the clean leg follows the composite — the models' part and the pack's dry part");
+    // A capture 160 samples late (setCrossoverLag says so), and the pack's blend knob at its dry end and half way.
+    const std::vector<Cap> caps { { "early", delayModel(160, 1.0), "60", 0 }, { "late", delayModel(160, 1.0), "240", 0 } };
+    for (const double mix : { 0.0, 150.0, 300.0 }) {
+        Bench off(caps, 48000.0, 60.0, crossover(150.0, 0.0, false, 160), false, true);
+        Bench on(caps, 48000.0, 60.0, crossover(150.0, 1.0, false, 160), false, true);
+        (void) off.p.setDial("mix", mix); (void) on.p.setDial("mix", mix);
+        off.settle(80); on.settle(80);
+        const double stray = strayDb(impulseResponse(on, 32768), impulseResponse(off, 32768), 48000.0);
+        ok(stray < -60.0, std::string("blend knob at ") + fmt(mix, "%.0f") + (mix == 0.0 ? " (fully dry)" : mix == 150.0 ? " (half)"
+           : " (fully wet)") + ": the sum strays from the device's magnitude by " + fmt(stray, "%.1f") + " dB of its peak");
+    }
+}
+
+/** A stereo player for the plane tests: identity captures, the crossover snapped on at `hz`. */
+struct Stereo {
+    RigPlayer p;
+    std::map<std::string, std::vector<std::byte>> files;
+    std::vector<float> l = std::vector<float>(kBlock), r = std::vector<float>(kBlock);
+    explicit Stereo(double hz) {
+        crossover(hz, 1.0)(p);
+        test::run(p.prepare(48000.0, kBlock, 2));
+        p.setNormalize(false);
+        const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "late", gainModel(1.0), "240", 0 } };
+        for (const auto& c : caps) files[c.id] = bytesOf(c.model);
+        p.load(rigOf(caps), [this](const std::string& id) { return files.at(id); });
+        (void) p.setDial("gain", 60.0);
+    }
+    /** One block at `width` planes, every sample `v`; the peak of the planes handed back. */
+    double block(int width, float v, int n = kBlock) {
+        std::fill(l.begin(), l.end(), v); std::fill(r.begin(), r.end(), v);
+        float* io[2] { l.data(), r.data() };
+        test::run(p.process(io, width, n));
+        p.serviceHere();
+        double peak = 0.0;
+        for (int i = 0; i < n; ++i) for (int c = 0; c < width; ++c) peak = std::max(peak, (double) std::abs(io[c][i]));
+        return peak;
+    }
+};
+
+void stoppedPlanes() {
+    group("a plane the host stops leaves no crossover memory behind it — 20 Hz, a short gap");
+    {
+        Stereo s(20.0);
+        for (int k = 0; k < 200; ++k) (void) s.block(2, 0.5f);
+        (void) s.block(0, 0.0f, 64);                          // a zero-width stretch of 64 samples
+        double peak = 0.0;
+        for (int k = 0; k < 20; ++k) peak = std::max(peak, s.block(2, 0.0f));
+        ok(peak <= 1e-6, "0.5 held, a 64-sample zero-width gap, then digital silence: peak " + fmt(peak, "%.3g"));
+    }
+    {
+        Stereo s(20.0);
+        for (int k = 0; k < 200; ++k) (void) s.block(2, 0.5f);
+        (void) s.block(1, 0.5f, 64);                          // the right plane stops for 64 samples…
+        std::fill(s.l.begin(), s.l.end(), 0.5f); std::fill(s.r.begin(), s.r.end(), 0.0f);
+        double peak = 0.0;
+        for (int k = 0; k < 20; ++k) {                         // …and comes back silent while the left plays on
+            std::fill(s.l.begin(), s.l.end(), 0.5f); std::fill(s.r.begin(), s.r.end(), 0.0f);
+            float* io[2] { s.l.data(), s.r.data() };
+            test::run(s.p.process(io, 2, kBlock));
+            for (const float v : s.r) peak = std::max(peak, (double) std::abs(v));
+        }
+        ok(peak <= 1e-6, "stereo -> mono for 64 samples -> stereo, the returning plane silent: peak " + fmt(peak, "%.3g"));
+    }
+}
+
+void unloadIsSilence() {
+    group("unload: nothing of the outgoing crossover is heard — not after it, not under the next load");
+    Bench b({ { "early", gainModel(1.0), "60", 0 }, { "late", gainModel(1.0), "240", 0 } }, 48000.0, 60.0, crossover(150.0, 1.0));
+    for (int k = 0; k < 100; ++k) b.block([](long) { return 0.5f; });
+    b.p.unload();
+    double after = 0.0;
+    for (int k = 0; k < 10; ++k) { b.block([](long) { return 0.0f; }); for (const float v : b.y) after = std::max(after, (double) std::abs(v)); }
+    ok(after <= 1e-6, "0.5 held, unload(), zeros: peak " + fmt(after, "%.3g"));
+    b.p.unload();
+    Bench fresh({ { "early", gainModel(1.0), "60", 0 }, { "late", gainModel(1.0), "240", 0 } }, 48000.0, 60.0, crossover(150.0, 1.0));
+    for (int k = 0; k < 100; ++k) fresh.block([](long) { return 0.5f; });
+    fresh.p.unload();
+    fresh.files["early"] = bytesOf(gainModel(1.0));
+    fresh.p.load(rigOf({ { "early", gainModel(1.0), "60", 0 }, { "late", gainModel(1.0), "240", 0 } }),
+                 [&fresh](const std::string& id) { return fresh.files.at(id); });
+    double under = 0.0;
+    for (int k = 0; k < 10; ++k) { fresh.block([](long) { return 0.0f; }); for (const float v : fresh.y) under = std::max(under, (double) std::abs(v)); }
+    ok(under <= 1e-6, "0.5 held, unload() and a new load(), zeros: peak " + fmt(under, "%.3g"));
 }
 
 // ------------------------------------------------------------------------------------------------- law 11 ----
@@ -551,6 +650,154 @@ void seamOnRealCaptures() {
     ok(true, "printed above");
 }
 
+
+// --------------------------------------------------------------------------------------- review round 1 ----
+
+/** The quietest one-period window (`period` samples) of y over [from, to): the level a dip would show. */
+double quietestWindow(const std::vector<float>& y, std::size_t from, std::size_t to, std::size_t period) {
+    double q = 1e30;
+    for (std::size_t n = from; n + period <= to && n + period <= y.size(); n += period / 4) {
+        double m = 0.0;
+        for (std::size_t k = n; k < n + period; ++k) m = std::max(m, (double) std::abs(y[k]));
+        q = std::min(q, m);
+    }
+    return q;
+}
+
+void lagAtHostRate() {
+    group("the clean leg's reach is a TIME, sized for the host rate; a lag past it is refused, never clamped");
+    const std::vector<Cap> caps { { "early", delayModel(1024, 1.0), "60", 0 }, { "late", delayModel(1024, 1.0), "240", 0 } };
+    Bench off(caps, 192000.0, 60.0, crossover(150.0, 0.0)), on(caps, 192000.0, 60.0, crossover(150.0, 1.0));
+    const bool took = off.p.setCrossoverLag(1024) && on.p.setCrossoverLag(1024);
+    off.settle(400); on.settle(400);
+    const double stray = strayDb(impulseResponse(on, 32768), impulseResponse(off, 32768), 192000.0);
+    ok(took && on.p.crossoverLagFits() && stray < -40.0, "a 48 kHz capture 1024 samples late (4096 at 192 kHz): taken, and "
+       "the sum strays from the device by " + fmt(stray, "%.1f") + " dB of its peak");
+    ok(! on.p.setCrossoverLag(2100) && on.p.crossoverLag() == 1024, "2100 (43.75 ms, past the 42.67 ms reach) is refused "
+       "and the trim stays at " + std::to_string(on.p.crossoverLag()));
+    AlignmentTable t; t.lagByFile = { { "early", 0 }, { "late", 1100 } }; t.reference = "early";
+    on.p.setAlignment(t);
+    ok(! on.p.crossoverLagFits(), "a table that puts a capture past the reach says so (crossoverLagFits false)");
+}
+
+void retargetMidFade() {
+    group("a second lag while the tap is crossfading continues from where the fade had got to");
+    const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "late", gainModel(1.0), "240", 0 } };
+    Bench b(caps, 48000.0, 60.0, crossover(2000.0, 1.0));
+    auto sine = [](long i) { return (float) (0.5 * std::sin(2.0 * kPi * 150.0 * (double) i / 48000.0)); };
+    const auto before = b.play(100, sine);
+    test::run(b.p.setCrossoverLag(160));
+    auto y = b.play(1, sine);
+    test::run(b.p.setCrossoverLag(161));                       // 2.7 ms later, inside the 10 ms fade
+    const auto rest = b.play(60, sine);
+    y.insert(y.end(), rest.begin(), rest.end());
+    const double settled = biggestStep(before, 0, before.size());
+    const double through = biggestStep(y, 0, 4800);
+    ok(through <= 1.1 * settled, "the biggest step through both fades " + fmt(through, "%.5f") + ", settled " + fmt(settled, "%.5f"));
+}
+
+void cleanLevel() {
+    group("the clean level: setCrossoverCleanDb, and the offline reading a host proposes it from");
+    const double up = measureLowBandGainDb(bytesOf(gainModel(4.0)), 150.0), down = measureLowBandGainDb(bytesOf(delayModel(37, 0.25)), 150.0);
+    ok(std::abs(up - 12.0412) < 0.05 && std::abs(down + 12.0412) < 0.05, "a gain-4 capture reads " + fmt(up, "%+.3f")
+       + " dB below 150 Hz, a gain-1/4 one " + fmt(down, "%+.3f"));
+    const std::vector<Cap> caps { { "early", gainModel(4.0), "60", 0 }, { "late", gainModel(4.0), "240", 0 } };
+    auto level30 = [&](double amount, double cleanDb) {
+        Bench b(caps, 48000.0, 60.0, [=](RigPlayer& p) { crossover(150.0, amount)(p); test::run(p.setCrossoverCleanDb(cleanDb)); });
+        b.settle(20);
+        return 20.0 * std::log10(ratio(lockIn(b, 30.0, 0.05, 40, 120)).mag);
+    };
+    const double swing = level30(1.0, 0.0) - level30(0.0, 0.0), held = level30(1.0, up) - level30(0.0, up);
+    ok(std::abs(swing + 12.04) < 0.1 && std::abs(held) < 0.1, "30 Hz, amount 0 -> 1: " + fmt(swing, "%+.2f") + " dB at clean 0 dB, "
+       + fmt(held, "%+.3f") + " dB at the reading");
+    ok(! RigPlayer().setCrossoverCleanDb(std::nan("")), "a non-finite clean level is refused");
+}
+
+void switchOnLevel() {
+    group("switching the split on and off leaves no hole at the crossover (the pair is faded in at 1 Hz, then swept)");
+    const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "late", gainModel(1.0), "240", 0 } };
+    Bench b(caps, 48000.0, 60.0, crossover(150.0, 0.0));
+    auto sine = [](long i) { return (float) (0.5 * std::sin(2.0 * kPi * 150.0 * (double) i / 48000.0)); };
+    (void) b.play(50, sine);
+    test::run(b.p.setCrossoverAmount(1.0));
+    const auto on = b.play(150, sine);
+    test::run(b.p.setCrossoverAmount(0.0));
+    const auto offY = b.play(500, sine);
+    const double inDb = 20.0 * std::log10(quietestWindow(on, 0, on.size(), 320) / 0.5);
+    const double outDb = 20.0 * std::log10(quietestWindow(offY, 0, offY.size(), 320) / 0.5);
+    // What is left is the swept pair's own: an LR4 whose frequency moves is not exactly an all-pass while it moves (-0.98
+    // dB here on the way up through the tone, -0.60 with a 40 ms sweep). A crossfade against the pair at 150 Hz read -12.4.
+    ok(inDb > -1.5 && outDb > -1.5 && ! b.p.crossoverRunning(), "a 150 Hz tone through the switch: on " + fmt(inDb, "%+.3f")
+       + " dB, off " + fmt(outDb, "%+.3f") + " dB at the quietest period, and stopped after");
+}
+
+void manyCaptures() {
+    group("a pack of 520 captures: the 520th keeps its lag (the table is sized at load)");
+    std::vector<Cap> caps;
+    for (int k = 0; k < 520; ++k)
+        caps.push_back({ "c" + std::to_string(k), k == 519 ? delayModel(37, 1.0) : gainModel(1.0), std::to_string(k), k == 519 ? 37 : 0 });
+    auto big = [&](RigPlayer& p) { crossover(150.0, 1.0)(p); };
+    std::vector<Cap> two { caps.front(), caps.back() };
+    Bench b(caps, 48000.0, 519.0, big);
+    b.settle(80);
+    const double r = ripple(impulseResponse(b, 32768), 48000.0);
+    ok(b.p.heldFileId(0) == "c519" || b.p.heldFileId(1) == "c519", "precondition: the 520th capture sounds");
+    ok(r <= 0.1, "its clean leg is held back by its 37 samples: " + fmt(r, "%.6f") + " dB");
+}
+
+void anchorAndPolarityPerCapture() {
+    group("the lag's anchor is named, and a capture's own reading (absolute lag, polarity) drops in per file");
+    namz::rig::Device d = rigOf({ { "a", "", "60", 0 }, { "b", "", "240", 4 } }).chain[0].device;
+    ok(AlignmentTable::fromDevice(d).reference == "a", "a pack's lags are counted from its first file");
+    const auto measured = measureAlignment(d, [](const std::string& id) {
+        return id == "a" ? std::vector<std::byte> {} : bytesOf(gainModel(1.0)); });
+    ok(measured.reference == "b", "a measured table names the file it counted from (the first that loads): "
+       + measured.reference);
+    // The trim belongs to the reference it was set against: rebased when the new table still knows it, else dropped.
+    const std::vector<Cap> caps { { "a", gainModel(1.0), "60", 0 }, { "b", gainModel(1.0), "240", 0 } };
+    Bench b(caps, 48000.0, 60.0);
+    AlignmentTable ta; ta.lagByFile = { { "a", 0 }, { "b", 5 } }; ta.reference = "a";
+    b.p.setAlignment(ta);
+    test::run(b.p.setCrossoverLag(20));
+    AlignmentTable tb; tb.lagByFile = { { "a", -5 }, { "b", 0 } }; tb.reference = "b";
+    b.p.setAlignment(tb);
+    const int rebased = b.p.crossoverLag();
+    AlignmentTable tc; tc.lagByFile = { { "b", 0 } }; tc.reference = "b"; tc.sampleRate = 44100.0;
+    b.p.setAlignment(tc);
+    ok(rebased == 25 && b.p.crossoverLagReference() == "b" && b.p.crossoverLag() == 0, "20 against a, rebased to "
+       + std::to_string(rebased) + " against b; a table in other samples drops it (" + std::to_string(b.p.crossoverLag()) + ")");
+    // MINOR 10: a trim that would put a capture before its DI is refused; a table that does says so.
+    AlignmentTable tn; tn.lagByFile = { { "a", 0 }, { "b", -5 } }; tn.reference = "a";
+    b.p.setAlignment(tn);
+    const bool before = b.p.crossoverLagFits();
+    ok(! before && ! b.p.setCrossoverLag(4) && b.p.setCrossoverLag(5) && b.p.crossoverLagFits(), "b 5 samples ahead of a: "
+       "nothing fits at trim 0, 4 is refused, 5 is taken");
+    // A capture's own absolute lag and polarity, as a table carries them: an inverted, 9-sample-late capture beside a plain one.
+    const std::vector<Cap> mixed { { "a", gainModel(1.0), "60", 0 }, { "b", delayModel(9, -1.0), "240", 9 } };
+    for (const double dial : { 60.0, 240.0 }) {
+        Bench m(mixed, 48000.0, dial, crossover(150.0, 1.0));
+        AlignmentTable tm; tm.lagByFile = { { "a", 0 }, { "b", 9 } }; tm.reference = "a";
+        tm.absoluteLagByFile = { { "a", 0 }, { "b", 9 } }; tm.invertedByFile = { { "b", true } };
+        m.p.setAlignment(tm);
+        m.settle(80);
+        const double r = ripple(impulseResponse(m, 32768), 48000.0);
+        ok(r <= 0.1, std::string("per-capture reading, dial at ") + fmt(dial, "%.0f") + (dial == 60.0 ? " (plain)" : " (inverted, 9 late)")
+           + ": " + fmt(r, "%.6f") + " dB");
+    }
+}
+
+void parkedIsNotRunning() {
+    group("crossoverRunning() is false while the player is parked");
+    Bench b({ { "a", gainModel(1.0), "60", 0 }, { "b", gainModel(1.0), "240", 0 } }, 48000.0, 60.0, crossover(150.0, 1.0));
+    b.settle(20);
+    b.p.setStandby(true);
+    b.settle(20);
+    const bool parked = b.p.crossoverRunning();
+    b.p.setStandby(false);
+    b.settle(5);
+    ok(b.p.standingBy() == false && ! parked && b.p.crossoverRunning(), "parked: not running; back: running");
+}
+
 } // namespace
 
 int main() {
@@ -564,7 +811,17 @@ int main() {
     glides();
     silenceIsExact();
     noAllocation();
+    packBlendKnob();
+    stoppedPlanes();
+    unloadIsSilence();
     allProperties<A_RigCrossover>();
+    lagAtHostRate();
+    retargetMidFade();
+    cleanLevel();
+    switchOnLevel();
+    manyCaptures();
+    anchorAndPolarityPerCapture();
+    parkedIsNotRunning();
     seamOnRealCaptures();
     return test::report();
 }

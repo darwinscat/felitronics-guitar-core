@@ -15,6 +15,7 @@
 
 #include <felitronics/rigplayer/ModelAlignment.h>
 
+#include <felitronics/eq/Crossover2.h>      // measureLowBandGainDb: the crossover blend's own pair
 #include <felitronics/nam/BlendLaw.h>       // kBlendMaxDelay — the most a slot can be delayed
 #include <felitronics/nam/NamStage.h>
 #include <namz_rig.h>
@@ -78,6 +79,15 @@ struct AlignmentTable {
     // loaded). A player converts to its own rate with the three-argument delayOf.
     double sampleRate = 0.0;
     bool fromPack = false;
+    // THE ANCHOR: the file every reading above is counted from — a pack's first file (NAMZ-FORMAT.md: "later than the
+    // stage's first file"), or the first whose bytes loaded when measured. One definition, carried with the numbers.
+    std::string reference;
+    // A capture's OWN reading, when something measured it against its DI: how late its output arrives (in the table's
+    // samples) and whether it hands its input back inverted. Empty today — no pack carries them yet; when one does,
+    // fromDevice fills these two from its files and nothing downstream changes. lagOf prefers the absolute lag to the
+    // relative one plus the reference's offset; RigPlayer applies the polarity per slot.
+    std::map<std::string, int>  absoluteLagByFile;
+    std::map<std::string, bool> invertedByFile;
 
     bool empty() const { return lagByFile.empty(); }
 
@@ -99,13 +109,16 @@ struct AlignmentTable {
         return std::clamp((int) std::lround((double) delayOf(fileId) * scale), 0, felitronics::nam::kBlendMaxDelay);
     }
 
-    // How LATE this file's output arrives against the stage's FIRST file — its own reading — plus `offset`, how late
-    // that first file arrives against its own DI (which no table holds: every reading here is relative), both in the
-    // table's samples, converted to HOST samples as delayOf converts. An unknown file is the offset alone. Its own lag
-    // plus its delayOf is how late a slot playing it trails the DI: what RigPlayer's crossover holds its clean leg back by.
+    // How LATE this file's output arrives against its DI, in HOST samples (converted as delayOf converts), plus `offset`
+    // — the host's trim, in the table's samples. A file with its own absolute reading takes it; otherwise its relative
+    // reading against `reference`, and the trim then says how late the reference trails its DI. An unknown file is the
+    // trim alone. Its lag plus its delayOf is how late a slot playing it trails the DI: what RigPlayer's crossover holds
+    // its clean leg back by.
     int lagOf(const std::string& fileId, double hostRate, double modelRate, int offset = 0) const {
+        const auto ab = absoluteLagByFile.find(fileId);
         const auto me = lagByFile.find(fileId);
-        const double lag = (double) (me == lagByFile.end() ? 0 : me->second) + (double) offset;
+        const int own = ab != absoluteLagByFile.end() ? ab->second : me == lagByFile.end() ? 0 : me->second;
+        const double lag = (double) own + (double) offset;
         const double at = sampleRate > 0.0 ? sampleRate : modelRate;
         const double scale = (at > 0.0 && hostRate > 0.0) ? hostRate / at : 1.0;
         return (int) std::lround(lag * scale);
@@ -120,11 +133,43 @@ struct AlignmentTable {
         for (const auto& f : d.files) {
             if (f.id.empty()) continue;
             if (! f.lagSamples) return AlignmentTable {};
+            if (out.reference.empty()) out.reference = f.id;
             out.lagByFile[f.id] = *f.lagSamples;
+            // ← a pack field for a capture's absolute lag and polarity plugs in here:
+            //   out.absoluteLagByFile[f.id] = *f.<absolute lag>;  out.invertedByFile[f.id] = f.<inverted>;
         }
         return out;
     }
 };
+
+/// HOW LOUD A CAPTURE'S LOW END IS against its DI, below `hz`: the alignment probe through the file, both sides through
+/// the crossover blend's own low-pass (eq::Crossover2), their energies compared — in dB. What a host may propose as the
+/// clean level (RigPlayer::setCrossoverCleanDb) so that turning the amount up does not also turn the bass up or down.
+/// `normalize` plays the capture as the player does with setNormalize(true) (its loudness tag applied). Offline: NAM
+/// inference, any thread but the audio one. NaN when the bytes do not load.
+inline double measureLowBandGainDb(const std::vector<std::byte>& model, double hz, double sampleRate = 48000.0,
+                                   bool normalize = false) {
+    const double fs = sampleRate > 0.0 ? sampleRate : 48000.0;
+    const auto probe = alignmentProbe(fs);
+    felitronics::nam::NamStage m;
+    m.prepare(fs, 512);
+    if (model.empty() || ! m.loadModelFromMemory(model.data(), model.size())) return std::nan("");
+    std::vector<float> y = probe;
+    for (std::size_t p = 0; p < y.size(); p += 512) {
+        float* io[1] { y.data() + p };
+        if (! m.process(io, 1, (int) std::min<std::size_t>(512, y.size() - p), normalize)) return std::nan("");
+    }
+    felitronics::eq::Crossover2 lx, ly;
+    lx.prepare(fs, 1); ly.prepare(fs, 1);
+    lx.setFrequency((float) hz); ly.setFrequency((float) hz);
+    double ex = 0.0, ey = 0.0;
+    for (std::size_t n = 0; n < y.size(); ++n) {
+        float lo = 0.0f, hi = 0.0f;
+        lx.processSample(0, probe[n], lo, hi); ex += (double) lo * lo;
+        ly.processSample(0, y[n], lo, hi);     ey += (double) lo * lo;
+    }
+    return ex > 0.0 && ey > 0.0 ? 10.0 * std::log10(ey / ex) : std::nan("");
+}
 
 // The table for a device: every DISTINCT file once (several settings may point at one file), against the
 // first one whose bytes load. A file with no reading — bytes that will not load, an output with no
@@ -143,7 +188,7 @@ inline AlignmentTable measureAlignment(const namz::rig::Device& d, const ModelSo
     for (const auto& id : ids) {
         const auto y = probeThrough(source(id), probe, sampleRate);
         if (y.empty()) continue;
-        if (ref.empty()) { ref = y; refId = id; out.lagByFile[id] = 0; continue; }
+        if (ref.empty()) { ref = y; refId = id; out.reference = id; out.lagByFile[id] = 0; continue; }
         const auto b = felitronics::rigplayer::bestLag(ref, y, felitronics::rigplayer::kSearch);
         if (b.corr < 0.0) continue;                          // no reading is not a complaint
         out.lagByFile[id] = b.lag;

@@ -5,7 +5,9 @@
 // when; this holds what it does — the clean ring, the two slot taps and their mirrored delay lines, the one
 // Linkwitz–Riley pair that splits both sides, and the glides:
 //
-//     out = HP4(device) + LP4((1 − amount) · device + amount · ±clean)
+//     out = HP4(device) + LP4((1 − amount) · device + amount · clean)
+//     clean = the slots' clean taps (each at its capture's lag and polarity), mixed as the slots are, then the pack's
+//             own dry part mixed in by the blend knob exactly as it is mixed into the device
 //
 // LP4 and HP4 are core's eq::Crossover2, built of the same two Butterworth SVFs a side (eq::Svf, Q = 1/√2), run on the
 // clean leg's low half and the device's high half — so a device that is a wire sums to the pair's all-pass.
@@ -67,22 +69,30 @@ public:
     static constexpr int    kMaxChannels = 2;
     static constexpr int    kMaxDelay = felitronics::nam::kBlendMaxDelay;
     static constexpr double kMinHz = 20.0, kMaxHz = 2000.0;
-    static constexpr int    kMaxLag = 2048;                    // host samples: the most the clean leg is held back
+    // THE CLEAN LEG'S REACH IS A TIME: 2048 samples at 48 kHz, sized in prepare() for the host rate (8192 at 192 kHz),
+    // so a lag that fits fits at every rate. maxLag() is it in host samples; the player refuses past it.
+    static constexpr double kMaxLagSeconds = 2048.0 / 48000.0;
+    // Where the pair is faded in and out: the SVF's floor. At 1 Hz its all-pass is a wire across the audible band (1.1
+    // degrees at 150 Hz), so the device can be crossfaded against it without the notch a crossfade against the pair at
+    // its working frequency would leave; the frequency is then swept up from here — and down to here before it stops.
+    static constexpr float  kFloorHz = 1.0f;
     static constexpr double kQ = 0.7071067811865476;           // eq::Crossover2's: 1/√2 Butterworth, cascaded = LR4
 
     // ------------------------------------------------------------------ settings (any thread: atomics) ----
     void setHz(float hz)         { hz_.store(hz, std::memory_order_release); }
     void setAmount(float amount) { amount_.store(amount, std::memory_order_release); }
-    void setInvert(bool on)      { invert_.store(on, std::memory_order_release); }
+    void setCleanGain(float g)   { cleanG_.store(g, std::memory_order_release); }
     bool runningFlag() const     { return running_.load(std::memory_order_acquire); }
+    int  maxLag() const          { return maxLag_; }       // host samples; set by prepare()
 
     // ------------------------------------------------------------------------- restarts (never beside run) ----
     // A ring long enough for a block plus the longest lag, a power of two so a tap is a mask; one block of the mixed taps
     // a plane. Sized whether or not it is on — nothing is allocated on the audio thread.
     void prepare(double fs, int maxBlock, int channels) {
         fs_ = fs; channels_ = std::clamp(channels, 1, kMaxChannels);
+        maxLag_ = (int) std::ceil(kMaxLagSeconds * fs_);
         std::size_t ring = 1;
-        while (ring < (std::size_t) maxBlock + (std::size_t) kMaxLag + 1u) ring <<= 1;
+        while (ring < (std::size_t) maxBlock + (std::size_t) maxLag_ + 1u) ring <<= 1;
         for (int c = 0; c < kMaxChannels; ++c) {
             ring_[c].assign(ring, 0.0f);
             clean_[c].assign((std::size_t) maxBlock, 0.0f);
@@ -107,15 +117,15 @@ public:
     // prepare() and reset(): the glides land where the settings stand, as the player's gains land.
     void snap() noexcept {
         const float amount = amount_.load(std::memory_order_acquire);
-        const float sign = invert_.load(std::memory_order_acquire) ? -1.0f : 1.0f;
         run_  = amount > 0.0f;
         mix_  = run_ ? 1.0f : 0.0f;
-        dryG_ = amount * sign;
+        dryG_ = amount * cleanG_.load(std::memory_order_acquire);
+        snapSign_ = true;
         wetG_ = 1.0f - amount;
         hzRt_ = hz_.load(std::memory_order_acquire);
         design(hzRt_);
         clear();
-        running_.store(run_, std::memory_order_release);
+        running_.store(run_ && ! parked_, std::memory_order_release);
     }
 
     // ---------------------------------------------------------------------------------------- audio thread ----
@@ -126,7 +136,8 @@ public:
         if (! run_ && amount_.load(std::memory_order_acquire) > 0.0f) {
             run_  = true;
             mix_  = 0.0f; dryG_ = 0.0f; wetG_ = 1.0f;
-            hzRt_ = hz_.load(std::memory_order_acquire);
+            snapSign_ = true;                                 // nothing of the clean leg is heard yet
+            hzRt_ = kFloorHz;                                 // faded in at the floor, then swept up (run)
             design(hzRt_);
             clear();
             running_.store(true, std::memory_order_release);
@@ -145,23 +156,39 @@ public:
     void clearSlotLine(int slot) noexcept {
         if (run_) for (auto& t : tail_[(std::size_t) (slot & 1)]) t.fill(0.0f);
     }
-    void clearPlaneLines(int c) noexcept {
-        if (run_) for (auto& slot : tail_) slot[(std::size_t) c].fill(0.0f);
+    // PARKED (the player's stand-by): nothing of this runs, and crossoverRunning() says so until the player is back.
+    void setParked(bool on) noexcept { parked_ = on; running_.store(run_ && ! on, std::memory_order_release); }
+    // A PLANE THE HOST STOPS HANDING OVER leaves nothing behind: its lines, its ring and the pair's memory for it are
+    // cleared on the falling edge (law 11c). The clocks and the glides are shared and go on.
+    void stopPlane(int c) noexcept {
+        if (! run_ || c < 0 || c >= kMaxChannels) return;
+        for (auto& slot : tail_) slot[(std::size_t) c].fill(0.0f);
+        std::fill(ring_[c].begin(), ring_[c].end(), 0.0f);
+        for (auto& f : lp_) f.resetChannel(c);
+        for (auto& f : hp_) f.resetChannel(c);
     }
+    // The clean plane after clean(): the player mixes the pack's own dry part into it with the blend knob's ramp, the
+    // one it mixes into the device, so the clean leg carries the composite the device carries.
+    float* cleanPlane(int c) noexcept { return clean_[c].data(); }
     // EACH SLOT'S CLEAN TAP is what its capture carries: the held model's own lag, read from the ring; the slot's
     // alignment delay is then applied by the mirrored line (clean). A new capture in the slot — a landing — is followed
     // at once, as its model is; so is any change while the slot is silent. A change of reading alone on a slot that is
     // heard (a table, setCrossoverLag) crossfades the tap over fadeLen_ rather than splice the clean leg.
+    // A lag asked while a fade is still under way WAITS for it (`next`) and starts its own fade from where that one
+    // lands, so the tap never jumps away from the mixture it is playing. Silent means silent at both ends of the block.
     void taps(const std::uint64_t held[2], const int own[2], const felitronics::nam::BlendStep& law) noexcept {
         for (int i = 0; i < 2; ++i) {
             auto& t = tap_[i];
-            const int want = std::clamp(own[i], 0, kMaxLag);
-            const double w = i == 0 ? 1.0 - law.endB : law.endB;
+            const int want = std::clamp(own[i], 0, maxLag_);
+            const double w0 = i == 0 ? 1.0 - law.beginB : law.beginB, w1 = i == 0 ? 1.0 - law.endB : law.endB;
             const bool moved = held[i] != t.held;
             t.held = held[i];
-            if (want == t.lag && ! moved) continue;
-            if (moved || w <= 0.0) { t.from = t.lag = want; t.pos = fadeLen_; }
-            else                   { t.from = t.lag; t.lag = want; t.pos = 0; }
+            if (moved || (w0 <= 0.0 && w1 <= 0.0)) {
+                if (want != t.lag || t.pos < fadeLen_ || moved) { t.from = t.lag = t.next = want; t.pos = fadeLen_; }
+                continue;
+            }
+            t.next = want;
+            if (t.pos >= fadeLen_ && t.next != t.lag) { t.from = t.lag; t.lag = t.next; t.pos = 0; }
         }
     }
     // THE CLEAN LEG, MIXED AS THE MODELS WERE: a slot that runs is tapped and delayed by nam::blendDelay through its
@@ -169,7 +196,17 @@ public:
     // one plane of the two. A HUSHED block still advances both lines, as the slots' do under the same silence: a capture
     // fed while nothing is heard (a one-model dip) must not come back with its line empty where the slot's is full. A
     // plane the host did not hand over carries silence, as its delay lines do.
-    void clean(int nch, int count, const MixRecipe& r, const int delay[2]) noexcept {
+    // `invert[i]`: whether slot i's capture hands its input back inverted (its own reading, or the host's word) — the
+    // slot's clean tap takes that polarity, gliding, before the slots are mixed; the pack's dry part never does.
+    void clean(int nch, int count, const MixRecipe& r, const int delay[2], const bool invert[2]) noexcept {
+        const float decay = std::exp(-(float) count / (float) (0.010 * fs_));
+        float signEnd[2], signStep[2];
+        for (int i = 0; i < 2; ++i) {
+            const float want = invert[i] ? -1.0f : 1.0f;
+            if (snapSign_) sign_[i] = want;
+            signEnd[i]  = glideEnd(want, sign_[i], decay);
+            signStep[i] = (signEnd[i] - sign_[i]) / (float) count;
+        }
         for (int c = 0; c < channels_; ++c) {
             float* cl = clean_[c].data();
             float* other = tmp_.data();
@@ -178,24 +215,31 @@ public:
             float* slot[2] { cl, other };
             for (int i = 0; i < 2; ++i) {
                 if (! r.run[i]) { std::fill(slot[i], slot[i] + count, 0.0f); continue; }
-                for (int k = 0; k < count; ++k) slot[i][k] = tapAt(tap_[i], ring, count, k);
+                float g = sign_[i];
+                for (int k = 0; k < count; ++k) { g += signStep[i]; slot[i][k] = tapAt(tap_[i], ring, count, k) * g; }
                 felitronics::nam::blendDelay(slot[i], tail_[i][(std::size_t) c].data(), kMaxDelay, delay[i], count);
             }
             mixSlots(cl, other, count, r);
         }
         for (auto& t : tap_) t.pos = std::min(t.pos + count, fadeLen_);
+        sign_[0] = signEnd[0]; sign_[1] = signEnd[1];
+        snapSign_ = false;
     }
     // THE SPLIT, on the audio-time grid (law 8a): per segment the glides take one step of the ~10 ms law and walk it
     // linearly, the frequency is designed where it has got to, and the filters are flushed on the boundary. Every
     // prepared plane runs — a plane the host stopped carries its zeros through, so nothing it held is replayed.
     void run(float* const* a, int count) noexcept {
         const float amount  = amount_.load(std::memory_order_acquire);
-        const float sign    = invert_.load(std::memory_order_acquire) ? -1.0f : 1.0f;
-        const float wantHz  = hz_.load(std::memory_order_acquire);
-        const float wantMix = amount > 0.0f ? 1.0f : 0.0f, wantDry = amount * sign, wantWet = 1.0f - amount;
+        const float wantDry = amount * cleanG_.load(std::memory_order_acquire), wantWet = 1.0f - amount;
+        const float target  = hz_.load(std::memory_order_acquire);
         for (int off = 0; off < count; ) {
             const int seg = grid_.segment(count - off);
             const float decay  = std::exp(-(float) seg / (float) (0.010 * fs_));
+            // ON: faded in at the floor, swept up once the fade is (all but) in. OFF: swept down to the floor, then faded
+            // out. A turn back on halfway simply sweeps up again from wherever it had got to.
+            const bool on = amount > 0.0f;
+            const float wantMix = on ? 1.0f : (hzRt_ <= 1.5f * kFloorHz ? 0.0f : mix_);
+            const float wantHz  = on && mix_ >= 0.999f ? target : kFloorHz;
             const float endMix = glideEnd(wantMix, mix_, decay);
             const float endDry = glideEnd(wantDry, dryG_, decay);
             const float endWet = glideEnd(wantWet, wetG_, decay);
@@ -238,7 +282,7 @@ public:
 private:
     // One slot's clean tap: the lag it reads at, the lag a crossfade leaves (and how far it is), and what it last saw
     // the slot hold. `held` starts at a value no slot holds, so the first look snaps.
-    struct Tap { int lag = 0, from = 0, pos = 0; std::uint64_t held = ~std::uint64_t { 0 }; };
+    struct Tap { int lag = 0, from = 0, pos = 0, next = 0; std::uint64_t held = ~std::uint64_t { 0 }; };
 
     // RigPlayer::rampEnd's law: an asymptotic approach that ARRIVES — the residual would otherwise park in a fixed-point
     // band, subnormal when the target is zero (law 8).
@@ -264,11 +308,15 @@ private:
     }
 
     std::atomic<float> hz_ { 150.0f }, amount_ { 0.0f };
-    std::atomic<bool>  invert_ { false }, running_ { false };
+    std::atomic<float> cleanG_ { 1.0f };
+    std::atomic<bool>  running_ { false };
+    bool   parked_ = false, snapSign_ = true;
+    int    maxLag_ = 2048;
     double fs_ = 48000.0;
     int    channels_ = 1;
     bool   run_ = false;
     float  mix_ = 0.0f, dryG_ = 0.0f, wetG_ = 1.0f;            // the split's fade, the clean and the device's low weights
+    float  sign_[2] { 1.0f, 1.0f };                            // each slot's clean polarity, gliding
     float  hzRt_ = 150.0f, hzAt_ = 0.0f;                       // the frequency gliding, and the one designed
     int    fadeLen_ = 1;                                       // a tap's crossfade: 10 ms at fs_
     Tap    tap_[2];
