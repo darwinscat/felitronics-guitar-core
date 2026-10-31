@@ -64,28 +64,34 @@ inline void mixSlots(float* x0, const float* x1, int count, const MixRecipe& r) 
     }
 }
 
-// ONE SLOT'S ALIGNMENT DELAY LINE — a model's output and the crossover's clean tap go through one each. It keeps the
-// last kCap samples it was fed, so its delay can MOVE while the slot is heard: crossfaded between the old and the new
-// delay over `fade` samples, where nam::blendDelay's tail holds only its own delay's worth and could only be cleared.
-// For a delay that holds, its samples are blendDelay's; cleared (zeros) wherever the player clears a slot's line.
+// ONE SLOT'S ALIGNMENT DELAY LINE, every plane of it — a model's output and the crossover's clean tap go through one
+// each. Per plane it keeps the last kCap samples it was fed, so its delay can MOVE while the slot is heard: crossfaded
+// between the old and the new delay over `fade` samples, where nam::blendDelay's tail holds only its own delay's worth
+// and could only be cleared. For a delay that holds, its samples are blendDelay's (CrossoverBlendTests' null).
+//
+// THE MOVE IS THE SLOT'S, not a plane's: one delay, one fade clock, advanced by the block's audio time (advance) whether
+// a plane was handed over or not — a plane that stops and comes back finds the fade where the others have it. A delay
+// asked while a fade is under way WAITS for it and starts its own fade from where it lands. clear() is a restart: the
+// planes' memory empty and the move landed.
 class SlotLine {
 public:
     static constexpr int kCap = felitronics::nam::kBlendMaxDelay;
-    void clear() noexcept { hist_.fill(0.0f); }
-    // A delay taken at once (fade 0: a silent slot, a landing, a restart) or crossfaded over `fade` samples (a slot
-    // that is heard). A new delay asked mid-fade starts its own fade from the one under way's destination.
+    static constexpr int kPlanes = 2;
+    void clear() noexcept { for (auto& h : hist_) h.fill(0.0f); from_ = next_ = n_; pos_ = len_ = 0; }
+    void clearPlane(int c) noexcept { if (c >= 0 && c < kPlanes) hist_[(std::size_t) c].fill(0.0f); }
     void set(int delay, int fade = 0) noexcept {
         delay = std::clamp(delay, 0, kCap);
-        if (fade <= 0) { from_ = n_ = delay; pos_ = len_ = 0; return; }
-        if (delay == n_) return;
-        from_ = n_; n_ = delay; pos_ = 0; len_ = fade;
+        if (fade <= 0) { from_ = n_ = next_ = delay; pos_ = len_ = 0; return; }
+        next_ = delay;
+        if (pos_ >= len_ && delay != n_) { from_ = n_; n_ = delay; pos_ = 0; len_ = fade; }
     }
     int delay() const noexcept { return n_; }
-    // In place: x leaves delayed. `scratch` holds `count` samples.
-    void process(float* x, int count, float* scratch) noexcept {
-        if (count <= 0) return;
+    // Plane c, in place: x leaves delayed. `scratch` holds `count` samples. The fade is read where the block began.
+    void process(int c, float* x, int count, float* scratch) noexcept {
+        if (count <= 0 || c < 0 || c >= kPlanes) return;
+        auto& h = hist_[(std::size_t) c];
         std::copy(x, x + count, scratch);
-        const auto at = [&] (int d, int k) { return k >= d ? scratch[k - d] : hist_[(std::size_t) (kCap - d + k)]; };
+        const auto at = [&] (int d, int k) { return k >= d ? scratch[k - d] : h[(std::size_t) (kCap - d + k)]; };
         for (int k = 0; k < count; ++k) {
             const float now = at(n_, k);
             if (pos_ + k < len_) {
@@ -93,16 +99,21 @@ public:
                 x[k] = was + (now - was) * ((float) (pos_ + k + 1) / (float) len_);
             } else x[k] = now;
         }
-        pos_ = std::min(pos_ + count, len_);
-        if (count >= kCap) std::copy(scratch + count - kCap, scratch + count, hist_.begin());
+        if (count >= kCap) std::copy(scratch + count - kCap, scratch + count, h.begin());
         else {
-            std::move(hist_.begin() + count, hist_.end(), hist_.begin());
-            std::copy(scratch, scratch + count, hist_.end() - count);
+            std::move(h.begin() + count, h.end(), h.begin());
+            std::copy(scratch, scratch + count, h.end() - count);
         }
     }
+    // The block's audio time, once per block: the fade moves on, and a waiting delay starts its own fade where it lands.
+    void advance(int count) noexcept {
+        if (count <= 0) return;
+        pos_ = std::min(pos_ + count, len_);
+        if (pos_ >= len_ && next_ != n_ && len_ > 0) { from_ = n_; n_ = next_; pos_ = 0; }
+    }
 private:
-    std::array<float, (std::size_t) kCap> hist_ {};
-    int n_ = 0, from_ = 0, pos_ = 0, len_ = 0;
+    std::array<float, (std::size_t) kCap> hist_[kPlanes] {};
+    int n_ = 0, from_ = 0, next_ = 0, pos_ = 0, len_ = 0;
 };
 
 class CrossoverBlend {
@@ -156,7 +167,7 @@ public:
         for (auto& f : lp_) f.reset();
         for (auto& f : hp_) f.reset();
         for (auto& r : ring_) std::fill(r.begin(), r.end(), 0.0f);
-        for (auto& slot : lines_) for (auto& l : slot) l.clear();
+        for (auto& l : lines_) l.clear();
         w_ = 0;
         grid_.reset();
         for (auto& t : tap_) t = Tap {};                      // the next look snaps each tap to its slot
@@ -199,11 +210,11 @@ public:
         w_ += (std::size_t) count;
     }
     // The slot's line takes the delay the player's own line takes, at the same moment and the same way (fade 0: at once).
-    void setLine(int slot, int delay, int fade) noexcept { for (auto& l : lines_[(std::size_t) (slot & 1)]) l.set(delay, fade); }
+    void setLine(int slot, int delay, int fade) noexcept { lines_[(std::size_t) (slot & 1)].set(delay, fade); }
     // The slot's line is cleared wherever the player clears the slot's own (a landing, a retime, falling asleep), and a
     // plane's where the host stops handing it over — only while running: a start clears everything anyway.
     void clearSlotLine(int slot) noexcept {
-        if (run_) for (auto& l : lines_[(std::size_t) (slot & 1)]) l.clear();
+        if (run_) lines_[(std::size_t) (slot & 1)].clear();
     }
     // PARKED (the player's stand-by): nothing of this runs, and crossoverRunning() says so until the player is back.
     void setParked(bool on) noexcept { parked_ = on; running_.store(run_ && ! on, std::memory_order_release); }
@@ -211,7 +222,7 @@ public:
     // cleared on the falling edge (law 11c). The clocks and the glides are shared and go on.
     void stopPlane(int c) noexcept {
         if (! run_ || c < 0 || c >= kMaxChannels) return;
-        for (auto& slot : lines_) slot[(std::size_t) c].clear();
+        for (auto& l : lines_) l.clearPlane(c);
         std::fill(ring_[c].begin(), ring_[c].end(), 0.0f);
         for (auto& f : lp_) f.resetChannel(c);
         for (auto& f : hp_) f.resetChannel(c);
@@ -274,7 +285,7 @@ public:
             for (int i = 0; i < 2; ++i) {
                 if (! r.run[i]) { std::fill(slot[i], slot[i] + count, 0.0f); continue; }
                 for (int k = 0; k < count; ++k) slot[i][k] = tapAt(tap_[i], ring, count, k);
-                lines_[i][(std::size_t) c].process(slot[i], count, lineTmp_.data());
+                lines_[i].process(c, slot[i], count, lineTmp_.data());
                 // The slot's gain AFTER its line: a polarity or level that lands reaches what the line still holds too,
                 // as the capture's own reading does on the device side (its line holds the capture's output).
                 float g = sign_[i];
@@ -283,6 +294,7 @@ public:
             mixSlots(cl, other, count, r);
         }
         for (auto& t : tap_) t.pos = std::min(t.pos + count, fadeLen_);
+        for (auto& l : lines_) l.advance(count);              // the slots' line clocks, in step with the player's
         sign_[0] = signEnd[0]; sign_[1] = signEnd[1];
         snapSign_ = false;
     }
@@ -388,7 +400,7 @@ private:
     felitronics::core::StateGrid grid_;
     std::vector<float> ring_[kMaxChannels], clean_[kMaxChannels], tmp_;
     std::size_t mask_ = 0, w_ = 0;
-    SlotLine lines_[2][kMaxChannels];
+    SlotLine lines_[2];
     std::vector<float> lineTmp_;
 };
 

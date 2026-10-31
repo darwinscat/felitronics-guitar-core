@@ -1254,6 +1254,117 @@ void settledChecksSeeNaN() {
        "an impulse response holding a NaN is not flat, and does not match");
 }
 
+
+// ------------------------------------------------------------------------------------------- SlotLine transitions ----
+
+void slotLineNullsBlendDelay() {
+    group("SlotLine against nam::blendDelay: delays 0 … 128, blocks of 1 … 300 samples, bit for bit while a delay holds");
+    std::uint32_t r = 12345u;
+    auto rnd = [&] { r = r * 1664525u + 1013904223u; return r; };
+    SlotLine line;
+    std::array<float, (std::size_t) felitronics::nam::kBlendMaxDelay> tail {};
+    std::vector<float> x(300), y(300), scratch(300);
+    long differ = 0, total = 0;
+    for (int seg = 0; seg < 400; ++seg) {
+        const int d = (int) (rnd() % 129u);
+        line.clear(); line.set(d); tail.fill(0.0f);            // a delay change lands on an emptied line, as the player's do
+        for (int blk = 0; blk < 6; ++blk) {
+            const int n = 1 + (int) (rnd() % 300u);
+            for (int k = 0; k < n; ++k) x[(std::size_t) k] = y[(std::size_t) k] = (float) ((double) (rnd() >> 8) / 16777216.0 - 0.5);
+            line.process(0, x.data(), n, scratch.data()); line.advance(n);
+            felitronics::nam::blendDelay(y.data(), tail.data(), felitronics::nam::kBlendMaxDelay, d, n);
+            for (int k = 0; k < n; ++k, ++total) if (x[(std::size_t) k] != y[(std::size_t) k]) ++differ;
+        }
+    }
+    ok(differ == 0 && total > 100000, std::to_string(total) + " samples, " + std::to_string(differ) + " differ");
+}
+
+void slotLineQueuesSecondRetime() {
+    group("a second retime while the first fade runs waits for it: 0 -> 64 -> 0, 128 samples apart, no splice");
+    SlotLine line;
+    constexpr int fade = 480, n = 32;
+    std::vector<float> in, out, x(n), scratch(n);
+    double own = 0.0;
+    for (int b = 0; b < 200; ++b) {
+        if (b == 50) line.set(64, fade);
+        if (b == 54) line.set(0, fade);                        // 128 samples into the first fade
+        for (int k = 0; k < n; ++k) x[(std::size_t) k] = (float) (0.5 * std::sin(2.0 * kPi * 150.0 * (double) (b * n + k) / 48000.0));
+        in.insert(in.end(), x.begin(), x.end());
+        line.process(0, x.data(), n, scratch.data()); line.advance(n);
+        out.insert(out.end(), x.begin(), x.end());
+    }
+    own = biggestStep(in, 1, in.size());
+    const double step = biggestStep(out, 1, out.size());
+    ok(step <= 1.1 * own && line.delay() == 0, "the steepest step " + fmt(step, "%.5f") + " against the tone's own "
+       + fmt(own, "%.5f") + "; the line ends at " + std::to_string(line.delay()));
+}
+
+void resetLandsAFadeInFlight() {
+    group("reset() with a retime's fade in flight is the same restart as one after it (law 11: restart independence)");
+    const std::vector<Cap> caps { { "early", gainModel(1.0), "60", 0 }, { "late", delayModel(37, 1.0), "240", 0 } };
+    AlignmentTable t; t.reference = "early"; t.lagByFile = { { "early", 0 }, { "late", 37 } };
+    Bench a(caps, 48000.0, 150.0, crossover(150.0, 1.0)), b(caps, 48000.0, 150.0, crossover(150.0, 1.0));
+    a.settle(80); b.settle(80);
+    a.p.setAlignment(t); b.p.setAlignment(t);
+    a.settle(1); b.settle(30);                                  // a: 2.7 ms into the 10 ms fade; b: long past it
+    a.p.reset(); b.p.reset();
+    double worst = 0.0;
+    for (int k = 0; k < 100; ++k) {
+        auto gen = [k](long i) { return di((long) k * kBlock + (i % kBlock), 48000.0); };
+        a.block(gen); b.block(gen);
+        for (int i = 0; i < kBlock; ++i) worst = std::max(worst, (double) std::abs(a.y[(std::size_t) i] - b.y[(std::size_t) i]));
+    }
+    ok(worst == 0.0, "the two restarts, the same input after them: within " + fmt(worst, "%.3g"));
+}
+
+void stoppedPlaneKeepsTheFadeClock() {
+    group("a plane stopped through a retime finds the fade where the others have it");
+    // The device alone (amount 0) must play L = R exactly once R's line has refilled; with the crossover on, R's filters
+    // and ring restart from silence on its return (law 11c) and settle within a few blocks — then L = R again.
+    for (const double amount : { 0.0, 1.0 }) {
+        std::map<std::string, std::vector<std::byte>> files { { "early", bytesOf(gainModel(1.0)) }, { "late", bytesOf(delayModel(37, 1.0)) } };
+        RigPlayer p;
+        crossover(150.0, amount)(p);
+        test::run(p.prepare(48000.0, kBlock, 2));
+        p.setNormalize(false);
+        p.load(rigOf({ { "early", "", "60", 0 }, { "late", "", "240", 0 } }), [&files](const std::string& id) { return files.at(id); });
+        (void) p.setDial("gain", 150.0);
+        std::vector<float> l(kBlock), r(kBlock);
+        long at = 0;
+        auto run = [&](int width) {
+            for (int i = 0; i < kBlock; ++i) l[(std::size_t) i] = r[(std::size_t) i] = di(at + i, 48000.0);
+            at += kBlock;
+            float* io[2] { l.data(), r.data() };
+            test::run(p.process(io, width, kBlock));
+            p.serviceHere();
+        };
+        for (int k = 0; k < 80; ++k) run(2);
+        AlignmentTable t; t.reference = "early"; t.lagByFile = { { "early", 0 }, { "late", 37 } };
+        p.setAlignment(t);
+        run(2);                                                 // the fade starts with both planes
+        for (int k = 0; k < 6; ++k) run(1);                     // R away for 16 ms — past the fade's end
+        run(2);                                                 // back: its line refills (37 samples) …
+        double worst = 0.0;
+        for (int k = 0; k < 40; ++k) {
+            run(2);
+            if (amount > 0.0 && k < 10) continue;
+            for (int i = 0; i < kBlock; ++i) worst = std::max(worst, (double) std::abs(l[(std::size_t) i] - r[(std::size_t) i]));
+        }
+        ok(amount > 0.0 ? worst <= 1e-6 : worst == 0.0, std::string(amount > 0.0 ? "with the crossover, 10 blocks on" : "the device")
+           + ": L and R, fed the same, play the same within " + fmt(worst, "%.3g"));
+    }
+}
+
+void alignmentReachReported() {
+    group("an alignment delay past the slots' reach (128 host samples) is reported, not silently clamped");
+    const std::vector<Cap> caps { { "a", gainModel(1.0), "60", 0 }, { "b", gainModel(1.0), "240", 0 } };
+    Bench b(caps, 48000.0, 60.0);
+    const bool before = b.p.alignmentFits();
+    AlignmentTable t; t.reference = "a"; t.lagByFile = { { "a", 0 }, { "b", 200 } };
+    b.p.setAlignment(t);
+    ok(before && ! b.p.alignmentFits(), "a capture 200 samples late against another: alignmentFits() false");
+}
+
 } // namespace
 
 int main() {
@@ -1296,6 +1407,11 @@ int main() {
     audibleRetimeCrossfades();
     retimeWaitsForBothEnds();
     settledChecksSeeNaN();
+    slotLineNullsBlendDelay();
+    slotLineQueuesSecondRetime();
+    resetLandsAFadeInFlight();
+    stoppedPlaneKeepsTheFadeClock();
+    alignmentReachReported();
     seamOnRealCaptures();
     return test::report();
 }
