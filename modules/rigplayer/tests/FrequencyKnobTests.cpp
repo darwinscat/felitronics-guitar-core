@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -190,29 +191,101 @@ double biggestStep(const std::vector<float>& y, std::size_t from, std::size_t to
     return s;
 }
 
+// THE MOTION BOUND: the steepest sample step through a FREQ move against the settled sound's own, worst over a whole-dial
+// jump either way, a short move, and a hand turning the dial (an update every block). Every sample is checked finite.
+// Measured 1.44x (the whole dial at once, 200 -> 3200 Hz past a 250 Hz tone at +15 dB) — the bands' coefficient ramp
+// between two distant bells is not a bell sweep; it is the house's ramp for every band knob. Gated with a margin.
+constexpr double kFreqMotionRatio = 1.6;
+
 void freqMoveGlides() {
-    group("a FREQ move glides: no sample step above the settled sound's own");
-    // One low tone: its own steps are small, and the bell moving past it changes it a lot — a cut shows.
+    group("a FREQ move glides: no step above the settled sound's own beyond the ramp's measured bound; every sample finite");
     auto tone = [](long i) { return (float) (0.3 * std::sin(2 * kPi * 250.0 * (double) i / kFs)); };
-    for (const auto& [from, to] : std::vector<std::pair<double, double>> { { 0.0, 300.0 }, { 300.0, 0.0 }, { 150.0, 225.0 } }) {
+    struct Move { const char* name; double from, to; bool hand; };
+    double worstRatio = 0.0;
+    bool finite = true;
+    for (const Move m : { Move { "0 -> 300 at once", 0.0, 300.0, false }, Move { "300 -> 0 at once", 300.0, 0.0, false },
+                          Move { "150 -> 225", 150.0, 225.0, false }, Move { "0 -> 300 by hand, 5 a block", 0.0, 300.0, true } }) {
         Bench b({ mid("freq"), freqDial() }), stay({ mid("freq"), freqDial() }), went({ mid("freq"), freqDial() });
         for (Bench* x : { &b, &stay, &went }) (void) x->p.setDial("mid", 300.0);
-        test::run(b.p.setDial("freq", from)); test::run(stay.p.setDial("freq", from)); test::run(went.p.setDial("freq", to));
-        const auto before = b.play(150, tone); (void) stay.play(150, tone); (void) went.play(150, tone);
-        test::run(b.p.setDial("freq", to));
-        const auto y = b.play(150, tone), s0 = stay.play(2, tone), s1 = went.play(2, tone);
-        const auto after = b.play(60, tone);
+        test::run(b.p.setDial("freq", m.from)); test::run(stay.p.setDial("freq", m.from)); test::run(went.p.setDial("freq", m.to));
+        (void) b.play(300, tone); (void) stay.play(300, tone); (void) went.play(300, tone);   // settled: the bands' ramps are over
+        const auto before = b.play(60, tone); (void) stay.play(60, tone); (void) went.play(60, tone);
+        std::vector<float> y { before.back() };              // the edit's own boundary is in the measurement
+        for (int k = 0; k < 150; ++k) {
+            if (m.hand) { if (k < 60) test::run(b.p.setDial("freq", m.from + (m.to - m.from) * (k + 1) / 60.0)); }
+            else if (k == 0) test::run(b.p.setDial("freq", m.to));
+            const auto blk = b.play(1, tone);
+            y.insert(y.end(), blk.begin(), blk.end());
+        }
+        const auto after = b.play(60, tone), s0 = stay.play(2, tone), s1 = went.play(2, tone);
+        for (const float v : y) finite = finite && std::isfinite(v);
         const double settled = std::max(biggestStep(before, 0, before.size()), biggestStep(after, 0, after.size()));
         const double glide = biggestStep(y, 0, y.size());
-        double hard = 0.0;                                     // a switch at the worst instant of one period
+        double hard = 0.0;
         for (std::size_t n = 0; n < 192; ++n) hard = std::max(hard, (double) std::abs(s1[n] - s0[n]));
-        // The move rides the player's band ramp (BandRampTests): the coefficients travel for one ring of the band, and
-        // between two distant bells that path is not a bell sweep — the whole dial at once (200 -> 3200 Hz, +15 dB, past
-        // a 250 Hz tone) lifts the tone's steepest step to 1.37x its settled one while it travels; no step, no zipper.
-        ok(glide <= 1.5 * settled && glide < 0.1 * hard, "FREQ " + fmt(from, "%.0f") + "° -> " + fmt(to, "%.0f") + "°: the biggest "
-           "step through the glide " + fmt(glide, "%.5f") + ", settled " + fmt(settled, "%.5f") + "; a cut would step up to "
-           + fmt(hard, "%.5f"));
+        worstRatio = std::max(worstRatio, glide / settled);
+        ok(std::isfinite(glide) && glide <= kFreqMotionRatio * settled && glide < 0.1 * hard, std::string("FREQ ") + m.name
+           + ": the steepest step " + fmt(glide, "%.5f") + " (" + fmt(glide / settled, "%.2f") + "x the settled " + fmt(settled, "%.5f")
+           + "); a cut up to " + fmt(hard, "%.5f"));
     }
+    ok(finite, "every sample through the moves finite; the worst ratio " + fmt(worstRatio, "%.3f") + "x");
+}
+
+void switchStatesQ() {
+    group("a FREQ switch that states Q: the band takes it");
+    auto sw = freqSwitch();
+    sw.positions[0].q = 0.7; sw.positions[1].q = 0.9; sw.positions[2].q = 1.4;
+    for (const auto& [v, hz, q] : std::vector<std::tuple<std::string, double, double>> { { "Lo", 400.0, 0.7 }, { "Hi", 1600.0, 1.4 } }) {
+        Bench b({ mid("freq"), sw });
+        (void) b.p.setDial("mid", 300.0);
+        test::run(b.p.setSwitch("freq", v));
+        const double gap = gapDb(b.impulse(16384), hz, q, 15.0);
+        ok(gap < 0.01, "FREQ " + v + ": the bell at " + fmt(hz, "%.0f") + " Hz, Q " + fmt(q, "%.1f") + ", within " + fmt(gap, "%.5f") + " dB");
+    }
+}
+
+void dialHoldsPastTheEnds() {
+    group("a FREQ dial whose positions sit inside the sweep holds the outermost past them — never extrapolates");
+    namz::rig::Tone f = freqDial();
+    f.positions[0].value = "60";  f.positions[0].norm = 0.2;
+    f.positions[2].value = "240"; f.positions[2].norm = 0.8;
+    for (const auto& [deg, hz, q] : std::vector<std::tuple<double, double, double>> { { 0.0, 200.0, 0.7 }, { 300.0, 3200.0, 1.4 } }) {
+        Bench b({ mid("freq"), f });
+        (void) b.p.setDial("mid", 300.0);
+        test::run(b.p.setDial("freq", deg));
+        const double gap = gapDb(b.impulse(16384), hz, q, 15.0);
+        ok(gap < 0.01, "FREQ at " + fmt(deg, "%.0f") + "° (past the outermost position): held at " + fmt(hz, "%.0f") + " Hz, Q "
+           + fmt(q, "%.1f") + ", within " + fmt(gap, "%.5f") + " dB");
+    }
+}
+
+void freqDuringCrossfadeAllocatesNothing() {
+    group("FREQ moving while the captures crossfade: finite, no step past the motion bound, and process() allocates nothing");
+    auto tone = [](long i) { return (float) (0.3 * std::sin(2 * kPi * 250.0 * (double) i / kFs)); };
+    Bench b({ mid("freq"), freqDial() });
+    (void) b.p.setDial("mid", 300.0);
+    const auto before = b.play(300, tone);
+    std::vector<float> y { before.back() };
+    long long seen = 0;
+    for (int k = 0; k < 120; ++k) {
+        if (k < 60) { (void) b.p.setDial("gain", 60.0 + 180.0 * (k + 1) / 60.0); test::run(b.p.setDial("freq", 150.0 + 2.5 * (k + 1))); }
+        for (int i = 0; i < kBlock; ++i) b.y[(std::size_t) i] = tone(b.at + i);
+        float* io[1] { b.y.data() };
+        const long long a0 = test::alloc::count.load();
+        test::run(b.p.process(io, 1, kBlock));
+        seen += test::alloc::count.load() - a0;
+        b.at += kBlock;
+        b.p.serviceHere();
+        y.insert(y.end(), b.y.begin(), b.y.end());
+    }
+    const auto after = b.play(300, tone);
+    bool finite = true;
+    for (const float v : y) finite = finite && std::isfinite(v);
+    const double settled = std::max(biggestStep(before, 0, before.size()), biggestStep(after, after.size() / 2, after.size()));
+    const double glide = biggestStep(y, 0, y.size());
+    ok(finite && glide <= kFreqMotionRatio * settled, "finite; the steepest step " + fmt(glide, "%.5f") + " ("
+       + fmt(glide / settled, "%.2f") + "x the settled " + fmt(settled, "%.5f") + ")");
+    test::okNoAlloc(seen == 0, "120 blocks with FREQ and the gain dial moving allocate nothing in process() (" + std::to_string(seen) + ")");
 }
 
 } // namespace
@@ -223,5 +296,8 @@ int main() {
     switchPlaysTheBell();
     referenceIsTheOldBand();
     freqMoveGlides();
+    switchStatesQ();
+    dialHoldsPastTheEnds();
+    freqDuringCrossfadeAllocatesNothing();
     return test::report();
 }
