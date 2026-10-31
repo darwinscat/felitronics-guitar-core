@@ -18,6 +18,7 @@
 #include <namz_rig.h>
 
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <cstddef>
 #include <string>
@@ -140,16 +141,46 @@ inline felitronics::rigplayer::SectionKind kindOf(namz::rig::SectionKind k) {
 // One band at travel `t`: the gain runs linearly in dB from zero at the reference to `range_db` at the
 // stop on t's side; the frequency heads for `hz_at` on that side geometrically and the Q for `q_at`
 // linearly, by |t|. A side that is not stated (0) does not move.
-inline felitronics::rigplayer::SectionBiquad sectionAt(const namz::rig::Section& s, double t, double sampleRate) {
+// `hzBy` / `qBy` (> 0): the band's frequency — and Q — as its frequency knob states them now (frequencyAt); they replace
+// the band's own, which then do not travel (one owner per quantity: a band naming a knob carries no `hz_at`).
+inline felitronics::rigplayer::SectionBiquad sectionAt(const namz::rig::Section& s, double t, double sampleRate,
+                                                       double hzBy = 0.0, double qBy = 0.0) {
     t = std::clamp(t, -1.0, 1.0);
     const double a = std::abs(t);
     const double gainDb = t < 0.0 ? -t * s.dbAtMin : t * s.dbAtMax;
     const double hzEnd  = t < 0.0 ? s.hzAtMin : s.hzAtMax;
     const double qEnd   = t < 0.0 ? s.qAtMin  : s.qAtMax;
     double hz = s.hz, q = s.q;
-    if (hzEnd > 0.0 && s.hz > 0.0) hz = s.hz * std::pow(hzEnd / s.hz, a);
-    if (qEnd > 0.0)                q  = s.q + (qEnd - s.q) * a;
+    if (hzBy > 0.0)                     hz = hzBy;
+    else if (hzEnd > 0.0 && s.hz > 0.0) hz = s.hz * std::pow(hzEnd / s.hz, a);
+    if (qBy > 0.0)                      q  = qBy;
+    else if (qEnd > 0.0)                q  = s.q + (qEnd - s.q) * a;
     return felitronics::rigplayer::designSection(kindOf(s.kind), hz, gainDb, q, sampleRate, s.pivot);
+}
+
+// THE FREQUENCY KNOB (namz 5, `positions[].hz`): where the band it moves sits at `value` — its frequency, and its Q
+// where the knob states one (else 0). A position named exactly is taken as stated, so the reference plays the band's
+// own numbers bit for bit. Between two positions of a DIAL, against `norm`: the frequency geometric, the Q linear; past
+// the outermost, held. A SWITCH has its named positions and nothing between them. False when it cannot say.
+inline bool frequencyAt(const Tone& t, const std::string& value, double& hz, double& q) {
+    for (const auto& p : t.positions)
+        if (p.value == value) { hz = p.hz; q = p.q; return p.hz > 0.0; }
+    double norm = 0.0;
+    if (t.positions.empty() || ! toneNorm(t, value, norm)) return false;
+    const auto& ps = t.positions;
+    const auto* a = &ps.front();
+    const auto* b = &ps.back();
+    if (norm <= a->norm) b = a;
+    else if (norm >= b->norm) a = b;
+    else
+        for (std::size_t k = 1; k < ps.size(); ++k)
+            if (norm <= ps[k].norm) { a = &ps[k - 1]; b = &ps[k]; break; }
+    if (! (a->hz > 0.0) || ! (b->hz > 0.0)) return false;
+    if (a == b || ! (b->norm > a->norm)) { hz = a->hz; q = a->q; return true; }
+    const double u = (norm - a->norm) / (b->norm - a->norm);
+    hz = a->hz * std::pow(b->hz / a->hz, u);
+    q  = a->q + (b->q - a->q) * u;
+    return true;
 }
 
 // WHOSE BANDS LIVE ON ITS POSITIONS — a switch stating a filter at each of them (schema 4). It carries
@@ -178,14 +209,21 @@ inline std::vector<felitronics::rigplayer::SectionBiquad> sectionsAtValue(const 
 
 // Every band of a `sections` knob at `value` (degrees). A knob whose bands cannot be built is empty —
 // the reference position plays, which is what dropping a tone knob has always meant.
-inline std::vector<felitronics::rigplayer::SectionBiquad> sectionsAt(const Tone& t, const std::string& value,
-                                                        double sampleRate) {
+// `frequencyOf(knob, hz, q)` answers for a band that names a frequency knob (`hz_by`): where that knob sets it now.
+// Without an answer the band plays at its own frequency, which is what a dropped frequency knob means.
+inline std::vector<felitronics::rigplayer::SectionBiquad> sectionsAt(
+        const Tone& t, const std::string& value, double sampleRate,
+        const std::function<bool(const std::string&, double&, double&)>& frequencyOf = {}) {
     std::vector<felitronics::rigplayer::SectionBiquad> out;
     double norm = 0.0;
     if (t.sections.empty() || ! toneNorm(t, value, norm)) return out;
     const double tr = travelOf(t, norm);
     out.reserve(t.sections.size());
-    for (const auto& s : t.sections) out.push_back(sectionAt(s, tr, sampleRate));
+    for (const auto& s : t.sections) {
+        double hz = 0.0, q = 0.0;
+        if (! s.hzBy.empty() && frequencyOf && frequencyOf(s.hzBy, hz, q)) out.push_back(sectionAt(s, tr, sampleRate, hz, q));
+        else                                                                out.push_back(sectionAt(s, tr, sampleRate));
+    }
     return out;
 }
 

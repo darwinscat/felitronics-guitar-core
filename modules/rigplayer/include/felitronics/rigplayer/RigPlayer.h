@@ -2674,6 +2674,8 @@ private:
     }
 
     void rebuildKnob(const namz::rig::Tone& t) {
+        // A FREQUENCY knob has no filter of its own and no side: it moves a band of another knob, wherever that sits.
+        if (namz::rig::isFrequencyKnob(t)) { rebuildBands(0); rebuildBands(1); return; }
         const int side = sideOf(t);
         if (side < 0) return;
         // Bands, whether they travel with a dial or stand still at a switch's position; else the curve.
@@ -2689,7 +2691,7 @@ private:
         for (const auto& t : tones()) {
             // A knob whose positions carry BANDS ships no curve and no grid: it belongs to the other
             // path, and asking this one for its curve would ask an empty grid for a value.
-            if (sideOf(t) != side || t.positions.empty() || bandsPerPosition(t)) continue;
+            if (sideOf(t) != side || t.positions.empty() || bandsPerPosition(t) || namz::rig::isFrequencyKnob(t)) continue;
             const auto grid  = gridOf(t);
             const auto curve = curveAt(t, grid, toneAt_[t.name]);
             if (curve.empty()) continue;
@@ -2712,6 +2714,15 @@ private:
     // Every band of every section-form knob on one side, at its knob's position — in a fixed order,
     // so band k keeps its state across knob moves.
     void rebuildBands(int side) {
+        // A band naming a frequency knob (`hz_by`) asks it where it sits now: that knob's position, by name.
+        const auto frequencyOf = [this] (const std::string& knob, double& hz, double& q) {
+            for (const auto& f : tones())
+                if (f.name == knob && namz::rig::isFrequencyKnob(f)) {
+                    const auto at = toneAt_.find(knob);
+                    return frequencyAt(f, at != toneAt_.end() ? at->second : toneStart(f), hz, q);
+                }
+            return false;
+        };
         BandSet set;
         bandsShown_[side].clear();
         int dropped = 0;
@@ -2719,7 +2730,7 @@ private:
             if (sideOf(t) != side) continue;
             // A DIAL's bands travel with its rotation; a SWITCH's stand whole at the position it is on.
             // One list either way, in a fixed order, so band k keeps its state across knob moves.
-            const auto qs = ! t.sections.empty() ? sectionsAt(t, toneAt_[t.name], fs_)
+            const auto qs = ! t.sections.empty() ? sectionsAt(t, toneAt_[t.name], fs_, frequencyOf)
                           : bandsPerPosition(t)  ? sectionsAtValue(t, toneAt_[t.name], fs_)
                                                  : std::vector<felitronics::rigplayer::SectionBiquad> {};
             for (const auto& q : qs) {

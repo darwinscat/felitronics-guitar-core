@@ -16,4 +16,4 @@ modules/rigplayer/include/felitronics/rigplayer/BlendKnob.h  [pow*1]  retain-rt 
 modules/rigplayer/include/felitronics/rigplayer/CrossoverBlend.h  [exp*2]  retain-rt  the crossover blend's glides (the split per grid segment, the slots' polarity per block) on the playback path
 modules/rigplayer/include/felitronics/rigplayer/RigPlayer.h  [exp*2 log*2 pow*1]  retain-rt  block ramps and level conversions on the playback path
 modules/rigplayer/include/felitronics/rigplayer/SectionBiquad.h  [cos*1 log10*1 pow*2 sin*1]  retain-rt  the tone-section biquad's coefficients
-modules/rigplayer/include/felitronics/rigplayer/ToneKnobs.h  [pow*1]  retain-rt  knob-to-gain taper
+modules/rigplayer/include/felitronics/rigplayer/ToneKnobs.h  [pow*2]  retain-rt  knob-to-gain taper, and the frequency knob's geometric interpolation
