@@ -226,10 +226,11 @@ player says when; `CrossoverBlend.h` holds the mechanism (ring, taps, mirrored l
   up fades the pair in at 1 Hz, where its all-pass is a wire across the audible band, then — once that fade is 95 % in,
   about 30 ms — sweeps it up to the frequency (within 1 % about 46 ms later); turning it to 0 sweeps down, fades out
   and stops once the fade is below −180 dB. A crossfade against the pair at its working frequency would null there
-  (−12.4 dB through the switch on a 150 Hz tone). THE TRUE BOUND of the sweep, over 8 phases × tones 40/55/80/150/300 Hz
-  × crossovers 80/150/250 Hz: the quietest period of the tone dips −3.03 dB switching on (a 55 Hz tone at an 80 Hz
-  crossover — the pair swept up through the tone) and −0.49 dB switching off; a 20 ms sweep or waiting for 99.9 % did
-  no better. A one-time switch transient.
+  (−12.4 dB through the switch on a 150 Hz tone). THE TRUE BOUND of the sweep, over 32 phases × tones
+  31/40/55/80/150/300 Hz × crossovers 50/80/150/250 Hz: the quietest period of the tone dips −3.47 dB switching on (an
+  80 Hz tone at a 150 Hz crossover — the pair swept up through the tone) and −0.60 dB switching off; a 20 ms sweep or
+  waiting for 99.9 % did no better. A one-time switch transient — a host that automates the amount between 0 and a
+  little hears it each time, and should hold the amount above 0 instead.
   The amount, the frequency, the clean level and the polarity glide (10 ms); a lag crossfades its tap (10 ms), and a
   second lag asked mid-fade waits for the first.
 - **One pair splits both sides**: core's `eq::Crossover2` (two Butterworth SVFs a side, a 4th-order Linkwitz–Riley).
@@ -263,8 +264,10 @@ What the player reads per capture, and what the host decides:
   when the same stamped rig (`rigId`) is loaded again, dropped to 0 by any other load (an unstamped pack cannot be told
   from another with the same file names and lags), rebased by a table counted from another reference in the same
   samples when it still reads the old one, else dropped; a table in other samples drops it too — a measured table
-  (its probe's rate) and a pack's (the models' rate, 0) count as different even when the models are 48 kHz. Set with
-  nothing loaded, it is the next pack's. **`setCrossoverLag(trim)`** is the bench's trim on every capture.
+  (its probe's rate) and a pack's (the models' rate, 0) count as different even when the models are 48 kHz. The same
+  rig loaded again is checked the same way against the table it brings. Set with nothing loaded, it is the next
+  pack's, whatever tables arrive before it. Set it AFTER the table it is measured against (`setAlignment`, or the
+  pack's own): a later table in other coordinates rebases or drops it. **`setCrossoverLag(trim)`** is the bench's trim on every capture.
   Both are refused if they would put a capture before its DI or past the clean leg's reach — a TIME, 2048 samples at
   48 kHz, sized for the host rate — and `crossoverLagFits()` turns false when a later table or rate does that. At
   bass frequencies a few samples hardly matter (5 samples are 5.6° at 150 Hz); tens do.

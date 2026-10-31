@@ -16,7 +16,7 @@
   `eq::Crossover2` on the player without it — bit for bit at amount 1, within 1e-6 at 0.3 — through crossfades,
   one-model dips, a table handed in while playing and an inverting capture; the blend knob dry, half and wet keeps the
   device's magnitude within −131 dB of its peak. Switching on fades the pair in at 1 Hz and sweeps it up: the worst
-  dip of a tone through the switch is −3.03 dB over 8 phases × 5 tones × 3 crossovers (a plain crossfade read −12.4 at
+  dip of a tone through the switch is −3.47 dB over 32 phases × 6 tones × 4 crossovers (a plain crossfade read −12.4 at
   one). A stopped plane and `unload()` leave nothing of it. A capture's lag is its absolute reading, or its relative
   one plus the pack's reference offset (bound to the pack: its `rigId`, else that load), plus the bench's trim; its
   polarity and the clean level (captures' part only) land with it. Amount 0 is the player without it, byte for byte against the player before it
