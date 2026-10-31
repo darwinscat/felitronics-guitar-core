@@ -1354,7 +1354,7 @@ public:
         xoRefOffset_ = samples;
         if (prepared_ && loaded_ && ! crossoverLagsFit()) { xoRefOffset_ = was; return false; }
         xoRefPending_ = ! loaded_;
-        if (loaded_) { xoRefPack_ = xoPack_; xoRefFile_ = align_.reference; xoRefRate_ = align_.sampleRate; }
+        if (loaded_) { xoRefPack_ = xoPack_; xoRefFile_ = align_.reference; xoRefRate_ = align_.sampleRate; xoRefTable_ = align_.lagByFile; }
         publishCrossoverLags();
         return true;
     }
@@ -1943,20 +1943,50 @@ private:
     // A PENDING offset (set with nothing loaded) has no coordinates yet: no table rebases it, and the next load binds it
     // as it is. A load of the SAME pack (its rigId) is a table like any other: unchanged when it counts from the same
     // reference in the same samples, rebased or dropped otherwise — never kept in the coordinates of the last table.
+    //
+    // THE SAME RIG LOADED AGAIN brings its table back: the offset is KEPT only when that table is the one it was bound
+    // to, word for word; REBASED when the old reference is still read in the same samples and every other file stands
+    // where it stood against it (the anchor moved, nothing was recaptured); DROPPED otherwise — a recapture moves what
+    // the offset measured. (A reference file retrained under the same numbers cannot be told without its bytes.) A
+    // rebase that leaves ±kMaxCrossoverLag drops it too: the arithmetic is wide, the stored value representable.
     void bindReferenceLag(const AlignmentTable& t, bool newPack) {
         if (xoRefPending_) {
             if (! newPack) return;
-            xoRefPending_ = false; xoRefPack_ = xoPack_; xoRefFile_ = t.reference; xoRefRate_ = t.sampleRate;
+            xoRefPending_ = false;
+            bindTo(t);
             return;
         }
         const bool otherPack = newPack && xoRefPack_ != xoPack_;
-        if (otherPack) xoRefOffset_ = 0;
         const bool sameUnits = felitronics::core::exactlyEqual(t.sampleRate, xoRefRate_);
-        if (! otherPack && (t.reference != xoRefFile_ || ! sameUnits)) {
-            const auto old = t.lagByFile.find(xoRefFile_);
-            xoRefOffset_ = old != t.lagByFile.end() && sameUnits ? xoRefOffset_ - old->second : 0;
+        const auto old = t.lagByFile.find(xoRefFile_);
+        const bool readable = old != t.lagByFile.end() && sameUnits;
+        if (otherPack) xoRefOffset_ = 0;
+        else if (newPack) {
+            const bool identical = t.reference == xoRefFile_ && sameUnits && t.lagByFile == xoRefTable_;
+            if (! identical) xoRefOffset_ = readable && sameShape(t) ? rebased(old->second) : 0;
         }
-        xoRefPack_ = xoPack_; xoRefFile_ = t.reference; xoRefRate_ = t.sampleRate;
+        else if (t.reference != xoRefFile_ || ! sameUnits) xoRefOffset_ = readable ? rebased(old->second) : 0;
+        bindTo(t);
+    }
+    void bindTo(const AlignmentTable& t) {
+        xoRefPack_ = xoPack_; xoRefFile_ = t.reference; xoRefRate_ = t.sampleRate; xoRefTable_ = t.lagByFile;
+    }
+    int rebased(int oldReferenceLag) const {
+        const long long r = (long long) xoRefOffset_ - (long long) oldReferenceLag;
+        return r < -kMaxCrossoverLag || r > kMaxCrossoverLag ? 0 : (int) r;
+    }
+    // Every file of the bound table stands where it stood against the old reference, in `t` as well (and no file came or went).
+    bool sameShape(const AlignmentTable& t) const {
+        if (t.lagByFile.size() != xoRefTable_.size()) return false;
+        const auto oldNew = t.lagByFile.find(xoRefFile_);
+        const auto oldOld = xoRefTable_.find(xoRefFile_);
+        if (oldNew == t.lagByFile.end() || oldOld == xoRefTable_.end()) return false;
+        for (const auto& [id, lag] : xoRefTable_) {
+            const auto it = t.lagByFile.find(id);
+            if (it == t.lagByFile.end()) return false;
+            if ((long long) it->second - oldNew->second != (long long) lag - oldOld->second) return false;
+        }
+        return true;
     }
     bool crossoverLagsFit() const {
         for (std::size_t k = 0; k < models_.size(); ++k)
@@ -3028,7 +3058,8 @@ private:
     int    xoTrim_ = 0;                                         // the host trim (setCrossoverLag), the bench's
     int    xoRefOffset_ = 0;                                    // the reference offset (setCrossoverReferenceLag)…
     std::string xoPack_, xoRefPack_, xoRefFile_;                // …the pack, and the reference, it belongs to…
-    double xoRefRate_ = 0.0;                                    // …and the samples it is in (the table's rate; 0 = the models')
+    double xoRefRate_ = 0.0;                                    // …and the samples it is in (the table's rate; 0 = the models')…
+    std::map<std::string, int> xoRefTable_;                     // …and the relative table it was bound to, word for word
     bool   xoRefPending_ = false;                               // set with nothing loaded: the next pack's
     std::vector<double> modelRate_;                             // message thread: each model's own rate; NaN = not landed
     std::atomic<bool> xoInvert_ { false };

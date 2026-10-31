@@ -265,7 +265,9 @@ What the player reads per capture, and what the host decides:
   from another with the same file names and lags), rebased by a table counted from another reference in the same
   samples when it still reads the old one, else dropped; a table in other samples drops it too — a measured table
   (its probe's rate) and a pack's (the models' rate, 0) count as different even when the models are 48 kHz. The same
-  rig loaded again is checked the same way against the table it brings. Set with nothing loaded, it is the next
+  rig loaded again keeps it only when it brings the very table it was bound to, rebases it when only the anchor moved,
+  and drops it after a recapture (a file that moved against the reference); a reference retrained under the same
+  numbers cannot be told without its bytes. Set with nothing loaded, it is the next
   pack's, whatever tables arrive before it. Set it AFTER the table it is measured against (`setAlignment`, or the
   pack's own): a later table in other coordinates rebases or drops it. **`setCrossoverLag(trim)`** is the bench's trim on every capture.
   Both are refused if they would put a capture before its DI or past the clean leg's reach — a TIME, 2048 samples at

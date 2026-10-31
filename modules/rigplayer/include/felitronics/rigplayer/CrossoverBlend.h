@@ -229,9 +229,12 @@ public:
             float* slot[2] { cl, other };
             for (int i = 0; i < 2; ++i) {
                 if (! r.run[i]) { std::fill(slot[i], slot[i] + count, 0.0f); continue; }
-                float g = sign_[i];
-                for (int k = 0; k < count; ++k) { g += signStep[i]; slot[i][k] = tapAt(tap_[i], ring, count, k) * g; }
+                for (int k = 0; k < count; ++k) slot[i][k] = tapAt(tap_[i], ring, count, k);
                 felitronics::nam::blendDelay(slot[i], tail_[i][(std::size_t) c].data(), kMaxDelay, delay[i], count);
+                // The slot's gain AFTER its line: a polarity or level that lands reaches what the line still holds too,
+                // as the capture's own reading does on the device side (its line holds the capture's output).
+                float g = sign_[i];
+                for (int k = 0; k < count; ++k) { g += signStep[i]; slot[i][k] *= g; }
             }
             mixSlots(cl, other, count, r);
         }

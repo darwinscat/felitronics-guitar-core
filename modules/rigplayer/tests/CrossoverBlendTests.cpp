@@ -1034,6 +1034,88 @@ void lagOfSaturates() {
        "INT_MAX + 1 + 1 and INT_MAX/2 x 4 both read INT_MAX (" + std::to_string(sum) + ", " + std::to_string(scaled) + ")");
 }
 
+
+// --------------------------------------------------------------------------------------- review round 4 ----
+
+void recapturedRigDropsTheOffset() {
+    group("a same-rig reload whose relative table CHANGED (a recapture) does not keep the offset");
+    const std::vector<Cap> was { { "a", delayModel(160, 1.0), "60", 0 }, { "b", delayModel(200, 1.0), "240", 40 } };
+    const std::vector<Cap> now { { "a", delayModel(160, 1.0), "60", 0 }, { "b", delayModel(240, 1.0), "240", 80 } };
+    Bench b(was, 48000.0, 60.0, crossover(150.0, 1.0));
+    loadPack(b, was, "rig-3");
+    test::run(b.p.setCrossoverReferenceLag(160));
+    loadPack(b, was, "rig-3");
+    const int same = b.p.crossoverReferenceLag();
+    loadPack(b, now, "rig-3");
+    ok(same == 160 && b.p.crossoverReferenceLag() == 0, "the same table again: kept (" + std::to_string(same)
+       + "); b recaptured 40 -> 80 under the same rig: dropped (" + std::to_string(b.p.crossoverReferenceLag()) + ")");
+}
+
+void mutedSnapReachesTheLine() {
+    group("a polarity landing in a muted block reaches the whole slot line: 32-sample blocks, a 128-sample alignment delay");
+    // The middle capture inverts, warms 1500 samples at gain zero, and its slot is held back 128 samples by the alignment.
+    const std::vector<Cap> caps { { "early", delayModel(1628, 1.0), "60", 1628 }, { "mid", delayModel(1500, -1.0), "150", 1500 },
+                                  { "late", delayModel(1628, 1.0), "240", 1628 } };
+    AlignmentTable t; t.reference = "early"; t.lagByFile = { { "early", 1628 }, { "mid", 1500 }, { "late", 1628 } };
+    std::map<std::string, std::vector<std::byte>> files;
+    for (const auto& c : caps) files[c.id] = bytesOf(c.model);
+    auto make = [&](RigPlayer& p, double amount) {
+        test::run(p.setMaxModels(1)); crossover(150.0, amount)(p);
+        test::run(p.prepare(48000.0, kBlock, 1)); p.setNormalize(false);
+        p.load(rigOf(caps), [&files](const std::string& id) { return files.at(id); });
+        (void) p.setDial("gain", 60.0); p.setAlignment(t);
+    };
+    // The reading must land in the LAST muted block, so the line still holds samples from before it when the capture
+    // becomes audible: a first pass finds that block, a second hands the reading in just before it.
+    constexpr int n = 32;
+    auto run = [&](int updateAfter, int& firstAudible) {
+        AlignmentTable tt = t;
+        RigPlayer off, on;
+        make(off, 0.0); make(on, 1.0);
+        off.setAlignment(tt); on.setAlignment(tt);
+        Reference ref(48000.0, 150.0f);
+        std::vector<float> x(n), y(n);
+        long at = 0;
+        double worst = 0.0;
+        auto step = [&] {
+            for (int i = 0; i < n; ++i) x[(std::size_t) i] = y[(std::size_t) i] = di(at + i, 48000.0);
+            at += n;
+            float* io0[1] { x.data() }; float* io1[1] { y.data() };
+            test::run(off.process(io0, 1, n)); test::run(on.process(io1, 1, n));
+            off.serviceHere(); on.serviceHere();
+            for (int i = 0; i < n; ++i) worst = std::max(worst, (double) std::abs(ref(x[(std::size_t) i]) - y[(std::size_t) i]));
+        };
+        for (int k = 0; k < 400; ++k) step();
+        (void) off.setDial("gain", 150.0); (void) on.setDial("gain", 150.0);
+        firstAudible = -1;
+        bool muted = false;                               // mid held, and the law holding it at gain zero
+        for (int k = 0; k < 1600; ++k) {
+            step();
+            if (k == updateAfter) { tt.invertedByFile = { { "mid", true } }; off.setAlignment(tt); on.setAlignment(tt); worst = 0.0; }
+            const bool mid = on.heldFileId(0) == "mid" || on.heldFileId(1) == "mid";
+            if (mid && ! on.audible()) muted = true;
+            if (firstAudible < 0 && muted && on.audible()) firstAudible = k;
+        }
+        return worst;
+    };
+    int firstAudible = -1, unused = -1;
+    (void) run(-1, firstAudible);
+    const double worst = firstAudible > 2 ? run(firstAudible - 2, unused) : 1.0;
+    ok(worst == 0.0, "the reading lands in the last muted block (" + std::to_string(firstAudible - 1) + "); from there on within "
+       + fmt(worst, "%.3g"));
+}
+
+void rebaseSaturates() {
+    group("a rebase that cannot be represented drops the offset (UBSan: no signed overflow)");
+    RigPlayer p;                                             // not prepared: the offset is taken without a reach to check
+    std::map<std::string, std::vector<std::byte>> files { { "a", bytesOf(gainModel(1.0)) }, { "b", bytesOf(gainModel(1.0)) } };
+    p.load(rigOf({ { "a", "", "60", 0 }, { "b", "", "240", 0 } }), [&files](const std::string& id) { return files.at(id); });
+    test::run(p.setCrossoverReferenceLag(-2));
+    AlignmentTable t; t.reference = "b"; t.lagByFile = { { "a", std::numeric_limits<int>::max() }, { "b", 0 } };
+    p.setAlignment(t);
+    ok(p.crossoverReferenceLag() == 0, "-2 rebased by a reference INT_MAX away: dropped (" + std::to_string(p.crossoverReferenceLag()) + ")");
+}
+
 } // namespace
 
 int main() {
@@ -1068,6 +1150,9 @@ int main() {
     referenceOffsetAcrossLoads();
     polarityThroughOneModelWarmUp();
     lagOfSaturates();
+    recapturedRigDropsTheOffset();
+    mutedSnapReachesTheLine();
+    rebaseSaturates();
     seamOnRealCaptures();
     return test::report();
 }
