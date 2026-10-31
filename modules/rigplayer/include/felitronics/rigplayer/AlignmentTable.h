@@ -89,6 +89,27 @@ struct AlignmentTable {
     // offset; RigPlayer applies the polarity per slot.
     std::map<std::string, int>  absoluteLagByFile;
     std::map<std::string, bool> invertedByFile;
+    // fromDevice DERIVED `lagByFile` from the absolute readings (no `lag_samples` in the pack). Those readings are each
+    // in their own model's rate, so a player compares them in TIME (delayOfAbsolute) once it knows the rates; the derived
+    // `lagByFile` stays as the table's shape (its reference, its files) and for a host that reads it.
+    bool derivedFromAbsolute = false;
+
+    // How much to DELAY this file so it lines up with the latest one, from the ABSOLUTE readings compared in time — each
+    // in its own model's rate (`rateOf`; not positive = the host's) — in HOST samples. 48 samples at 48 kHz and 96 at
+    // 96 kHz are both 1 ms: neither is delayed. An unknown file is not delayed.
+    int delayOfAbsolute(const std::string& fileId, double hostRate, const std::function<double(const std::string&)>& rateOf) const {
+        const auto me = absoluteLagByFile.find(fileId);
+        if (me == absoluteLagByFile.end() || ! (hostRate > 0.0)) return 0;
+        const auto seconds = [&] (const std::string& id, int lag) {
+            const double r = rateOf ? rateOf(id) : 0.0;
+            return (double) lag / (r > 0.0 ? r : hostRate);
+        };
+        double latest = seconds(fileId, me->second);
+        for (const auto& [id, lag] : absoluteLagByFile) latest = std::max(latest, seconds(id, lag));
+        const double d = (latest - seconds(fileId, me->second)) * hostRate;
+        return d >= (double) felitronics::nam::kBlendMaxDelay ? felitronics::nam::kBlendMaxDelay
+                                                              : std::clamp((int) std::lround(d), 0, felitronics::nam::kBlendMaxDelay);
+    }
 
     bool empty() const { return lagByFile.empty(); }
 
@@ -154,6 +175,7 @@ struct AlignmentTable {
         if (allRelative) {
             for (const auto& f : d.files) if (! f.id.empty()) out.lagByFile[f.id] = *f.lagSamples;
         } else if (allAbsolute && ! out.reference.empty()) {
+            out.derivedFromAbsolute = true;
             const long long ref = out.absoluteLagByFile[out.reference];
             for (const auto& [id, lag] : out.absoluteLagByFile) {
                 const long long rel = (long long) lag - ref;

@@ -23,6 +23,7 @@
 
 #include <felitronics/eq/Crossover2.h>
 #include <felitronics/rigplayer/RigPlayer.h>
+#include <namz_rig_load.h>
 
 #include <algorithm>
 #include <cmath>
@@ -1155,6 +1156,49 @@ void schema5Readings() {
     }
 }
 
+
+void schema5MixedRatesAndJson() {
+    group("namz 5 readings: compared in time across model rates; a JSON-loaded pack of opposite polarities; a lead reported");
+    {   // 48 samples at 48 kHz and 96 at 96 kHz are both 1 ms: neither capture is held back against the other. (The table's
+        // own arithmetic: a Linear capture tagged 96 kHz does not load, so the rates are handed in as the player does.)
+        const auto t = AlignmentTable::fromDevice(schema5({ { "a", "", "60", std::nullopt }, { "b", "", "240", std::nullopt } },
+                                                          { 48, 96 }, { 1, 1 }).chain[0].device);
+        const auto rateOf = [](const std::string& id) { return id == "b" ? 96000.0 : 48000.0; };
+        const int a = t.delayOfAbsolute("a", 48000.0, rateOf), b = t.delayOfAbsolute("b", 48000.0, rateOf);
+        ok(t.derivedFromAbsolute && a == 0 && b == 0, "a 48 kHz capture 48 late beside a 96 kHz one 96 late: delays " + std::to_string(a)
+           + " and " + std::to_string(b) + " (the samples compared as numbers would hold a back by " + std::to_string(t.delayOf("a")) + ")");
+    }
+    {   // the manifest as namz 5 reads it: one capture plain, one inverting, both 20 late, a third of the way across
+        const std::string json = R"({"format":"orbitrig","chain":[{"kind":"nam","slot":"pedal",
+            "controls":[{"name":"gain","role":"gain","sweep":300,"values":["60","240"]}],
+            "files":[{"file":"a.namz","settings":{"gain":"60"},"input_lag_samples":20,"polarity":1},
+                     {"file":"b.namz","settings":{"gain":"240"},"input_lag_samples":20,"polarity":-1}]}]})";
+        bool loaded = false;
+        const auto rig = namz::rig::loadRigManifest(json, &loaded);
+        std::map<std::string, std::vector<std::byte>> files { { "a.namz", bytesOf(delayModel(20, 1.0)) }, { "b.namz", bytesOf(delayModel(20, -1.0)) } };
+        auto play = [&](double amount, float& mix) {
+            Bench b({ { "x", gainModel(1.0), "60", 0 }, { "y", gainModel(1.0), "240", 0 } }, 48000.0, 60.0, crossover(150.0, amount));
+            b.p.load(rig, [&files](const std::string& id) { const auto it = files.find(id); return it == files.end() ? std::vector<std::byte> {} : it->second; });
+            (void) b.p.setDial("gain", 120.0);
+            b.settle(80);
+            mix = b.p.liveMix();
+            return impulseResponse(b, 32768);
+        };
+        float m0 = 0.0f, m1 = 0.0f;
+        const auto off = play(0.0, m0), on = play(1.0, m1);
+        double worst = 0.0;
+        for (const double f : grid12()) worst = std::max(worst, std::abs(magDb(on, f, 48000.0) - magDb(off, f, 48000.0)));
+        ok(loaded && m1 > 0.05f && m1 < 0.95f && worst <= 0.1, "loaded from JSON, both captures heard (weight " + fmt(m1, "%.2f")
+           + "): the sum keeps the device's magnitude within " + fmt(worst, "%.6f") + " dB");
+    }
+    {   // a capture that LEADS its DI cannot be matched by holding the clean leg back: reported, not hidden
+        const std::vector<Cap> caps { { "a", gainModel(1.0), "60", std::nullopt }, { "b", gainModel(1.0), "240", std::nullopt } };
+        Bench b(caps, 48000.0, 60.0, crossover(150.0, 1.0));
+        b.p.load(schema5(caps, { -5, 0 }, { 1, 1 }), [&b](const std::string& id) { return b.files.at(id); });
+        ok(! b.p.crossoverLagFits(), "input_lag_samples -5: crossoverLagFits() false");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1193,6 +1237,7 @@ int main() {
     mutedSnapReachesTheLine();
     rebaseSaturates();
     schema5Readings();
+    schema5MixedRatesAndJson();
     seamOnRealCaptures();
     return test::report();
 }

@@ -2168,7 +2168,19 @@ private:
         // actually run it at. AlignmentTable falls back to scale 1.0 when handed a non-positive rate,
         // which for an untagged model at 96 kHz would apply a 48 kHz lag unscaled.
         const double runSR = felitronics::nam::NamStage::rateMatch(fs_, st.modelSampleRate()).modelRunSR;
-        return align_.delayOf(fileIdOfModel(id), fs_, runSR);
+        if (! align_.derivedFromAbsolute) return align_.delayOf(fileIdOfModel(id), fs_, runSR);
+        // A table derived from ABSOLUTE readings (namz 5) compares them in time, each in its own model's rate: this one's
+        // from its stage, the others' as learned at their landing, NAM's default for one not landed yet.
+        const std::string& me = fileIdOfModel(id);
+        const double unknown = felitronics::nam::NamStage::rateMatch(fs_, -1.0).modelRunSR;
+        return align_.delayOfAbsolute(me, fs_, [&] (const std::string& file) {
+            if (file == me) return runSR;
+            for (std::size_t k = 0; k < models_.size() && k < modelRate_.size(); ++k)
+                if (models_[k].id == file)
+                    return std::isnan(modelRate_[k]) ? unknown
+                                                     : felitronics::nam::NamStage::rateMatch(fs_, modelRate_[k]).modelRunSR;
+            return unknown;
+        });
     }
 
     // The whole decision for the panel as it stands, handed to the audio thread as a request. What the
@@ -2327,6 +2339,8 @@ private:
     // runs it (process() reads the slot's stage after the law).
     bool land(int slot, felitronics::nam::NamStage& stage, std::uint64_t model) {
         slotStage_[(std::size_t) (slot & 1)].store(&stage, std::memory_order_seq_cst);
+        if (model >= 1 && model <= modelRate_.size())         // the model's own rate, learned: the delays below read it
+            modelRate_[(std::size_t) model - 1] = stage.modelSampleRate();
         const int delay = delayOfModel(model, stage);             // after the load: the rate is the model's
         clearAsk(slot);
         landSlot_.store(slot, std::memory_order_relaxed);
@@ -2334,8 +2348,8 @@ private:
         landWarm_.store(warmFor(stage), std::memory_order_relaxed);
         landDelay_.store(std::clamp(delay, 0, kMaxDelay), std::memory_order_relaxed);
         if (model >= 1 && model <= modelRate_.size()) {     // the crossover's clean tap: now the rate is the model's
-            modelRate_[(std::size_t) model - 1] = stage.modelSampleRate();
             publishCrossoverLags();
+            if (align_.derivedFromAbsolute) stageDelays();     // a rate learned moves the others' delays (at silence)
         }
         landFlag_.store(true, std::memory_order_release);
         return true;
@@ -2715,8 +2729,9 @@ private:
     // so band k keeps its state across knob moves.
     void rebuildBands(int side) {
         // A band naming a frequency knob (`hz_by`) asks it where it sits now: that knob's position, by name.
-        const auto frequencyOf = [this] (const std::string& knob, double& hz, double& q) {
-            for (const auto& f : tones())
+        const auto knobs = tones();                          // once: tones() hands out a copy
+        const auto frequencyOf = [this, &knobs] (const std::string& knob, double& hz, double& q) {
+            for (const auto& f : knobs)
                 if (f.name == knob && namz::rig::isFrequencyKnob(f)) {
                     const auto at = toneAt_.find(knob);
                     return frequencyAt(f, at != toneAt_.end() ? at->second : toneStart(f), hz, q);
@@ -2726,7 +2741,7 @@ private:
         BandSet set;
         bandsShown_[side].clear();
         int dropped = 0;
-        for (const auto& t : tones()) {
+        for (const auto& t : knobs) {
             if (sideOf(t) != side) continue;
             // A DIAL's bands travel with its rotation; a SWITCH's stand whole at the position it is on.
             // One list either way, in a fixed order, so band k keeps its state across knob moves.
