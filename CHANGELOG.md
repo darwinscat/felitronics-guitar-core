@@ -11,6 +11,13 @@ namz v5.0.0 — the `.orbitrig` schema 5 — played; schema-4 packs load and pla
   (OrbitAmp FORCEs both) moves its pin with this one. namz 5.0.0 drops a `lag_samples` beyond ±48000 samples — its
   bound, by design: a schema-4 pack carrying one plays without a relative table.
 
+- **rigplayer: a slot's alignment delay moves while it is heard.** A table handed in mid-mix, or a model rate learned at a
+  landing (namz 5's absolute readings compared in time), reaches the capture that is PLAYING through a 10 ms crossfade of
+  its line (`SlotLine`, which keeps its last 128 samples; for a delay that holds, its samples are `nam::blendDelay`'s,
+  checked byte for byte) — it used to wait until the slot fell silent, so the comb stood until the dial visited a knot.
+  A slot changing capture is retimed only once it is silent at BOTH ends of a block: a constant 0.5 through such a turn
+  read 0.376 (a quarter of the sound spliced to zeros) and reads 0.5 now. The rest of the player is unchanged.
+
 ### Added
 - **rigplayer: the frequency knob.** A band whose `hz_by` names a knob takes its frequency — and its Q, where that knob
   states one — from that knob's position: on a dial geometric in Hz and linear in Q against `norm`, held past the
