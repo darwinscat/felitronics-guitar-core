@@ -17,6 +17,11 @@ Signal order, per block:
   once per block on the audio thread, the only writer of the weight.
 - A tone knob plays as the pack describes it: `sections` become biquads, `positions` (a curve)
   become one minimum-phase FIR per side. A blend knob mixes the DI through the dry path's response.
+- A FREQUENCY knob (schema 5: a band's `hz_by`, the knob's `positions[].hz` and optional `q`) moves another knob's
+  band: on a dial its frequency runs geometrically and its Q linearly against `norm` between the positions, held past
+  the outermost; on a switch the position whose value matches; a position named exactly plays as stated, so at the
+  knob's reference the band is its own, bit for bit. The band's gain still runs on its own knob. A move rides the
+  bands' coefficient ramp like any other knob (`ToneKnobs.h`: `frequencyAt`).
 - The models' offsets come from the pack (`lag_samples`); a pack without them can be measured by the
   host (`AlignmentTable`) and handed in.
 
@@ -255,9 +260,10 @@ What the player reads per capture, and what the host decides:
   capture's slot alone, and a capture's polarity and clean level LAND with it (a landing, a silent slot); only an edit
   to a capture that is heard glides. `setCrossoverInvert(true)` inverts every slot on top — the host's word for
   captures nothing has read: an inverting device notches the sum at the crossover (−132 dB at 150 Hz on an inverting
-  wire) where the bands should meet. No pack carries the per-capture readings yet: namz 5.0.0's
-  `files[].input_lag_samples` and `files[].polarity` plug in at the marked line of `AlignmentTable::fromDevice`
-  (`absoluteLagByFile` / `invertedByFile`), and nothing else changes.
+  wire) where the bands should meet. A schema-5 pack states them: `AlignmentTable::fromDevice` reads
+  `files[].input_lag_samples` into `absoluteLagByFile` and `files[].polarity` (−1) into `invertedByFile`, and when
+  every file states its absolute lag but not its `lag_samples`, derives the relative table from them (each against the
+  reference's), so a pack carrying only the new readings is aligned as well.
 - **`setCrossoverReferenceLag(offset)`** says how late the table's reference (`crossoverLagReference()`: the pack's
   first file, or the first that loaded when measured) trails its DI — the relative readings' missing number; a host
   can measure it as `measureAlignment` does, the probe through the file against the probe itself. It is the PACK's: kept

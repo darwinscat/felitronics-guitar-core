@@ -4,7 +4,23 @@
 
 ## Unreleased
 
+namz v5.0.0 — the `.orbitrig` schema 5 — played; schema-4 packs load and play as before.
+
+### Changed
+- **namz pinned to v5.0.0** (`FELITRONICS_NAMZ_TAG`, `FELITRONICS_NAMZ_COMMIT` = `717ca2d`). A host that pins namz itself
+  (OrbitAmp FORCEs both) moves its pin with this one.
+
 ### Added
+- **rigplayer: the frequency knob.** A band whose `hz_by` names a knob takes its frequency — and its Q, where that knob
+  states one — from that knob's position: on a dial geometric in Hz and linear in Q against `norm`, held past the
+  outermost position; on a switch the matching position (`frequencyAt`, `ToneKnobs.h`). The gain law is unchanged. A
+  MID with a FREQ dial plays the RBJ bell at the interpolated frequency and Q within 0.0004 dB (200 · 400 · 800 · 1600 ·
+  3200 Hz), a FREQ switch within 0.00002 dB; at FREQ's reference the output is the pack without FREQ, bit for bit; a
+  move rides the bands' coefficient ramp (whole-dial jump: the steepest step 1.37x the settled one, a cut 24x).
+- **rigplayer: a capture's own lag and polarity from the pack.** `AlignmentTable::fromDevice` reads schema 5's
+  `files[].input_lag_samples` and `files[].polarity`; a pack stating only those gets its relative table derived from
+  them. Played through the crossover blend: a pack with only absolute readings, a plain capture 160 samples late and an
+  inverting one 200 late, sums flat within 0.000002 dB.
 - **rigplayer: the crossover blend — a bass amp's clean low end.** `RigPlayer::setCrossoverHz` / `setCrossoverAmount` /
   `setCrossoverCleanDb` / `setCrossoverInvert` / `setCrossoverLag` / `setCrossoverReferenceLag`: below the frequency the output carries the clean
   input, above it the device, `HP4(device) + LP4((1 − amount) · device + amount · clean)`, split by core's
