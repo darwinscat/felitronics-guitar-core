@@ -21,7 +21,11 @@ Signal order, per block:
   band: on a dial its frequency runs geometrically and its Q linearly against `norm` between the positions, held past
   the outermost; on a switch the position whose value matches; a position named exactly plays as stated, so at the
   knob's reference the band is its own, bit for bit. The band's gain still runs on its own knob. A move rides the
-  bands' coefficient ramp like any other knob (`ToneKnobs.h`: `frequencyAt`).
+  bands' coefficient ramp like any other knob (`ToneKnobs.h`: `frequencyAt`); between two distant bells that path is
+  not a bell sweep — the whole dial at once lifts a tone's steepest step to 1.44x its settled one while it travels.
+  SWITCHES: the format says a switch's change of position cross-fades the outputs; this player ramps the coefficients
+  for every switch, a `positions[].sections` switch and a FREQ switch alike. An output crossfade for every switch is a
+  separate change.
 - The models' offsets come from the pack (`lag_samples`); a pack without them can be measured by the
   host (`AlignmentTable`) and handed in.
 
@@ -262,8 +266,12 @@ What the player reads per capture, and what the host decides:
   captures nothing has read: an inverting device notches the sum at the crossover (−132 dB at 150 Hz on an inverting
   wire) where the bands should meet. A schema-5 pack states them: `AlignmentTable::fromDevice` reads
   `files[].input_lag_samples` into `absoluteLagByFile` and `files[].polarity` (−1) into `invertedByFile`, and when
-  every file states its absolute lag but not its `lag_samples`, derives the relative table from them (each against the
-  reference's), so a pack carrying only the new readings is aligned as well.
+  every file states its absolute lag but not its `lag_samples`, derives the relative table from them, so a pack
+  carrying only the new readings is aligned as well — its slots' delays compared in TIME, each reading in its own
+  model's rate (48 samples at 48 kHz and 96 at 96 kHz are both 1 ms). With absolute readings the reference offset has
+  nothing to add: trim with `setCrossoverLag`, the bench's. A capture whose `input_lag_samples` is NEGATIVE leads its
+  DI — a training artefact: the clean leg cannot be advanced, so it plays on time and `crossoverLagFits()` reports
+  false; the player does not delay the model.
 - **`setCrossoverReferenceLag(offset)`** says how late the table's reference (`crossoverLagReference()`: the pack's
   first file, or the first that loaded when measured) trails its DI — the relative readings' missing number; a host
   can measure it as `measureAlignment` does, the probe through the file against the probe itself. It is the PACK's: kept
