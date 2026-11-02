@@ -517,7 +517,9 @@ group('exceptions where they are allowed: garbage for a capture is a failed load
     const memory0 = (await newProcessor(w0, null, { calibrate: false })).m.HEAPU8.buffer.byteLength;
     const { outs, proc } = await renderWorklet(w0, fixtureDir, frames, 1, 2, moves, ins, garbage);
     const memory1 = proc.m ? proc.m.HEAPU8.buffer.byteLength : 0;   // null: the processor failed (said below)
-    ok(memory1 > memory0 + (40 << 20), `the memory grew during a load (${memory0 >> 20} -> ${memory1 >> 20} MiB)`);
+    // Grown, and to hold the 48 MiB file: how far past it is the allocator's — the room the module already had, and
+    // whether a small allocation after the file needs one more growth step.
+    ok(memory1 > memory0 && memory1 >= big.length, `the memory grew during a load (${memory0 >> 20} -> ${memory1 >> 20} MiB)`);
     const failed = proc.port.posted.filter((m) => m.loaded !== undefined && !m.ok).map((m) => m.loaded);
     ok(failed.includes('g150.namz') && failed.includes('g240.nam'),
        `NAM threw and NamStage caught it, twice: { loaded, ok: false } for ${failed}`);
