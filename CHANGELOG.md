@@ -2,9 +2,10 @@
 
 # Changelog
 
-## Unreleased
+## v0.8.0 — 2026-11-02
 
-namz v5.0.0 — the `.orbitrig` schema 5 — played; schema-4 packs load and play as before.
+namz v5.0.0 — the `.orbitrig` schema 5, its frequency knob and a capture's own lag and polarity — played, and a bass
+amp's clean low end: the crossover blend. Schema-4 packs load and play as before.
 
 ### Changed
 - **namz pinned to v5.0.0** (`FELITRONICS_NAMZ_TAG`, `FELITRONICS_NAMZ_COMMIT` = `717ca2d`). A host that pins namz itself
