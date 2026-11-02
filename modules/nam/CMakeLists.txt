@@ -110,18 +110,19 @@ else()
     message(STATUS "Eigen at ${FELITRONICS_EIGEN_DIR} is not a git checkout — its commit is not checked")
 endif()
 
-# namz is a header-only, lossless .nam codec and the .orbitrig rig model (namz_rig*.h — schema 4 with
-# `tone`, `lag_samples` and the pack's own two levels, all of which felitronics::rigplayer reads).
+# namz is a header-only, lossless .nam codec and the .orbitrig rig model (namz_rig*.h — schema 5 with
+# `tone`, `lag_samples`, the pack's own two levels, a capture's `input_lag_samples` / `polarity` and the frequency knob
+# (`hz_by`, `positions[].hz`), all of which felitronics::rigplayer reads; schema-4 packs load as before).
 # Pinned by release tag, and the fetched tag is held to its commit (THIRD_PARTY_NOTICES.md names it): a tag that
 # moved, or another tag set without its commit, stops the configure instead of building silently. A host that sets
 # FELITRONICS_NAMZ_TAG (OrbitAmp FORCEs it) sets FELITRONICS_NAMZ_COMMIT with it. A local checkout
 # (FELITRONICS_NAMZ_SRC, FETCHCONTENT_SOURCE_DIR_NAMZ_SRC) is its owner's choice and is not held; BUILD-INFO names it.
 # SOURCE_SUBDIR deliberately points at a directory without CMakeLists.txt: populate the headers without building
 # namz's project or fetching nlohmann twice.
-set(FELITRONICS_NAMZ_TAG "v4.4.0" CACHE STRING
+set(FELITRONICS_NAMZ_TAG "v5.0.0" CACHE STRING
     "namz release to build against")
-set(FELITRONICS_NAMZ_COMMIT "215d1640a9462e965a5bf027d4a533b1d43a9607" CACHE STRING
-    "The commit that release must be: namz v4.4.0's tag")
+set(FELITRONICS_NAMZ_COMMIT "717ca2dc34cc712075abc77c613c507ee8bc8727" CACHE STRING
+    "The commit that release must be: namz v5.0.0's tag")
 set(FELITRONICS_NAMZ_SRC "" CACHE PATH
     "Local namz checkout (when empty, fetch the pin)")
 if(FELITRONICS_NAMZ_SRC AND NOT EXISTS "${FELITRONICS_NAMZ_SRC}")

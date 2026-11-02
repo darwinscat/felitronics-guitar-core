@@ -2,6 +2,61 @@
 
 # Changelog
 
+## v0.8.0 — 2026-11-02
+
+namz v5.0.0 — the `.orbitrig` schema 5, its frequency knob and a capture's own lag and polarity — played, and a bass
+amp's clean low end: the crossover blend. Schema-4 packs load and play as before.
+
+### Changed
+- **namz pinned to v5.0.0** (`FELITRONICS_NAMZ_TAG`, `FELITRONICS_NAMZ_COMMIT` = `717ca2d`). A host that pins namz itself
+  (OrbitAmp FORCEs both) moves its pin with this one. namz 5.0.0 drops a `lag_samples` beyond ±48000 samples — its
+  bound, by design: a schema-4 pack carrying one plays without a relative table.
+
+- **rigplayer: a slot's alignment delay moves while it is heard.** A table handed in mid-mix, or a model rate learned at a
+  landing (namz 5's absolute readings compared in time), reaches the capture that is PLAYING through a 10 ms crossfade of
+  its line (`SlotLine`, which keeps its last 128 samples; for a delay that holds, its samples are `nam::blendDelay`'s,
+  checked byte for byte) — it used to wait until the slot fell silent, so the comb stood until the dial visited a knot.
+  A slot changing capture is retimed only once it is silent at BOTH ends of a block: a constant 0.5 through such a turn
+  read 0.376 (a quarter of the sound spliced to zeros) and reads 0.5 now. The move is the SLOT's: one delay and one
+  fade clock for every plane, run on audio time, so a plane the host stops and hands back finds the fade where the
+  others have it; a delay asked mid-fade waits for the fade under way; `reset()` lands a fade in flight; the staged
+  delay is published together with the capture it belongs to, so an edit between the request and the delay cannot
+  retime the capture still playing. `SlotLine` nulls `nam::blendDelay` bit for bit over 366150 samples (delays 0 … 128,
+  blocks of 1 … 300). `RigPlayer::alignmentFits()` reports a table or rate that asks a slot for more than its 128-sample
+  reach (the line holds it at 128). The rest of the player is unchanged.
+
+### Added
+- **rigplayer: the frequency knob.** A band whose `hz_by` names a knob takes its frequency — and its Q, where that knob
+  states one — from that knob's position: on a dial geometric in Hz and linear in Q against `norm`, held past the
+  outermost position; on a switch the matching position (`frequencyAt`, `ToneKnobs.h`). The gain law is unchanged. A
+  MID with a FREQ dial plays the RBJ bell at the interpolated frequency and Q within 0.0004 dB (200 · 400 · 800 · 1600 ·
+  3200 Hz), a FREQ switch within 0.00002 dB; at FREQ's reference the output is the pack without FREQ, bit for bit; a
+  move rides the bands' coefficient ramp (whole-dial jump: the steepest step 1.44x the settled one, a cut 25x; by hand,
+  5° a block, 1.23x).
+- **rigplayer: a capture's own lag and polarity from the pack.** `AlignmentTable::fromDevice` reads schema 5's
+  `files[].input_lag_samples` and `files[].polarity`; a pack stating only those gets its relative table derived from
+  them — compared in time, each reading in its own model's rate. Played through the crossover blend: a pack with only absolute readings, a plain capture 160 samples late and an
+  inverting one 200 late, sums flat within 0.000002 dB.
+- **rigplayer: the crossover blend — a bass amp's clean low end.** `RigPlayer::setCrossoverHz` / `setCrossoverAmount` /
+  `setCrossoverCleanDb` / `setCrossoverInvert` / `setCrossoverLag` / `setCrossoverReferenceLag`: below the frequency the output carries the clean
+  input, above it the device, `HP4(device) + LP4((1 − amount) · device + amount · clean)`, split by core's
+  `eq::Crossover2` pair (4th-order Linkwitz–Riley) on both sides; the mechanism is `rigplayer/CrossoverBlend.h`, and
+  `mixSlots` is now the one spelling of how the law mixes two slots, for the models and the clean leg alike. The clean
+  leg is held back by what the device carries — the rate-match, each capture's lag and polarity and its slot's
+  alignment delay through mirrored lines — and carries the pack blend knob's dry part as the device does: a wire sums
+  flat (±0.000002 dB at 80/150/250 Hz, with captures 5 and 37 samples late too), pure-delay captures null against
+  `eq::Crossover2` on the player without it — bit for bit at amount 1, within 1e-6 at 0.3 — through crossfades,
+  one-model dips, a table handed in while playing and an inverting capture; the blend knob dry, half and wet keeps the
+  device's magnitude within −131 dB of its peak. Switching on fades the pair in at 1 Hz and sweeps it up: the worst
+  dip of a tone through the switch is −3.47 dB over 32 phases × 6 tones × 4 crossovers (a plain crossfade read −12.4 at
+  one). A stopped plane and `unload()` leave nothing of it. A capture's lag is its absolute reading, or its relative
+  one plus the pack's reference offset (bound to the pack: its `rigId`, else that load), plus the bench's trim; its
+  polarity and the clean level (captures' part only) land with it. Amount 0 is the player without it, byte for byte against the player before it
+  (NAM's A2, 48 and 44.1 kHz, a dial walk, narrow calls, a park), and costs one atomic load a block.
+  `AlignmentTable` names its `reference` and can carry each capture's `absoluteLagByFile` / `invertedByFile` (filled
+  by nothing yet); `lagOf` reads a file's lag in host samples; `measureLowBandGainDb` reads a capture's low-band gain
+  offline, for the clean level. No pack field.
+
 ## v0.7.1 — 2026-10-21
 
 The echo and the room no longer click when they stand by — felitronics-core pinned to v0.61.2.

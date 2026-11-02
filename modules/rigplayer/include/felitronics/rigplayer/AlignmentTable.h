@@ -15,6 +15,7 @@
 
 #include <felitronics/rigplayer/ModelAlignment.h>
 
+#include <felitronics/eq/Crossover2.h>      // measureLowBandGainDb: the crossover blend's own pair
 #include <felitronics/nam/BlendLaw.h>       // kBlendMaxDelay — the most a slot can be delayed
 #include <felitronics/nam/NamStage.h>
 #include <namz_rig.h>
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -78,6 +80,40 @@ struct AlignmentTable {
     // loaded). A player converts to its own rate with the three-argument delayOf.
     double sampleRate = 0.0;
     bool fromPack = false;
+    // THE ANCHOR: the file every reading above is counted from — a pack's first file (NAMZ-FORMAT.md: "later than the
+    // stage's first file"), or the first whose bytes loaded when measured. One definition, carried with the numbers.
+    std::string reference;
+    // A capture's OWN reading, when something measured it against its DI: how late its output arrives (in the table's
+    // samples) and whether it hands its input back inverted — namz 5's `input_lag_samples` and `polarity`, which
+    // fromDevice reads, or a host's measurement. lagOf prefers the absolute lag to the relative one plus the reference's
+    // offset; RigPlayer applies the polarity per slot.
+    std::map<std::string, int>  absoluteLagByFile;
+    std::map<std::string, bool> invertedByFile;
+    // fromDevice DERIVED `lagByFile` from the absolute readings (no `lag_samples` in the pack). Those readings are each
+    // in their own model's rate, so a player compares them in TIME (delayOfAbsolute) once it knows the rates; the derived
+    // `lagByFile` stays as the table's shape (its reference, its files) and for a host that reads it.
+    bool derivedFromAbsolute = false;
+
+    // How much to DELAY this file so it lines up with the latest one, from the ABSOLUTE readings compared in time — each
+    // in its own model's rate (`rateOf`; not positive = the host's) — in HOST samples. 48 samples at 48 kHz and 96 at
+    // 96 kHz are both 1 ms: neither is delayed. An unknown file is not delayed.
+    int delayOfAbsolute(const std::string& fileId, double hostRate, const std::function<double(const std::string&)>& rateOf) const {
+        const double d = delayOfAbsoluteRaw(fileId, hostRate, rateOf);
+        return d >= (double) felitronics::nam::kBlendMaxDelay ? felitronics::nam::kBlendMaxDelay
+                                                              : std::clamp((int) std::lround(d), 0, felitronics::nam::kBlendMaxDelay);
+    }
+    // …before it is rounded and held to the line's reach.
+    double delayOfAbsoluteRaw(const std::string& fileId, double hostRate, const std::function<double(const std::string&)>& rateOf) const {
+        const auto me = absoluteLagByFile.find(fileId);
+        if (me == absoluteLagByFile.end() || ! (hostRate > 0.0)) return 0.0;
+        const auto seconds = [&] (const std::string& id, int lag) {
+            const double r = rateOf ? rateOf(id) : 0.0;
+            return (double) lag / (r > 0.0 ? r : hostRate);
+        };
+        double latest = seconds(fileId, me->second);
+        for (const auto& [id, lag] : absoluteLagByFile) latest = std::max(latest, seconds(id, lag));
+        return (latest - seconds(fileId, me->second)) * hostRate;
+    }
 
     bool empty() const { return lagByFile.empty(); }
 
@@ -99,20 +135,91 @@ struct AlignmentTable {
         return std::clamp((int) std::lround((double) delayOf(fileId) * scale), 0, felitronics::nam::kBlendMaxDelay);
     }
 
-    // THE PACK'S OWN READING. Every distinct file of the stage must carry `lag_samples`, or the stage
-    // is not measured and the table is empty: a pair with one side unknown cannot be lined up, and a
-    // half-measured table applied as if whole delays some models against nothing.
+    // How LATE this file's output arrives against its DI, in HOST samples (converted as delayOf converts). A file with
+    // its own absolute reading takes it, plus `trim`; otherwise its relative reading against `reference`, plus
+    // `referenceOffset` (how late the reference trails its DI), plus `trim` — the offset never reaches an absolute
+    // reading. Both in the table's samples; an unknown file is offset and trim alone. Its lag plus its delayOf is how
+    // late a slot playing it trails the DI: what RigPlayer's crossover holds its clean leg back by.
+    int lagOf(const std::string& fileId, double hostRate, double modelRate, int referenceOffset = 0, int trim = 0) const {
+        const auto ab = absoluteLagByFile.find(fileId);
+        const auto me = lagByFile.find(fileId);
+        // Widened before anything is added, and saturated before it is narrowed: a reading near INT_MAX must not wrap.
+        const double own = ab != absoluteLagByFile.end() ? (double) ab->second
+                         : (double) (me == lagByFile.end() ? 0 : me->second) + (double) referenceOffset;
+        const double lag = own + (double) trim;
+        const double at = sampleRate > 0.0 ? sampleRate : modelRate;
+        const double scale = (at > 0.0 && hostRate > 0.0) ? hostRate / at : 1.0;
+        const double host = lag * scale;
+        constexpr double hi = (double) std::numeric_limits<int>::max(), lo = (double) std::numeric_limits<int>::min();
+        return host >= hi ? std::numeric_limits<int>::max() : host <= lo ? std::numeric_limits<int>::min() : (int) std::lround(host);
+    }
+
+    // THE PACK'S OWN READINGS. The relative table needs every distinct file measured — a pair with one side unknown
+    // cannot be lined up, and a half-measured table applied as if whole delays some models against nothing — from
+    // `lag_samples`, or derived from `input_lag_samples` when every file has that instead (namz 5). A file's absolute
+    // lag and polarity are read wherever stated. Nothing stated at all: the table is empty.
     static AlignmentTable fromDevice(const namz::rig::Device& d) {
         AlignmentTable out;
         out.fromPack = true;
+        // namz 5's per-capture readings FIRST, in the file's own rate as `lag_samples` is: `input_lag_samples` (how late
+        // the model's output arrives against its own DI) and `polarity` (-1: it hands its input back inverted). Not
+        // stated = not measured: such a file has no absolute reading and plays by its relative one.
+        bool allRelative = true, allAbsolute = true;
         for (const auto& f : d.files) {
             if (f.id.empty()) continue;
-            if (! f.lagSamples) return AlignmentTable {};
-            out.lagByFile[f.id] = *f.lagSamples;
+            if (out.reference.empty()) out.reference = f.id;
+            if (f.inputLagSamples) out.absoluteLagByFile[f.id] = *f.inputLagSamples;
+            if (f.polarity && *f.polarity == -1) out.invertedByFile[f.id] = true;
+            allRelative = allRelative && f.lagSamples.has_value();
+            allAbsolute = allAbsolute && f.inputLagSamples.has_value();
         }
+        // The relative table: the pack's own `lag_samples` when every file states one (schema 4, and 5 with both); else,
+        // when every file states its absolute lag, derived from those — each against the reference's — so a pack that
+        // carries only the new readings is aligned as well. Neither whole: no relative table, as before.
+        if (allRelative) {
+            for (const auto& f : d.files) if (! f.id.empty()) out.lagByFile[f.id] = *f.lagSamples;
+        } else if (allAbsolute && ! out.reference.empty()) {
+            out.derivedFromAbsolute = true;
+            const long long ref = out.absoluteLagByFile[out.reference];
+            for (const auto& [id, lag] : out.absoluteLagByFile) {
+                const long long rel = (long long) lag - ref;
+                if (rel < std::numeric_limits<int>::min() || rel > std::numeric_limits<int>::max()) { out.lagByFile.clear(); break; }
+                out.lagByFile[id] = (int) rel;
+            }
+        }
+        if (out.lagByFile.empty() && out.absoluteLagByFile.empty() && out.invertedByFile.empty()) return AlignmentTable {};
         return out;
     }
 };
+
+/// HOW LOUD A CAPTURE'S LOW END IS against its DI, below `hz`: the alignment probe through the file, both sides through
+/// the crossover blend's own low-pass (eq::Crossover2), their energies compared — in dB. What a host may propose as the
+/// clean level (RigPlayer::setCrossoverCleanDb) so that turning the amount up does not also turn the bass up or down.
+/// `normalize` plays the capture as the player does with setNormalize(true) (its loudness tag applied). Offline: NAM
+/// inference, any thread but the audio one. NaN when the bytes do not load.
+inline double measureLowBandGainDb(const std::vector<std::byte>& model, double hz, double sampleRate = 48000.0,
+                                   bool normalize = false) {
+    const double fs = sampleRate > 0.0 ? sampleRate : 48000.0;
+    const auto probe = alignmentProbe(fs);
+    felitronics::nam::NamStage m;
+    m.prepare(fs, 512);
+    if (model.empty() || ! m.loadModelFromMemory(model.data(), model.size())) return std::nan("");
+    std::vector<float> y = probe;
+    for (std::size_t p = 0; p < y.size(); p += 512) {
+        float* io[1] { y.data() + p };
+        if (! m.process(io, 1, (int) std::min<std::size_t>(512, y.size() - p), normalize)) return std::nan("");
+    }
+    felitronics::eq::Crossover2 lx, ly;
+    lx.prepare(fs, 1); ly.prepare(fs, 1);
+    lx.setFrequency((float) hz); ly.setFrequency((float) hz);
+    double ex = 0.0, ey = 0.0;
+    for (std::size_t n = 0; n < y.size(); ++n) {
+        float lo = 0.0f, hi = 0.0f;
+        lx.processSample(0, probe[n], lo, hi); ex += (double) lo * lo;
+        ly.processSample(0, y[n], lo, hi);     ey += (double) lo * lo;
+    }
+    return ex > 0.0 && ey > 0.0 ? 10.0 * std::log10(ey / ex) : std::nan("");
+}
 
 // The table for a device: every DISTINCT file once (several settings may point at one file), against the
 // first one whose bytes load. A file with no reading — bytes that will not load, an output with no
@@ -131,7 +238,7 @@ inline AlignmentTable measureAlignment(const namz::rig::Device& d, const ModelSo
     for (const auto& id : ids) {
         const auto y = probeThrough(source(id), probe, sampleRate);
         if (y.empty()) continue;
-        if (ref.empty()) { ref = y; refId = id; out.lagByFile[id] = 0; continue; }
+        if (ref.empty()) { ref = y; refId = id; out.reference = id; out.lagByFile[id] = 0; continue; }
         const auto b = felitronics::rigplayer::bestLag(ref, y, felitronics::rigplayer::kSearch);
         if (b.corr < 0.0) continue;                          // no reading is not a complaint
         out.lagByFile[id] = b.lag;

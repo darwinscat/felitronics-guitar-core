@@ -7,7 +7,7 @@
 //
 //     in → pack in → dry copy → pre tone (bands, curve) → chain trim → ┬→ trim A → model A → align ─┐
 //                                                                      └→ trim B → model B → align ─┴→ mix
-//        → post tone (bands, curve) → dry/wet blend → pack out → out
+//        → post tone (bands, curve) → dry/wet blend → crossover blend → pack out → out
 //
 //   • WHICH files play is namz::rig's policy (a turned control is law) joined to ModelBlend.h's pair
 //     along the gain dial — RigSelection.h, pure.
@@ -33,6 +33,8 @@
 //   • A tone knob is applied as the pack describes it — a curve becomes a minimum-phase FIR, bands
 //     become biquads — on the side of the models its circuit puts it. ToneKnobs.h, pure.
 //   • A blend knob mixes the DI the models were fed, through the dry path's own response. BlendKnob.h.
+//   • The crossover blend — the host's, not the pack's (setCrossoverAmount): below a frequency the CLEAN input,
+//     above it the device, split by one Linkwitz–Riley pair, the clean leg held back by what the models carry.
 //   • THE PACK'S OWN TWO LEVELS BRACKET EVERYTHING IT DOES. `chain[].input_db` is the level of the
 //     guitar into this device, and it goes FIRST — ahead of the dry copy, because a blend knob mixes
 //     one guitar with itself and both ends must be fed the same signal. `chain[].output_db` is the
@@ -56,6 +58,7 @@
 
 #include <felitronics/rigplayer/AlignmentTable.h>
 #include <felitronics/rigplayer/BlendKnob.h>
+#include <felitronics/rigplayer/CrossoverBlend.h>
 #include <felitronics/rigplayer/RigSelection.h>
 #include <felitronics/rigplayer/ToneKnobs.h>
 
@@ -372,6 +375,8 @@ public:
         // the latency it reports (the app's `wire`, PluginProcessor.cpp:1409-1467 — "a wire the same LENGTH as the
         // block it replaces").
         wire_.prepare(channels_, maxBlock_, dryAlignerCapacity (fs_));
+        retimeFade_ = std::max(1, (int) (0.010 * fs_));
+        xo_.prepare(fs_, maxBlock_, channels_);           // the crossover blend's ring, lines and pair (CrossoverBlend.h)
         fadeStep_ = (float) (1000.0 / (fs_ * kStandbyFadeMs));   // BypassFade::prepare, spelled the same
         // The scope's two rings: the tap's length plus two blocks of slack, so a read overtaken by the writer by a
         // block and a half is still whole (scopeRead). Atomic floats — relaxed loads and stores are plain moves on
@@ -388,6 +393,7 @@ public:
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
             dryBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
             spare_[c].assign((std::size_t) maxBlock_, 0.0f);
+            lineTmp_.assign((std::size_t) maxBlock_, 0.0f);
             quietBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
         }
         quietRun_ = kQuietForever;
@@ -405,6 +411,7 @@ public:
         // contractually never concurrent with process().
         for (int s = 0; s < 2; ++s) bandRt_[s].count = 0;
         snapGains();
+        xo_.snap();
         snapStandby();                                   // BypassFade::snapTo — no fade on the first block
         prepared_ = true;
         if (loaded_) {                                   // the FIRs and the bands were designed for the old rate
@@ -416,6 +423,7 @@ public:
         // would think of, and the warm-up ledger and the two alignment delays were the half nothing
         // touched.
         restateInHostSamples();
+        if (loaded_) publishCrossoverLags();             // the captures' own lags, restated in the new host samples
         return true;
     }
     // 🔴 THE STREAM RESTART, AND UNTIL P86 THIS CLASS DID NOT HAVE ONE. A consumer reaching a
@@ -532,6 +540,7 @@ public:
         for (int s = 0; s < 2; ++s)
             for (int k = 0; k < bandRt_[s].count; ++k) bandCur_[s][k] = bandTo_[s][k];
         snapGains();
+        xo_.snap();
         snapStandby();                   // the stand-by fade lands too: a restart restarts the parameter epoch
         // 🔴 …AND A SLOT CAUGHT MID-WARM-UP IS RE-ARMED, exactly as prepare() re-arms it. This restart has
         // just flushed both networks, so a slot that was part-way through its receptive field is holding
@@ -602,6 +611,12 @@ public:
         // The models' offsets, from the pack when it carries them — measured once, when it was built.
         // A pack without them leaves the table empty; the host may measure and setAlignment().
         align_ = AlignmentTable::fromDevice(d);
+        modelRate_.assign(models_.size(), std::numeric_limits<double>::quiet_NaN());   // learned when it lands
+        // THE PACK'S IDENTITY for the reference offset: its stamped rigId, else this very load (an unstamped pack cannot be
+        // told from another with the same file names and lags — a fingerprint of the table would call them one).
+        xoPack_ = ! d.rigId.empty() ? "rig:" + d.rigId : "load:" + std::to_string(gen_);
+        bindReferenceLag(align_, true);
+        publishCrossoverLags();
         loaded_ = true;
         preloadCap_ = preloadNext_;                      // the set is made by the apply() below
         preloadStale_ = true;
@@ -664,6 +679,8 @@ public:
         chainGain_.store(1.0f, std::memory_order_release);
         for (auto& g : slotGain_) g.store(1.0f, std::memory_order_release);
         for (auto& p : pendDelay_) p.store(0, std::memory_order_release);
+        modelRate_.clear();
+        xoFits_ = alignFits_ = true;                     // no pack, nothing out of reach
         for (auto& c : slotCold_) c.store(false, std::memory_order_release);
     }
     bool loaded() const { return loaded_; }
@@ -952,15 +969,16 @@ public:
         return p;
     }
 
-    // The models' measured offsets (AlignmentTable.h), for a pack that does not carry its own. A delay
-    // travels with a model and is applied at the one instant its slot is silent — weight exactly zero
-    // — never as a splice on a live signal. So a table handed in BEFORE playing lands with the first
-    // loads; one that arrives mid-mix waits until the dial visits a knot, or until the next prepare(),
-    // which lands it on every slot at once because a prepare leaves nothing to splice (see
-    // restateInHostSamples). A host that has the bytes in hand should measure before it plays.
+    // The models' measured offsets (AlignmentTable.h), for a pack that does not carry its own. A delay travels with a
+    // model: a slot silent at both ends of a block takes it at once, as a model lands; a slot that is HEARD takes a delay
+    // of the capture it is playing (a table handed in mid-mix, a model rate learned at a landing) through a 10 ms
+    // crossfade of its line — never a splice; a capture on its way out keeps its delay until it is silent. A prepare()
+    // lands every slot's at once, because a prepare leaves nothing to splice (see restateInHostSamples).
     void setAlignment(AlignmentTable table) {
+        bindReferenceLag(table, false);
         align_ = std::move(table);
         if (loaded_) stageDelays();
+        publishCrossoverLags();
     }
     const AlignmentTable& alignment() const { return align_; }
     bool alignmentFromPack() const { return align_.fromPack && ! align_.empty(); }
@@ -971,6 +989,10 @@ public:
     void service() {
         for (auto& n : nam_) n.collectGarbage();
         freeRetired();                                       // the preload's copies unload() and an eviction retired
+        {
+            const auto now = audioClock_.load(std::memory_order_seq_cst);
+            std::erase_if(xoRetired_, [now] (const auto& r) { return now > r.second; });   // the crossover's outgrown tables
+        }
         servePreloadAsk();
         for (auto& f : fir_) f.flushPending();
         dry_.flushPending();
@@ -1253,6 +1275,113 @@ public:
     bool standby() const { return standby_.load(std::memory_order_acquire); }          // what was asked
     bool standingBy() const { return standingBy_.load(std::memory_order_acquire); }    // faded out, not running
 
+    // ------------------------------------------------------------------------------ the crossover blend ----
+    //
+    // A BASS AMP'S CLEAN LOW END: below `crossoverHz()` the output carries the CLEAN input — the dry copy, the input
+    // at the pack's input level (and the host's, the feed) before the pre tone — and above it the device. The host's
+    // setting, not the pack's: nothing here reads or writes a manifest field. It sits after the blend knob and before
+    // the pack's output level, so that level rides both bands:
+    //
+    //     out = HP4(device) + LP4((1 − amount) · device + amount · clean)
+    //
+    // `clean` is the slots' clean taps (each at its capture's lag and polarity) mixed as the slots are, plus the pack's
+    // own dry part mixed in by the blend knob exactly as it is mixed into the device. The mechanism is CrossoverBlend.h.
+    //
+    // ONE PAIR SPLITS BOTH SIDES: LP4 and HP4 are core's eq::Crossover2 — two Butterworth SVFs a side, a 4th-order
+    // Linkwitz–Riley — run on the clean leg's low half and the device's high half, so both carry the filters' own phase
+    // and a device that is a wire sums to that pair's all-pass: flat magnitude, at every amount.
+    //
+    // THE CLEAN LEG IS HELD BACK BY WHAT THE DEVICE'S OUTPUT CARRIES: the rate-match (latencySamples(), as the blend
+    // knob's dry), and per slot the capture's own lag — its `lag_samples` against the stage's first file, plus
+    // setCrossoverLag() — and the slot's alignment delay, through a line that mirrors the slot's own (cleared where it is
+    // cleared). The two slots' taps are then mixed by the law's own weight and gain, sample for sample as the models are
+    // mixed, so the bands meet in time while two captures blend, through a one-model dip, across a landing or a retime. A
+    // capture's lag that changes while its slot is heard — a table handed in, setCrossoverLag — crossfades the tap over
+    // 10 ms rather than splice it.
+    //
+    // AMOUNT 0 IS THE PLAYER WITHOUT IT, bit for bit, and costs one atomic load a block. Leaving 0 fades the split in
+    // with the pair at 1 Hz (an all-pass that is a wire across the audible band) and then sweeps it up to the frequency;
+    // returning to 0 sweeps down, fades out and, once every glide has arrived, stops the filters (crossoverRunning()).
+    // The amount, the frequency, the clean level and the polarity glide (10 ms); a lag crossfades its tap (10 ms). What the player cannot do is the
+    // device's own phase near the seam — a coupling cap, a tone stack: that is in the capture, and only measured.
+    //
+    // Message thread. A non-finite value is refused (false) and changes nothing; the range is clamped. The frequency, the
+    // amount, the clean level and the polarity are kept across load() and unload() — the bench's, like the host's
+    // levels; the lag trim belongs to the table's reference (setCrossoverLag).
+    static constexpr double kCrossoverMinHz = CrossoverBlend::kMinHz, kCrossoverMaxHz = CrossoverBlend::kMaxHz;
+    static constexpr int    kMaxCrossoverLag = 2048;       // table samples: setCrossoverLag's outer bound (the reach is a time)
+    bool setCrossoverHz(double hz) {
+        if (! std::isfinite(hz)) return false;
+        xoHzSet_ = std::clamp(hz, kCrossoverMinHz, kCrossoverMaxHz);
+        xo_.setHz((float) xoHzSet_);
+        return true;
+    }
+    bool setCrossoverAmount(double amount) {
+        if (! std::isfinite(amount)) return false;
+        xoAmountSet_ = std::clamp(amount, 0.0, 1.0);
+        xo_.setAmount((float) xoAmountSet_);
+        return true;
+    }
+    // POLARITY IS A CAPTURE'S, applied per slot. A device that hands its input back inverted puts its low band against
+    // the clean one, and the sum then NOTCHES at the crossover (LP4 − HP4 is zero there) instead of meeting. A capture
+    // whose table reading says it inverts (AlignmentTable::invertedByFile) gets an inverted clean tap in its slot; this
+    // inverts every slot's on top of that — the host's word, for captures nothing has read. The pack's own dry part
+    // (blend knob) is never inverted. Glides.
+    void setCrossoverInvert(bool on) { xoInvertSet_ = on; xoInvert_.store(on, std::memory_order_release); }
+    // TWO NUMBERS, KEPT APART. Every capture's lag is its absolute reading (AlignmentTable::absoluteLagByFile — how late
+    // against its own DI) when it has one; otherwise its relative reading (`lag_samples`, counted from the table's
+    // reference, crossoverLagReference()) plus the REFERENCE OFFSET — how late that reference trails its DI. The HOST
+    // TRIM is then added to every capture, absolute or relative. An absolute reading never takes the offset, so a
+    // calibration of the relative table cannot be counted twice once the pack carries its own readings.
+    //
+    // setCrossoverLag(trim): the bench's, kept across load(); 0 by default.
+    // setCrossoverReferenceLag(offset): the PACK's — bound to the pack it was set on (its stamped rigId, else that very
+    // load), the reference and the table's samples; a table counted from another file rebases it when it still reads the
+    // old reference in the same samples, else drops it to 0; another pack drops it to 0. Set while nothing is loaded, it
+    // is the next pack's.
+    // Both in the table's samples. REFUSED (false, nothing changes) past ±kMaxCrossoverLag, or once prepared if it would
+    // put a capture before its DI or past the clean leg's reach (CrossoverBlend::kMaxLagSeconds at the host rate) — and
+    // when a later table or rate does that, crossoverLagFits() says so. A slot that is heard crossfades to it.
+    bool setCrossoverLag(int samples) {
+        if (samples < -kMaxCrossoverLag || samples > kMaxCrossoverLag) return false;
+        const int was = xoTrim_;
+        xoTrim_ = samples;
+        if (prepared_ && loaded_ && ! crossoverLagsFit()) { xoTrim_ = was; return false; }
+        publishCrossoverLags();
+        return true;
+    }
+    bool setCrossoverReferenceLag(int samples) {
+        if (samples < -kMaxCrossoverLag || samples > kMaxCrossoverLag) return false;
+        const int was = xoRefOffset_;
+        xoRefOffset_ = samples;
+        if (prepared_ && loaded_ && ! crossoverLagsFit()) { xoRefOffset_ = was; return false; }
+        xoRefPending_ = ! loaded_;
+        if (loaded_) { xoRefPack_ = xoPack_; xoRefFile_ = align_.reference; xoRefRate_ = align_.sampleRate; xoRefTable_ = align_.lagByFile; }
+        publishCrossoverLags();
+        return true;
+    }
+    // THE CLEAN LEVEL against the device, in dB, 0 by default: the clean leg's gain, so the amount trades the low end
+    // instead of also turning it up or down. measureLowBandGainDb (AlignmentTable.h) reads what a capture does to its low
+    // end, offline; a host may propose that. Clamped to ±24 dB; non-finite refused. Glides with the amount.
+    bool setCrossoverCleanDb(double db) {
+        if (! std::isfinite(db)) return false;
+        xoCleanDbSet_ = std::clamp(db, -24.0, 24.0);
+        xo_.setCleanGain(linOf(xoCleanDbSet_));
+        return true;
+    }
+    double crossoverCleanDb() const { return xoCleanDbSet_; }
+    const std::string& crossoverLagReference() const { return align_.reference; }
+    int    crossoverReferenceLag() const { return xoRefOffset_; }
+    bool   crossoverLagFits() const { return xoFits_; }
+    // Every capture's ALIGNMENT delay (the slots' lines, kMaxDelay host samples) within its reach at this rate; false =
+    // a table or a rate asks more, and the line holds the capture back by kMaxDelay instead. Message thread.
+    bool   alignmentFits() const { return alignFits_; }   // every capture's lag within [0, the reach] at this rate
+    double crossoverHz()     const { return xoHzSet_; }
+    double crossoverAmount() const { return xoAmountSet_; }
+    bool   crossoverInvert() const { return xoInvertSet_; }
+    int    crossoverLag()    const { return xoTrim_; }
+    bool   crossoverRunning() const { return xo_.runningFlag(); }   // any thread
+
     // --------------------------------------------------------------------- the scope: OrbitAmp's ScopeTap ----
     // The newest samples of what went INTO the player and what came OUT of it, channel 0, for a picture (the app's
     // SHAPE) — at the app's own two points, around the whole player: CapturedBlock::process copies the block's input
@@ -1405,9 +1534,11 @@ public:
         // this file already does in three other places where a slot's delay line stops being valid: a
         // landing, a retime, and falling asleep all fill it. The convolvers and the tone are not touched:
         // they are handed the PREPARED width with the spare planes zeroed, so they never stop running.
-        if (nch < ranNch_)
+        if (nch < ranNch_) {
             for (int i = 0; i < 2; ++i)
-                for (int c = nch; c < ranNch_; ++c) lagTail_[i][(std::size_t) c].fill(0.0f);
+                for (int c = nch; c < ranNch_; ++c) line_[i].clearPlane(c);
+            for (int c = nch; c < ranNch_; ++c) xo_.stopPlane(c);   // the crossover's lines, ring and filter memory too
+        }
         ranNch_ = nch;
         const bool norm = normalize_.load(std::memory_order_acquire);
         const bool works = ! standby_.load(std::memory_order_acquire);   // read once a call, as the app reads `linkWorks` once a block
@@ -1450,6 +1581,7 @@ public:
                 // Back: the host's level ARRIVES (the app's IN trim, `lastInGain = inTarget`), everything else
                 // resumes from where it stood and takes what moved meanwhile — under the fade-in.
                 parkedRt_ = false;
+                xo_.setParked(false);
                 curIn_ = inGain_.load(std::memory_order_acquire);
                 curFeed_ = feedGain_.load(std::memory_order_acquire);
                 standingBy_.store(false, std::memory_order_release);
@@ -1493,6 +1625,15 @@ public:
             for (int c = 0; c < channels_; ++c) std::copy(a[c], a[c] + count, d[c]);
             dryLatency_.advance((const float* const*) d, channels_, count, latencySamples());
             for (int c = 0; c < channels_; ++c) std::copy_n(dryLatency_.delayed(c), count, d[c]);
+            // THE CROSSOVER'S CLEAN LEG is this same dry, rung so each slot can tap it at its own lag below. While the
+            // crossover is off nothing here runs: one atomic load, and the block is the player without it.
+            // A FORGET (unload, load) is taken here, before the clean leg is rung: the outgoing device's crossover audio
+            // goes with it — its ring, lines and filters (its settings stay, they are the bench's). The law takes the
+            // same forget below, as it always did.
+            const bool forgetting = forget_.exchange(false, std::memory_order_acquire);
+            if (forgetting && xo_.running()) xo_.clear();
+            const bool xo = xo_.begin();
+            if (xo) xo_.ring(d, count);
 
             // The knobs that sit BEFORE the distortion in the hardware, shaping what gets distorted.
             runBands(0, a, count);
@@ -1514,15 +1655,17 @@ public:
 
             // THE LAW, once per block, and the only writer of the weight. Everything it needs arrives
             // through atomics; everything it asks for leaves the same way.
-            if (forget_.exchange(false, std::memory_order_acquire)) { blend_ = {}; coldRt_[0] = coldRt_[1] = false; }
+            if (forgetting) { blend_ = {}; coldRt_[0] = coldRt_[1] = false; }
             if (const int f = landFail_.exchange(0, std::memory_order_acquire); f != 0)
                 felitronics::nam::blendLoadFailed(blend_, f - 1);
             if (landFlag_.exchange(false, std::memory_order_acquire)) {
                 const int ls = landSlot_.load(std::memory_order_relaxed);
                 const int nd = landDelay_.load(std::memory_order_relaxed);
                 slotDelay_[(std::size_t) (ls & 1)].store(nd, std::memory_order_relaxed);
-                pendDelay_[(std::size_t) (ls & 1)].store(nd, std::memory_order_release);
-                for (auto& t : lagTail_[(std::size_t) (ls & 1)]) t.fill(0.0f);
+                pendDelay_[(std::size_t) (ls & 1)].store(staged(landModel_.load(std::memory_order_relaxed), nd), std::memory_order_release);
+                line_[(std::size_t) (ls & 1)].clear(); line_[(std::size_t) (ls & 1)].set(nd);
+                xo_.clearSlotLine(ls);                 // the crossover's clean line, cleared with it
+                xo_.setLine(ls, nd, 0);
                 felitronics::nam::blendLanded(blend_, ls, landModel_.load(std::memory_order_relaxed),
                                               landWarm_.load(std::memory_order_relaxed));
             }
@@ -1554,18 +1697,33 @@ public:
                 // FALLING ASLEEP CLEARS THE DELAY LINE, exactly as a landing does (above): the tail would
                 // otherwise hold the slot's last samples from before the rest, and a model that declares
                 // no field (need == 0) is heard on the very block it wakes in — with those samples first.
-                if (blend_.cold[i] && ! coldRt_[i])
-                    for (auto& t : lagTail_[(std::size_t) i]) t.fill(0.0f);
+                if (blend_.cold[i] && ! coldRt_[i]) {
+                    line_[(std::size_t) i].clear();
+                    xo_.clearSlotLine(i);              // the crossover's clean line, cleared with it
+                }
                 coldRt_[i] = blend_.cold[i];
                 if (blend_.cold[i]) coldBlocks_[(std::size_t) i].fetch_add(1, std::memory_order_relaxed);
             }
-            // …and a staged retime lands the same way a model does: only where the slot is silent.
+            // …and a staged retime. A slot silent at BOTH ends of the block takes it at once, its line cleared, as a model
+            // lands. A slot that is HEARD takes it only when the delay belongs to the capture it is playing (a table read
+            // again, a model rate learned): crossfaded over 10 ms, line and clean line alike. A capture on its way out keeps
+            // its delay until it is silent — the staged one is the incoming capture's.
             for (int i = 0; i < 2; ++i) {
-                const double w = i == 0 ? 1.0 - law.endB : law.endB;
-                const int want = pendDelay_[(std::size_t) i].load(std::memory_order_acquire);
-                if (w <= 0.0 && want != slotDelay_[(std::size_t) i].load(std::memory_order_relaxed)) {   // exactly zero: the law clamps to [0, 1]
+                const double w0 = i == 0 ? 1.0 - law.beginB : law.beginB, w1 = i == 0 ? 1.0 - law.endB : law.endB;
+                // ONE publication: the staged delay WITH the capture it was computed for — the request is published
+                // apart, so a dial edit between the two could otherwise lend the playing capture another's delay.
+                const std::uint64_t st = pendDelay_[(std::size_t) i].load(std::memory_order_acquire);
+                const int want = pendDelayOf(st);
+                if (want == slotDelay_[(std::size_t) i].load(std::memory_order_relaxed)) continue;
+                if (w0 <= 0.0 && w1 <= 0.0) {                  // exactly zero: the law clamps to [0, 1]
                     slotDelay_[(std::size_t) i].store(want, std::memory_order_relaxed);
-                    for (auto& t : lagTail_[(std::size_t) i]) t.fill(0.0f);
+                    line_[(std::size_t) i].clear(); line_[(std::size_t) i].set(want);
+                    xo_.clearSlotLine(i);
+                    xo_.setLine(i, want, 0);
+                } else if (blend_.held[i] != 0 && blend_.held[i] == pendModelOf(st)) {
+                    slotDelay_[(std::size_t) i].store(want, std::memory_order_relaxed);
+                    line_[(std::size_t) i].set(want, retimeFade_);
+                    xo_.setLine(i, want, retimeFade_);
                 }
             }
             liveMix_.store((float) law.endB, std::memory_order_release);
@@ -1644,33 +1802,31 @@ public:
             // …and only now may a job thread see the law's ask (see above, at the law).
             if (law.load.wanted && loadAsk_.load(std::memory_order_relaxed) == 0)
                 loadAsk_.store((law.load.model << 1) | (std::uint64_t) (law.load.slot & 1), std::memory_order_release);
+            const MixRecipe recipe { &law, { run[0], run[1] }, hush, aAlone, bAlone };
             // Align BEFORE the weights: during a ramp the two gains must sum to one at the SAME instant.
             // Each slot carries its own history per channel, advanced every block including at zero.
             for (int c = 0; c < nch; ++c) {
-                if (run[0]) felitronics::nam::blendDelay(a[c], lagTail_[0][(std::size_t) c].data(), kMaxDelay,
-                                                         slotDelay_[0].load(std::memory_order_acquire), count);
-                if (run[1]) felitronics::nam::blendDelay(b[c], lagTail_[1][(std::size_t) c].data(), kMaxDelay,
-                                                         slotDelay_[1].load(std::memory_order_acquire), count);
-                // A one-model block the law holds silent throughout is SILENCE, written, not a mix
-                // multiplied by zero: the weight may be travelling between two slots neither of which
-                // was run, and a stale buffer times zero is a NaN if it held one.
-                if (hush)        std::fill(a[c], a[c] + count, 0.0f);
-                else if (aAlone) { /* slot 1 asleep at zero: `a` is the whole sound */ }
-                else if (bAlone) std::copy(b[c], b[c] + count, a[c]);
-                else             felitronics::nam::blendMix(a[c], b[c], count, law.beginB, law.endB);
-                // …and the law's own gain, which is below one only while a slot that carries weight is
-                // not yet safe to hear (a cold start, a device change, a turn to two models) — or,
-                // with one model, through a dip, whose ramp may end inside the block (gainRamp) and
-                // holds there. Zero = the whole block, which is the arithmetic this always was.
-                if (! hush && (law.beginGain < 1.0 || law.endGain < 1.0)) {
-                    const int ramp = law.gainRamp > 0 ? std::min(law.gainRamp, count) : count;
-                    const float dg = (float) (law.endGain - law.beginGain) / (float) ramp;
-                    float g = (float) law.beginGain;
-                    for (int i = 0; i < count; ++i) {
-                        if (i < ramp) g += dg; else g = (float) law.endGain;
-                        a[c][i] *= g;
-                    }
-                }
+                if (run[0]) line_[0].process(c, a[c], count, lineTmp_.data());
+                if (run[1]) line_[1].process(c, b[c], count, lineTmp_.data());
+                // …then the two slots become one plane, as the law says: mixSlots (CrossoverBlend.h), the one
+                // spelling of it — the crossover's clean leg goes through the same lines.
+                mixSlots(a[c], b[c], count, recipe);
+            }
+            for (auto& l : line_) l.advance(count);       // the lines' clocks run on audio time, planes handed over or not
+
+            // THE CROSSOVER'S CLEAN LEG for this block, as the models' part was just mixed: each slot's tap through its
+            // mirrored line, the same recipe. The pack's dry part joins it at the blend knob below.
+            if (xo) {
+                // The per-model table is read SEQ_CST, once, as the slots' stages are read: the same proof as the preload's
+                // retired copies (retireStage) — the clock ticked seq_cst at the top of this call, the publication and the
+                // retirement stamp are seq_cst on the message thread, so a block whose tick is past the stamp reads the new
+                // pointer, and service() frees an old table only once such a block has begun.
+                const XoModels* xt = xoModelsRt_.load(std::memory_order_seq_cst);
+                const std::uint64_t held[2] { blend_.held[0], blend_.held[1] };
+                const int own[2] { ownLagRt(xt, held[0]), ownLagRt(xt, held[1]) };
+                xo_.taps(held, own, law);
+                const bool inv[2] { invertRt(xt, held[0]), invertRt(xt, held[1]) };
+                xo_.clean(nch, count, recipe, inv);
             }
 
             // The knobs AFTER the distortion, shaping what came out.
@@ -1695,10 +1851,25 @@ public:
                         a[c][i] = a[c][i] * gw + d[c][i] * gd;
                     }
                 }
+                // …and the same two ramps into the crossover's clean leg: the pack's dry part is clean already, so the
+                // clean leg carries it with the timing, the level and the polarity it has in the device.
+                if (xo)
+                    for (int c = 0; c < channels_; ++c) {
+                        float gd = curDry_, gw = curWet_;
+                        float* cl = xo_.cleanPlane(c);
+                        for (int i = 0; i < count; ++i) {
+                            gd += stepDry; gw += stepWet;
+                            cl[i] = cl[i] * gw + d[c][i] * gd;
+                        }
+                    }
                 curDry_ = endDry; curWet_ = endWet;
                 liveDry_.store(endDry, std::memory_order_release);
                 liveWet_.store(endWet, std::memory_order_release);
             }
+
+            // THE CROSSOVER BLEND (setCrossoverAmount): the clean leg tapped at each slot's lag and mixed by this block's
+            // law exactly as the models were, then split with the device by one Linkwitz–Riley pair.
+            if (xo) xo_.run(a, count);
 
             // THE PACK'S OUTPUT LEVEL, and it goes last: after the mix. One number for the whole
             // stage, and applied any earlier it would ride the wet side alone and move a blend the
@@ -1731,6 +1902,142 @@ public:
     }
 
 private:
+    // ------------------------------------------------------------------------- the crossover blend ----
+    // Message thread. Every capture's own lag in host samples — its reading in the table plus setCrossoverLag, at the
+    // rate it runs at (learned at its landing; before that the host's rate is assumed, and the landing corrects it).
+    // Published per model, so the audio thread reads the lag of whatever a slot HOLDS, whichever thread moved it last.
+    int ownLagOf(std::size_t k) const {
+        if (k >= models_.size()) return 0;
+        const double rate = k < modelRate_.size() ? modelRate_[k] : std::numeric_limits<double>::quiet_NaN();
+        // Not landed yet: the rate NAM assumes for a capture that names none, as an untagged one runs (the landing corrects it).
+        const double runSR = felitronics::nam::NamStage::rateMatch(fs_, std::isnan(rate) ? -1.0 : rate).modelRunSR;
+        return align_.lagOf(models_[k].id, fs_, runSR, xoRefOffset_, xoTrim_);
+    }
+    // Per model, for the audio thread: its lag in host samples (clamped to the reach) and whether it inverts.
+    struct XoModels {
+        explicit XoModels(std::size_t count)
+            : n(count), lag(std::make_unique<std::atomic<int>[]>(count)), inv(std::make_unique<std::atomic<bool>[]>(count)) {}
+        std::size_t n;
+        std::unique_ptr<std::atomic<int>[]>  lag;
+        std::unique_ptr<std::atomic<bool>[]> inv;
+    };
+    // A staged delay and the capture it belongs to, in one word: the model id above, the delay (0 … kMaxDelay) below.
+    static std::uint64_t staged(std::uint64_t model, int delay) noexcept {
+        return (model << 32) | (std::uint64_t) (std::uint32_t) std::clamp(delay, 0, kMaxDelay);
+    }
+    static int           pendDelayOf(std::uint64_t s) noexcept { return (int) (std::uint32_t) (s & 0xffffffffu); }
+    static std::uint64_t pendModelOf(std::uint64_t s) noexcept { return s >> 32; }
+
+    // Audio thread: the lag of the capture a slot holds, as published.
+    static int ownLagRt(const XoModels* t, std::uint64_t held) noexcept {
+        return t != nullptr && held >= 1 && held <= t->n ? t->lag[(std::size_t) held - 1].load(std::memory_order_relaxed) : 0;
+    }
+    bool invertRt(const XoModels* t, std::uint64_t held) const noexcept {
+        const bool own = t != nullptr && held >= 1 && held <= t->n && t->inv[(std::size_t) held - 1].load(std::memory_order_relaxed);
+        return own != xoInvert_.load(std::memory_order_acquire);
+    }
+    void publishCrossoverLags() {
+        // THE TABLE IS SIZED FOR THE PACK (grow only): one a pack outgrows is retired and freed by service() once the
+        // audio clock has passed — process() ticks the clock before it reads the pointer, as it does for a slot's stage.
+        // A grown table is FILLED before it is published, so the audio thread never reads an entry not yet written.
+        std::unique_ptr<XoModels> grown;
+        if (! xoModels_ || xoModels_->n < models_.size())
+            grown = std::make_unique<XoModels>(std::max<std::size_t>(models_.size(), 16));
+        XoModels& into = grown ? *grown : *xoModels_;
+        bool fits = true;
+        for (std::size_t k = 0; k < models_.size(); ++k) {
+            const int own = ownLagOf(k);
+            if (prepared_ && (own < 0 || own > xo_.maxLag())) fits = false;
+            const auto inv = align_.invertedByFile.find(models_[k].id);
+            into.lag[k].store(std::clamp(own, 0, xo_.maxLag()), std::memory_order_relaxed);
+            into.inv[k].store(inv != align_.invertedByFile.end() && inv->second, std::memory_order_relaxed);
+        }
+        xoFits_ = fits;
+        // THE SLOTS' ALIGNMENT DELAYS have a reach too (kMaxDelay host samples): a table or a rate that asks more is
+        // clamped in the line — said here, not silently.
+        bool lines = true;
+        for (std::size_t k = 0; k < models_.size() && prepared_; ++k) if (rawDelayOf(k) >= (double) kMaxDelay + 0.5) lines = false;   // as lround rounds
+        alignFits_ = lines;
+        if (grown) {
+            xoModelsRt_.store(grown.get(), std::memory_order_seq_cst);
+            if (xoModels_) xoRetired_.push_back({ std::move(xoModels_), audioClock_.load(std::memory_order_seq_cst) });
+            xoModels_ = std::move(grown);
+        }
+    }
+    // THE REFERENCE OFFSET BELONGS TO A PACK, a reference and a table's samples. load(): another pack drops it (a pending
+    // one is adopted); setAlignment(): another reference in the same samples rebases it when the new table still reads the
+    // old reference — the old one is `rel` later than the new, so the new trails its DI by offset − rel — else drops it.
+    //
+    // A PENDING offset (set with nothing loaded) has no coordinates yet: no table rebases it, and the next load binds it
+    // as it is. A load of the SAME pack (its rigId) is a table like any other: unchanged when it counts from the same
+    // reference in the same samples, rebased or dropped otherwise — never kept in the coordinates of the last table.
+    //
+    // THE SAME RIG LOADED AGAIN brings its table back: the offset is KEPT only when that table is the one it was bound
+    // to, word for word; REBASED when the old reference is still read in the same samples and every other file stands
+    // where it stood against it (the anchor moved, nothing was recaptured); DROPPED otherwise — a recapture moves what
+    // the offset measured. (A reference file retrained under the same numbers cannot be told without its bytes.) A
+    // rebase that leaves ±kMaxCrossoverLag drops it too: the arithmetic is wide, the stored value representable.
+    void bindReferenceLag(const AlignmentTable& t, bool newPack) {
+        if (xoRefPending_) {
+            if (! newPack) return;
+            xoRefPending_ = false;
+            bindTo(t);
+            return;
+        }
+        const bool otherPack = newPack && xoRefPack_ != xoPack_;
+        const bool sameUnits = felitronics::core::exactlyEqual(t.sampleRate, xoRefRate_);
+        const auto old = t.lagByFile.find(xoRefFile_);
+        const bool readable = old != t.lagByFile.end() && sameUnits;
+        if (otherPack) xoRefOffset_ = 0;
+        else if (newPack) {
+            const bool identical = t.reference == xoRefFile_ && sameUnits && t.lagByFile == xoRefTable_;
+            if (! identical) xoRefOffset_ = readable && sameShape(t) ? rebased(old->second) : 0;
+        }
+        else if (t.reference != xoRefFile_ || ! sameUnits) xoRefOffset_ = readable ? rebased(old->second) : 0;
+        bindTo(t);
+    }
+    void bindTo(const AlignmentTable& t) {
+        xoRefPack_ = xoPack_; xoRefFile_ = t.reference; xoRefRate_ = t.sampleRate; xoRefTable_ = t.lagByFile;
+    }
+    int rebased(int oldReferenceLag) const {
+        const long long r = (long long) xoRefOffset_ - (long long) oldReferenceLag;
+        return r < -kMaxCrossoverLag || r > kMaxCrossoverLag ? 0 : (int) r;
+    }
+    // Every file of the bound table stands where it stood against the old reference, in `t` as well (and no file came or went).
+    bool sameShape(const AlignmentTable& t) const {
+        if (t.lagByFile.size() != xoRefTable_.size()) return false;
+        const auto oldNew = t.lagByFile.find(xoRefFile_);
+        const auto oldOld = xoRefTable_.find(xoRefFile_);
+        if (oldNew == t.lagByFile.end() || oldOld == xoRefTable_.end()) return false;
+        for (const auto& [id, lag] : xoRefTable_) {
+            const auto it = t.lagByFile.find(id);
+            if (it == t.lagByFile.end()) return false;
+            if ((long long) it->second - oldNew->second != (long long) lag - oldOld->second) return false;
+        }
+        return true;
+    }
+    // A model's alignment delay in host samples, before the line clamps it.
+    double rawDelayOf(std::size_t k) const {
+        const double rate = k < modelRate_.size() ? modelRate_[k] : std::numeric_limits<double>::quiet_NaN();
+        const double runSR = felitronics::nam::NamStage::rateMatch(fs_, std::isnan(rate) ? -1.0 : rate).modelRunSR;
+        if (align_.derivedFromAbsolute) {
+            const double unknown = felitronics::nam::NamStage::rateMatch(fs_, -1.0).modelRunSR;
+            return align_.delayOfAbsoluteRaw(models_[k].id, fs_, [&] (const std::string& file) {
+                for (std::size_t j = 0; j < models_.size() && j < modelRate_.size(); ++j)
+                    if (models_[j].id == file)
+                        return std::isnan(modelRate_[j]) ? unknown : felitronics::nam::NamStage::rateMatch(fs_, modelRate_[j]).modelRunSR;
+                return unknown;
+            });
+        }
+        const double at = align_.sampleRate > 0.0 ? align_.sampleRate : runSR;
+        return (double) align_.delayOf(models_[k].id) * (at > 0.0 && fs_ > 0.0 ? fs_ / at : 1.0);
+    }
+    bool crossoverLagsFit() const {
+        for (std::size_t k = 0; k < models_.size(); ++k)
+            if (const int own = ownLagOf(k); own < 0 || own > xo_.maxLag()) return false;
+        return true;
+    }
+
     // ------------------------------------------------------- the restart, where both verbs share ----
 
     // What a restart clears that does NOT depend on the rate: the per-slot alignment tails, the band
@@ -1745,13 +2052,13 @@ private:
     // would trigger writes zeros over zeros) and it is honest, which is why it is here and not only in
     // reset().
     void clearAudioState() noexcept {
-        for (int c = 0; c < kMaxChannels; ++c)
-            for (auto& t : lagTail_) t[(std::size_t) c].fill(0.0f);
+        for (auto& l : line_) l.clear();
         for (auto& side : bq_) for (auto& band : side) for (auto& b : band) b.reset();
         for (auto& g : bandGrid_) g.reset();             // a stream restart re-anchors the audio-time grid
         for (int s = 0; s < 2; ++s)
             for (int k = 0; k < kMaxBands; ++k) bandPos_[s][k] = bandLen_[s][k] = 0;
         ranNch_ = 0;
+        xo_.clear();
         for (int c = 0; c < kMaxChannels; ++c) {
             std::fill(slotB_[c].begin(),  slotB_[c].end(),  0.0f);
             std::fill(dryBuf_[c].begin(), dryBuf_[c].end(), 0.0f);
@@ -1824,6 +2131,7 @@ private:
         const bool by = standby_.load(std::memory_order_acquire);
         fadeG_ = by ? 0.0f : 1.0f;
         parkedRt_ = by;
+        xo_.setParked(by);
         standingBy_.store(by, std::memory_order_release);
     }
 
@@ -1837,7 +2145,9 @@ private:
         dry_.clearAudioState();
         dryLatency_.reset();
         for (auto& side : bq_) for (auto& band : side) for (auto& q : band) q.reset();
-        for (auto& slot : lagTail_) for (auto& t : slot) t.fill(0.0f);
+        for (auto& l : line_) l.clear();
+        xo_.clear();                     // the crossover's filters, ring and lines stop as the others do; its glides do not snap
+        xo_.setParked(true);
         ranNch_ = 0;
         standingBy_.store(true, std::memory_order_release);
     }
@@ -1901,7 +2211,19 @@ private:
         // actually run it at. AlignmentTable falls back to scale 1.0 when handed a non-positive rate,
         // which for an untagged model at 96 kHz would apply a 48 kHz lag unscaled.
         const double runSR = felitronics::nam::NamStage::rateMatch(fs_, st.modelSampleRate()).modelRunSR;
-        return align_.delayOf(fileIdOfModel(id), fs_, runSR);
+        if (! align_.derivedFromAbsolute) return align_.delayOf(fileIdOfModel(id), fs_, runSR);
+        // A table derived from ABSOLUTE readings (namz 5) compares them in time, each in its own model's rate: this one's
+        // from its stage, the others' as learned at their landing, NAM's default for one not landed yet.
+        const std::string& me = fileIdOfModel(id);
+        const double unknown = felitronics::nam::NamStage::rateMatch(fs_, -1.0).modelRunSR;
+        return align_.delayOfAbsolute(me, fs_, [&] (const std::string& file) {
+            if (file == me) return runSR;
+            for (std::size_t k = 0; k < models_.size() && k < modelRate_.size(); ++k)
+                if (models_[k].id == file)
+                    return std::isnan(modelRate_[k]) ? unknown
+                                                     : felitronics::nam::NamStage::rateMatch(fs_, modelRate_[k]).modelRunSR;
+            return unknown;
+        });
     }
 
     // The whole decision for the panel as it stands, handed to the audio thread as a request. What the
@@ -1944,7 +2266,8 @@ private:
     // For the slots as loaded now; a model still to come brings its own delay when it lands.
     void stageDelays() {
         for (int i = 0; i < 2; ++i)
-            pendDelay_[(std::size_t) i].store(delayOfModel(modelIdOf(plan_.file[i]), slotStageOf(i)), std::memory_order_release);
+            pendDelay_[(std::size_t) i].store(staged(modelIdOf(plan_.file[i]), delayOfModel(modelIdOf(plan_.file[i]), slotStageOf(i))),
+                                              std::memory_order_release);
     }
 
     // 🔴 EVERY NUMBER THIS PLAYER HOLDS IN HOST SAMPLES, RESTATED AT THE RATE IT NOW RUNS AT. This is
@@ -2019,6 +2342,8 @@ private:
             felitronics::nam::blendRestated(blend_, i, warmFor(slotStageOf(i)), timeScale);
             const int d = std::clamp(delayOfModel(blend_.held[i], slotStageOf(i)), 0, kMaxDelay);
             slotDelay_[(std::size_t) i].store(d, std::memory_order_relaxed);
+            line_[(std::size_t) i].set(d);                        // no signal to splice: the lines were just cleared
+            xo_.setLine(i, d, 0);
         }
         if (landFlag_.load(std::memory_order_acquire)) {
             const int ls = landSlot_.load(std::memory_order_relaxed) & 1;
@@ -2060,12 +2385,18 @@ private:
     // runs it (process() reads the slot's stage after the law).
     bool land(int slot, felitronics::nam::NamStage& stage, std::uint64_t model) {
         slotStage_[(std::size_t) (slot & 1)].store(&stage, std::memory_order_seq_cst);
+        if (model >= 1 && model <= modelRate_.size())         // the model's own rate, learned: the delays below read it
+            modelRate_[(std::size_t) model - 1] = stage.modelSampleRate();
         const int delay = delayOfModel(model, stage);             // after the load: the rate is the model's
         clearAsk(slot);
         landSlot_.store(slot, std::memory_order_relaxed);
         landModel_.store(model, std::memory_order_relaxed);
         landWarm_.store(warmFor(stage), std::memory_order_relaxed);
         landDelay_.store(std::clamp(delay, 0, kMaxDelay), std::memory_order_relaxed);
+        if (model >= 1 && model <= modelRate_.size()) {     // the crossover's clean tap: now the rate is the model's
+            publishCrossoverLags();
+            if (align_.derivedFromAbsolute) stageDelays();     // a rate learned moves the others' delays (at silence)
+        }
         landFlag_.store(true, std::memory_order_release);
         return true;
     }
@@ -2403,6 +2734,8 @@ private:
     }
 
     void rebuildKnob(const namz::rig::Tone& t) {
+        // A FREQUENCY knob has no filter of its own and no side: it moves a band of another knob, wherever that sits.
+        if (namz::rig::isFrequencyKnob(t)) { rebuildBands(0); rebuildBands(1); return; }
         const int side = sideOf(t);
         if (side < 0) return;
         // Bands, whether they travel with a dial or stand still at a switch's position; else the curve.
@@ -2418,7 +2751,7 @@ private:
         for (const auto& t : tones()) {
             // A knob whose positions carry BANDS ships no curve and no grid: it belongs to the other
             // path, and asking this one for its curve would ask an empty grid for a value.
-            if (sideOf(t) != side || t.positions.empty() || bandsPerPosition(t)) continue;
+            if (sideOf(t) != side || t.positions.empty() || bandsPerPosition(t) || namz::rig::isFrequencyKnob(t)) continue;
             const auto grid  = gridOf(t);
             const auto curve = curveAt(t, grid, toneAt_[t.name]);
             if (curve.empty()) continue;
@@ -2441,14 +2774,24 @@ private:
     // Every band of every section-form knob on one side, at its knob's position — in a fixed order,
     // so band k keeps its state across knob moves.
     void rebuildBands(int side) {
+        // A band naming a frequency knob (`hz_by`) asks it where it sits now: that knob's position, by name.
+        const auto knobs = tones();                          // once: tones() hands out a copy
+        const auto frequencyOf = [this, &knobs] (const std::string& knob, double& hz, double& q) {
+            for (const auto& f : knobs)
+                if (f.name == knob && namz::rig::isFrequencyKnob(f)) {
+                    const auto at = toneAt_.find(knob);
+                    return frequencyAt(f, at != toneAt_.end() ? at->second : toneStart(f), hz, q);
+                }
+            return false;
+        };
         BandSet set;
         bandsShown_[side].clear();
         int dropped = 0;
-        for (const auto& t : tones()) {
+        for (const auto& t : knobs) {
             if (sideOf(t) != side) continue;
             // A DIAL's bands travel with its rotation; a SWITCH's stand whole at the position it is on.
             // One list either way, in a fixed order, so band k keeps its state across knob moves.
-            const auto qs = ! t.sections.empty() ? sectionsAt(t, toneAt_[t.name], fs_)
+            const auto qs = ! t.sections.empty() ? sectionsAt(t, toneAt_[t.name], fs_, frequencyOf)
                           : bandsPerPosition(t)  ? sectionsAtValue(t, toneAt_[t.name], fs_)
                                                  : std::vector<felitronics::rigplayer::SectionBiquad> {};
             for (const auto& q : qs) {
@@ -2724,7 +3067,7 @@ private:
     std::atomic<int>           landDelay_ { 0 };
     std::atomic<int>           landFail_ { 0 };          // slot + 1; 0 = none
     std::atomic<bool>          forget_ { false };
-    std::atomic<int>           pendDelay_[2] { 0, 0 };
+    std::atomic<std::uint64_t> pendDelay_[2] { 0, 0 };     // staged(model, delay): one publication, see the retime
     std::atomic<int>           slotDelay_[2] { 0, 0 };
     std::atomic<std::uint64_t> held_[2] { 0, 0 };
     std::atomic<float>         liveMix_ { 0.0f };
@@ -2763,7 +3106,9 @@ private:
     // audio thread only
     felitronics::nam::BlendState blend_ {};
     bool coldRt_[2] {};                                // the law's cold flags as of the last block, to see a slot fall asleep
-    std::array<float, (std::size_t) kMaxDelay> lagTail_[2][kMaxChannels] {};
+    SlotLine line_[2];                           // each slot's alignment delay line, every plane (CrossoverBlend.h)
+    std::vector<float> lineTmp_;                 // its scratch: one block
+    int retimeFade_ = 1;                         // a heard slot's retime: 10 ms at fs_
     int ranNch_ = 0;                        // planes that advanced state on the previous call
     float curIn_ = 1.0f, curOut_ = 1.0f;
     float curFeed_ = 1.0f;                             // the feed's own ramp, which only the scope's dry rides
@@ -2780,6 +3125,22 @@ private:
     felitronics::core::DryAligner dryLatency_;   // holds the dry path back by the models' rate-match
     felitronics::core::DryAligner wire_;         // the stand-by wire: the raw input at latencySamples()
     std::vector<float> slotB_[kMaxChannels], dryBuf_[kMaxChannels], spare_[kMaxChannels], quietBuf_[kMaxChannels];
+
+    // the crossover blend (setCrossoverAmount): the settings on the message thread, their atomics, the audio side
+    double xoHzSet_ = 150.0, xoAmountSet_ = 0.0, xoCleanDbSet_ = 0.0;
+    bool   xoInvertSet_ = false, xoFits_ = true, alignFits_ = true;
+    int    xoTrim_ = 0;                                         // the host trim (setCrossoverLag), the bench's
+    int    xoRefOffset_ = 0;                                    // the reference offset (setCrossoverReferenceLag)…
+    std::string xoPack_, xoRefPack_, xoRefFile_;                // …the pack, and the reference, it belongs to…
+    double xoRefRate_ = 0.0;                                    // …and the samples it is in (the table's rate; 0 = the models')…
+    std::map<std::string, int> xoRefTable_;                     // …and the relative table it was bound to, word for word
+    bool   xoRefPending_ = false;                               // set with nothing loaded: the next pack's
+    std::vector<double> modelRate_;                             // message thread: each model's own rate; NaN = not landed
+    std::atomic<bool> xoInvert_ { false };
+    std::unique_ptr<XoModels> xoModels_;                        // message thread owns…
+    std::atomic<XoModels*> xoModelsRt_ { nullptr };             // …the audio thread reads
+    std::vector<std::pair<std::unique_ptr<XoModels>, std::uint64_t>> xoRetired_;   // freed once the clock is past
+    CrossoverBlend xo_;                                         // the mechanism; RigPlayer says when
 
     // stand-by: the request (message → audio) and what the audio thread made of it
     std::atomic<bool> standby_ { false }, standingBy_ { false };

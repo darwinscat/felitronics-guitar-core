@@ -23,6 +23,8 @@ void afterLaw(felitronics::rigplayer::RigPlayer& player);
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <functional>
+#include <tuple>
 #include <map>
 #include <string>
 #include <utility>
@@ -281,7 +283,9 @@ struct Host {
 RigPlayer* gDeliverInside = nullptr;
 int        gDeliveredInside = 0;
 }  // namespace
+std::function<void(RigPlayer&)> gAfterLawHook;               // a test's own step in the same seam
 void afterLaw(felitronics::rigplayer::RigPlayer& player) {
+    if (gAfterLawHook) gAfterLawHook(player);
     if (&player != gDeliverInside) return;
     while (auto job = player.takeLoadJob()) { ++gDeliveredInside; player.deliver(RigPlayer::run(std::move(*job))); }
 }
@@ -324,8 +328,56 @@ double shelfDb(double gainDb, double fs) {
 
 } // namespace
 
+
+// A STAGED DELAY TRAVELS WITH ITS CAPTURE. The request (which capture each slot wants) and the staged delay are two
+// publications; a dial edit landing between the audio thread's reads of them — here, in the seam after the law — used
+// to let the delay of the capture now asked for retime the capture still playing.
+void stagedDelayCarriesItsCapture() {
+    group("a staged delay is published with its capture: an edit between the request and the delay retimes nothing it should not");
+    auto field = [](int d) {
+        std::string w = "[";
+        for (int i = 0; i < 40; ++i) w += (i == d ? "1.0" : "0.0") + std::string(i < 39 ? "," : "]");
+        const std::string j = R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":40,"bias":false,"implementation":"direct"},"weights":)"
+                            + w + R"(,"sample_rate":48000})";
+        const auto* q = reinterpret_cast<const std::byte*>(j.data());
+        return std::vector<std::byte>(q, q + j.size());
+    };
+    std::map<std::string, std::vector<std::byte>> files { { "early", field(0) }, { "mid", field(20) }, { "late", field(10) } };
+    namz::rig::Rig r;
+    namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam"; st.slot = "pedal";
+    namz::rig::Control g; g.name = "gain"; g.role = namz::rig::Role::Gain; g.values = { "60", "150", "240" }; g.sweep = 300;
+    st.device.controls = { g };
+    for (const auto& [id, at, lag] : std::vector<std::tuple<std::string, std::string, int>> { { "early", "60", 0 }, { "mid", "150", 20 }, { "late", "240", 10 } }) {
+        namz::rig::FileEntry f; f.id = id; f.settings = { { "gain", at } }; f.lagSamples = lag; st.device.files.push_back(f);
+    }
+    r.chain = { st };
+    RigPlayer p;
+    felitronics::test::run(p.prepare(48000.0, 128, 1));
+    p.setNormalize(false);
+    p.load(r, [&files](const std::string& id) { return files.at(id); });
+    (void) p.setDial("gain", 172.5);                         // slot 0 plays late (delay 10), slot 1 mid
+    std::vector<float> x(128);
+    long at = 0;
+    auto block = [&] {
+        for (int i = 0; i < 128; ++i) x[(std::size_t) i] = (float) (0.3 * std::sin(0.02 * (double) (at + i)));
+        at += 128;
+        float* io[1] { x.data() };
+        felitronics::test::run(p.process(io, 1, 128));
+        p.serviceHere();
+    };
+    for (int k = 0; k < 120; ++k) block();
+    const bool playing = p.heldFileId(0) == "late" && p.liveMix() > 0.05f && p.liveMix() < 0.95f && p.appliedSlotDelay(0) == 10;
+    bool fired = false;
+    gAfterLawHook = [&] (RigPlayer& q) { if (&q == &p && ! fired) { fired = true; (void) q.setDial("gain", 140.0); } };
+    block();
+    gAfterLawHook = nullptr;
+    ok(playing && fired && p.heldFileId(0) == "late" && p.appliedSlotDelay(0) == 10, "slot 0 still playing late after "
+       "the edit: its delay " + std::to_string(p.appliedSlotDelay(0)) + " (10 is late's; 20 would be early's)");
+}
+
 int main() {
     std::printf("felitronics::rigplayer::RigPlayer tests\n");
+    stagedDelayCarriesItsCapture();
 
     group("law 11b: prepare() is binding — it used to CLAMP the width");
     {
@@ -1243,15 +1295,15 @@ int main() {
             ok(b.p.appliedSlotDelay(0) == 2 && b.p.appliedSlotDelay(1) == 0, "…the early slot delayed, the late one not");
         }
         {
-            // A table that arrives MID-MIX lands at the one instant a slot is free — weight exactly zero —
-            // never as a splice on a live signal. So the comb stands until the dial visits a knot, and is
-            // gone once it has: the host that can measure before playing should.
+            // A table that arrives MID-MIX reaches the captures that are playing — the delay is theirs — through a
+            // 10 ms crossfade of each slot's line, never as a splice on a live signal (it used to wait for a slot to
+            // fall silent, so the comb stood until the dial visited a knot).
             Bench b(r);
             b.files = files;
             b.p.setDial("gain", 150.0);
             approx(b.gainAt(6000.0), std::sqrt(0.5), 0.02, "mid-mix, before the table: the comb");
             b.p.setAlignment(table);
-            approx(b.gainAt(6000.0), std::sqrt(0.5), 0.02, "…and still the comb: neither slot is silent, so nothing lands");
+            approx(b.gainAt(6000.0), 1.0, 0.02, "…and the comb gone: the playing slots crossfade to the table's delays");
             b.p.setDial("gain", 240.0);
             b.gainAt(6000.0);                                  // the top: the early capture leaves its slot at zero
             b.p.setDial("gain", 150.0);
