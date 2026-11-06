@@ -19,6 +19,14 @@
 // Settings (a snapshot: the same for every stage of one block); process() calls them all in that order with the AMP as
 // the host's callback — what a host without stages of its own between them plays.
 //
+// A HOST WITH PICTURES AND GAPS (the plug-in) calls the parts some stages are made of: OCTAVE alone (octave) and the cut
+// after it (cut), so the stage can run a piece at a time for its picture while the cut, whose bits depend on its blocks,
+// runs once on the whole; ENVELOPE a piece at a time from a place in the kept key (envelope's keyAt); the cut after the
+// AMP and the gate's END mute apart (cut, muteAtEnd), for a reading between them. A GAP — time with silence, no samples
+// — is gap(), or, for a host that draws through it, its parts: the cuts over silence, the input cut's output as the key
+// (takeKey), and OCTAVE, ENVELOPE and CHORUS handed no channels. The cabinet can be the host's own (cabinetStage's
+// overload, prepare's ownCabinet false), loaded and prepared under its lock.
+//
 // THE CONTRACT. prepare() allocates; the stage methods allocate nothing, lock nothing, throw nothing. One thread owns
 // the chain's audio side; cabinet() is the cabinet's producer side (CabinetIr's own contract: its prepare, load and post
 // on another thread, one thread at a time — a host with more holds its own lock around them). A block longer than the
@@ -156,16 +164,20 @@ public:
 
     /** For `sampleRate`, host blocks of up to `maxBlock`, a bus of `channels` (1 or 2) — told `s` before its stages
         prepare, so they start where it stands (a slider at 0 idle from the first sample, one up on its knobs). False when
-        a stage refused; the chain then plays what the app plays with that stage refused. */
-    bool prepare (double sampleRate, int maxBlock, int channels, const Settings& s)
+        a stage refused; the chain then plays what the app plays with that stage refused. `ownCabinet` false leaves the
+        chain's cabinet unprepared, for a host that plays its own (cabinetStage's overload). */
+    bool prepare (double sampleRate, int maxBlock, int channels, const Settings& s, bool ownCabinet = true)
     {
         rate  = sampleRate;
         block = std::max (1, maxBlock);
         wide  = std::clamp (channels, 1, 2);
 
         bool ok = true;
-        cab.setReference (cabinet::CabinetIr::Reference::bass);
-        cab.prepare (sampleRate, block, std::max (1, channels));
+        if (ownCabinet)
+        {
+            cab.setReference (cabinet::CabinetIr::Reference::bass);
+            cab.prepare (sampleRate, block, std::max (1, channels));
+        }
         ok = gate.prepare (sampleRate, block, std::max (1, channels)) && ok;
         gate.seedEnabled (s.gateWorks);
 
@@ -185,6 +197,7 @@ public:
         envelopeReady = envFilter.prepare (sampleRate, block, 1);
         chorusReady   = chorusStage.prepare (sampleRate, block, wide);
         key.assign ((size_t) block, 0.0f);
+        silence.assign (2 * (size_t) block, 0.0f);
 
         diDry.assign ((size_t) std::max (2, channels) * (size_t) block, 0.0f);
         fadeDry.assign ((size_t) std::max (2, channels) * (size_t) block, 0.0f);
@@ -201,7 +214,15 @@ public:
     // ---- the front: the one signal, the bus's channel 0 -------------------------------------------------------------
 
     /** THE INPUT CUT — the HPF's gentle third across the chain, before every key and every stage. */
-    void inputCut (float* mono, int n, const Settings& s) noexcept { innerCut (0, mono, n, s); }
+    void inputCut (float* mono, int n, const Settings& s) noexcept { cut (0, mono, n, s); }
+
+    /** One of the four cuts across the chain (innerCutSettings), alone: 0 the input's, 1 after COMP, 2 after OCTAVE, 3
+        after the AMP. The stage methods run each in its place; a host running a stage in pieces runs its cut here. */
+    void cut (int at, float* mono, int n, const Settings& s) noexcept
+    {
+        float* io[] { mono };
+        innerCuts[(size_t) std::clamp (at, 0, 3)].process (io, 1, n, innerCutSettings (s));
+    }
 
     /** THE GATE: its decision on the signal as it stands here; its mute here when it mutes at the START. */
     void gateAnalyse (float* mono, int n, const Settings& s) noexcept
@@ -236,31 +257,76 @@ public:
         const auto release   = static_cast<basscomp::BassComp::Release> (std::clamp (s.compRelease, 0, 2));
         const auto character = static_cast<basscomp::BassComp::Character> (std::clamp (s.compCharacter, 0, basscomp::BassComp::characterCount - 1));
         comp.process (mono, n, amount, span, attack, release, character, (double) s.compThresholdDb, (double) s.compRatio);
-        innerCut (1, mono, n, s);
+        cut (1, mono, n, s);
     }
 
     /** OCTAVE, then the cut after it: its sub's own DC and thumps go before ENVELOPE and the AMP hear them. */
     void octaveDown (float* mono, int n, const Settings& s) noexcept
     {
-        if (octaverReady)
-        {
-            tellOctave (s);
-            float* io[] { mono };
-            (void) octaver.process (io, 1, n);
-        }
-        innerCut (2, mono, n, s);
+        octave (mono, n, s);
+        cut (2, mono, n, s);
     }
 
-    /** ENVELOPE, keyed by the key kept above (keepEnvelopeKey). */
-    void envelope (float* mono, int n, const Settings& s) noexcept
+    /** OCTAVE alone, without the cut after it — which a host running the stage in pieces runs once on the whole block
+        (cut (2, …)): the stage plays the same however its calls are sliced (its audio-time grid), the cut does not.
+        `mono` null: `n` samples of a gap, no channels. */
+    void octave (float* mono, int n, const Settings& s) noexcept
+    {
+        if (! octaverReady)
+            return;
+        tellOctave (s);
+        float* io[] { mono };
+        (void) octaver.process (mono != nullptr ? io : nullptr, mono != nullptr ? 1 : 0, n);
+    }
+
+    /** ENVELOPE, keyed by the key kept above (keepEnvelopeKey, or a gap's takeKey) — from `keyAt` samples into it, for a
+        host running the stage a piece at a time (its output does not depend on the slicing). `mono` null: `n` samples of
+        a gap, the key consumed. */
+    void envelope (float* mono, int n, const Settings& s, int keyAt = 0) noexcept
     {
         if (! envelopeReady)
             return;
         tellEnvelope (s);
         float* io[] { mono };
-        const float* k[] { key.data() };
-        const bool keyed = keyValid && n <= (int) key.size();
-        (void) envFilter.process (io, 1, n, keyed ? k : nullptr, keyed ? 1 : 0);
+        const bool keyed = keyValid && keyAt >= 0 && keyAt + n <= (int) key.size();
+        const float* k[] { keyed ? key.data() + keyAt : nullptr };
+        (void) envFilter.process (mono != nullptr ? io : nullptr, mono != nullptr ? 1 : 0, n, keyed ? k : nullptr, keyed ? 1 : 0);
+    }
+
+    /** A GAP's key: `src` as it is — the input cut's output over the gap's silence, not gated (the gate does not run
+        through a gap). */
+    void takeKey (const float* src, int n) noexcept
+    {
+        keyValid = n <= (int) key.size();
+        if (keyValid)
+            std::memcpy (key.data(), src, sizeof (float) * (size_t) std::max (0, n));
+    }
+
+    /** A GAP of `n` samples — time with silence, nothing to write: the five cuts run over silence of its length (their
+        memories decaying, their glides and fades going on), the input cut's makes ENVELOPE's key of it, and OCTAVE,
+        ENVELOPE and CHORUS take the gap as theirs. The gate, COMP and the cabinet stand still. */
+    void gap (int n, const Settings& s) noexcept
+    {
+        if (! prepared)
+            return;
+        for (int start = 0; start < n; start += block)
+        {
+            const int len = std::min (block, n - start);
+            float* plane = silence.data();
+            for (int k = 0; k < (int) innerCuts.size(); ++k)
+            {
+                std::fill_n (plane, len, 0.0f);
+                cut (k, plane, len, s);
+                if (k == 0)
+                    takeKey (plane, len);
+            }
+            std::fill (silence.begin(), silence.end(), 0.0f);
+            float* planes[2] { silence.data(), silence.data() + block };
+            bassCuts (planes, wide, len, s);
+            octave (nullptr, len, s);
+            envelope (nullptr, len, s);
+            (void) chorus (nullptr, 0, len, s);
+        }
     }
 
     // ---- after the AMP ----------------------------------------------------------------------------------------------
@@ -269,7 +335,13 @@ public:
         everything the chain added dies there too. */
     void afterAmp (float* mono, int n, const Settings& s) noexcept
     {
-        innerCut (3, mono, n, s);
+        cut (3, mono, n, s);
+        muteAtEnd (mono, n, s);
+    }
+
+    /** The gate's mute at the END, alone (afterAmp's second half) — nothing where it mutes at the START. */
+    void muteAtEnd (float* mono, int n, const Settings& s) noexcept
+    {
         if (! s.gateMutesAtStart)
         {
             float* io[] { mono };
@@ -284,24 +356,29 @@ public:
             std::memcpy (io[ch], io[0], sizeof (float) * (size_t) std::max (0, n));
     }
 
-    /** CHORUS, on the planes the seam made: each its own voice, above the low end only. */
-    void chorus (float* const* io, int planes, int n, const Settings& s) noexcept
+    /** CHORUS, on the planes the seam made: each its own voice, above the low end only. Whether the stage took the call
+        (its own answer — false refused, or not prepared). `io` null and `planes` 0: `n` samples of a gap. */
+    bool chorus (float* const* io, int planes, int n, const Settings& s) noexcept
     {
         if (! chorusReady)
-            return;
+            return false;
         tellChorus (s);
-        (void) chorusStage.process (io, std::min (planes, wide), n);
+        return chorusStage.process (io, std::min (planes, wide), n);
     }
 
     /** CAB, with the DI — the signal the cabinet is handed — mixed back by MIX's share, gliding over 20 ms for the whole
         travel; standing down, a crossfade to what it was handed, its memory drained. */
-    void cabinetStage (float* const* io, int planes, int n, const Settings& s) noexcept
+    void cabinetStage (float* const* io, int planes, int n, const Settings& s) noexcept { cabinetStage (io, planes, n, s, cab); }
+
+    /** CAB through the host's own cabinet `stage` (prepared, loaded and posted by the host) instead of the chain's. */
+    void cabinetStage (float* const* io, int planes, int n, const Settings& s, cabinet::CabinetIr& stage) noexcept
     {
         const int  nb    = std::min (planes, wide);
         const bool works = s.cabWorks;
         const auto span  = cabFade.advance (n, works);
         const bool on    = core::BypassFade::runs (span, works);
         const bool fade  = span.moving && canFade (n, nb);
+        cabRan = on;
 
         if (fade)
             for (int ch = 0; ch < nb; ++ch)
@@ -315,7 +392,7 @@ public:
             for (int ch = 0; ch < nb; ++ch)
                 std::memcpy (diPlane (ch), io[ch], sizeof (float) * (size_t) n);
 
-        cab.process (io, nb, n, on);
+        stage.process (io, nb, n, on);
 
         if (fade)
         {
@@ -354,7 +431,7 @@ public:
         }
 
         if (! on)
-            cab.idle (n);
+            stage.idle (n);
     }
 
     /** THE BASS'S CUTS, a stage after DI/CAB: the HPF by the strings, the LPF by the hand. Off, a wire. */
@@ -398,11 +475,24 @@ public:
     /** COMP's squeeze now, dB (0 or below), and its picture of the last block; the gate's gain now. */
     float compGrDb() const noexcept { return comp.grDb.load (std::memory_order_relaxed); }
     basscomp::BassComp&       compressor() noexcept       { return comp; }
+    const basscomp::BassComp& compressor() const noexcept { return comp; }
     const dynamics::NoiseGate& noiseGate() const noexcept { return gate; }
     const envfilter::EnvelopeFilter& envelopeFilter() const noexcept { return envFilter; }
     const octave::Octaver&           octaveStage() const noexcept { return octaver; }
     const chorus::BassChorus&        chorusVoice() const noexcept { return chorusStage; }
     int wideness() const noexcept { return wide; }
+
+    /** The gate's voicing (its close, by the app's DECAY). Not the audio thread — NoiseGate::setConfig's contract. */
+    void setGateConfig (const dynamics::NoiseGate::Config& c) { gate.setConfig (c); }
+
+    /** The three effects — 0 OCTAVE, 1 ENVELOPE, 2 CHORUS: whether the stage prepared (a refused one is a wire), and how
+        many times it has been told new knobs (its setParams calls; a gate counts them). */
+    bool effectReady (int which) const noexcept { return which == 0 ? octaverReady : which == 1 ? envelopeReady : chorusReady; }
+    int  told (int which) const noexcept { return toldCount[(size_t) std::clamp (which, 0, 2)]; }
+
+    /** Whether the cabinet was in the last block's path (working, or fading either way) — what a host's pictures of its
+        door and its exit follow. */
+    bool cabinetRan() const noexcept { return cabRan; }
 
     /** The cuts' settings the stages play from `s`: the END's, and the inner ones across the chain (a third of the HPF's
         corner — a tenth of a decibel off the lowest string — and no LPF). */
@@ -425,36 +515,21 @@ public:
         return c;
     }
 
-private:
-    void innerCut (int at, float* mono, int n, const Settings& s) noexcept
+    /** THE THREE EFFECTS' KNOBS as the chain tells its stages from `s`: the menu's fields from the app's knobs, through
+        the module's own law at the slider (paramsForAmount) — at 0 while the link does not work. `menu` holds the fields
+        no knob of the app's sets (the stage's last-told knobs: the chain passes those). What a host draws (a picture of
+        ENVELOPE's sweep) from the same `s` is what the stage was told. */
+    static octave::OctaverParams octaveKnobs (const Settings& s, octave::OctaverParams menu = {}) noexcept
     {
-        float* io[] { mono };
-        innerCuts[(size_t) at].process (io, 1, n, innerCutSettings (s));
-    }
-
-    template <typename P>
-    static bool sameKnobs (const P& a, const P& b) noexcept { return std::memcmp (&a, &b, sizeof (P)) == 0; }
-
-    void tellOctave (const Settings& s) noexcept
-    {
-        auto menu = octaveToldValid ? octaveTold : octave::OctaverParams {};
         menu.sub2Top = 0.0f;
         menu.toneHz  = s.octaveToneHz;
         menu.subHpHz = octaveSubHpHz;
         menu.gateDb  = s.gateWorks ? std::clamp (s.gateThresholdDb, -90.0f, -20.0f) : octaveGateIdleDb;
-        const float amount = s.octaveWorks ? s.octave : 0.0f;
-        const auto  p = octave::paramsForAmount (amount, menu);
-        if (! octaveToldValid || ! sameKnobs (p, octaveTold))
-        {
-            octaver.setParams (p);
-            octaveTold = p;
-            octaveToldValid = true;
-        }
+        return octave::paramsForAmount (s.octaveWorks ? s.octave : 0.0f, menu);
     }
 
-    void tellEnvelope (const Settings& s) noexcept
+    static envfilter::EnvelopeFilterParams envelopeKnobs (const Settings& s, envfilter::EnvelopeFilterParams menu = {}) noexcept
     {
-        auto menu = envelopeToldValid ? envelopeTold : envfilter::EnvelopeFilterParams {};
         const int range = std::clamp (s.envelopeRange, 0, 2);
         menu.attackMs   = envelopeAttackMs;
         menu.releaseMs  = s.envelopeReleaseMs;
@@ -465,11 +540,40 @@ private:
         menu.resonance  = s.envelopeResonance;
         menu.keepLows   = s.envelopeKeepLows ? 1.0f : 0.0f;
         menu.keepLowsHz = s.envelopeKeepHz;
-        const float amount = s.envelopeWorks ? s.envelope : 0.0f;
-        const auto  p = envfilter::paramsForAmount (amount, menu);
+        return envfilter::paramsForAmount (s.envelopeWorks ? s.envelope : 0.0f, menu);
+    }
+
+    static chorus::BassChorusParams chorusKnobs (const Settings& s, chorus::BassChorusParams menu) noexcept
+    {
+        menu.rateHz      = s.chorusRateHz;
+        menu.crossoverHz = s.chorusCrossoverHz;
+        menu.delayMs     = chorusCentreMs;
+        return chorus::paramsForAmount (s.chorusWorks ? s.chorus : 0.0f, menu);
+    }
+
+private:
+    template <typename P>
+    static bool sameKnobs (const P& a, const P& b) noexcept { return std::memcmp (&a, &b, sizeof (P)) == 0; }
+
+    void tellOctave (const Settings& s) noexcept
+    {
+        const auto p = octaveKnobs (s, octaveToldValid ? octaveTold : octave::OctaverParams {});
+        if (! octaveToldValid || ! sameKnobs (p, octaveTold))
+        {
+            octaver.setParams (p);
+            ++toldCount[0];
+            octaveTold = p;
+            octaveToldValid = true;
+        }
+    }
+
+    void tellEnvelope (const Settings& s) noexcept
+    {
+        const auto p = envelopeKnobs (s, envelopeToldValid ? envelopeTold : envfilter::EnvelopeFilterParams {});
         if (! envelopeToldValid || ! sameKnobs (p, envelopeTold))
         {
             envFilter.setParams (p);
+            ++toldCount[1];
             envelopeTold = p;
             envelopeToldValid = true;
         }
@@ -477,15 +581,11 @@ private:
 
     void tellChorus (const Settings& s) noexcept
     {
-        auto menu = chorusToldValid ? chorusTold : chorusStage.params();
-        menu.rateHz      = s.chorusRateHz;
-        menu.crossoverHz = s.chorusCrossoverHz;
-        menu.delayMs     = chorusCentreMs;
-        const float amount = s.chorusWorks ? s.chorus : 0.0f;
-        const auto  p = chorus::paramsForAmount (amount, menu);
+        const auto p = chorusKnobs (s, chorusToldValid ? chorusTold : chorusStage.params());
         if (! chorusToldValid || ! sameKnobs (p, chorusTold))
         {
             chorusStage.setParams (p);
+            ++toldCount[2];
             chorusTold = p;
             chorusToldValid = true;
         }
@@ -519,9 +619,10 @@ private:
     envfilter::EnvelopeFilterParams envelopeTold {};
     chorus::BassChorusParams        chorusTold {};
     bool octaveToldValid = false, envelopeToldValid = false, chorusToldValid = false;
+    std::array<int, 3> toldCount {};
 
-    std::vector<float> key, diDry, fadeDry;
-    bool  keyValid = false;
+    std::vector<float> key, diDry, fadeDry, silence;
+    bool  keyValid = false, cabRan = false;
     float diNow = 0.3f, diStep = 0.001f;
 };
 
