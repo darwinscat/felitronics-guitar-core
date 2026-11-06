@@ -346,7 +346,7 @@ group('the worklet loads in an AudioWorkletGlobalScope, and its exports are the 
     const want = [...fs.readFileSync(header, 'utf8').matchAll(/^[A-Za-z_][A-Za-z0-9_ *]* (fc_rig_[a-z_]+) \(/gm)]
         .map((m) => '_' + m[1]).sort();
     const got = Object.keys(proc.m).filter((k) => k.startsWith('_fc_rig_')).sort();
-    ok(want.length === 48, `the header declares 48 entry points (read ${want.length})`);
+    ok(want.length === 52, `the header declares 52 entry points (read ${want.length}) — ABI 6 added the crossover's four`);
     ok(JSON.stringify(got) === JSON.stringify(want), `the module exports exactly the header's entry points\n      got  ${got}\n      want ${want}`);
     ok(proc.m._fc_rig_abi_version() === 6, 'abi_version answers 6');
     ok(!/toResizableBuffer/.test(GLUE), 'the glue never calls WebAssembly.Memory.toResizableBuffer (Chrome 144+)');
