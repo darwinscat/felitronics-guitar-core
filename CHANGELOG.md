@@ -2,7 +2,10 @@
 
 # Changelog
 
-## Unreleased
+## v0.10.0 — 2026-11-06
+
+`BassChain` for a host with pictures and gaps: what the bass amps' plug-in plays its bass path through, bit for bit.
+What the chain and fcbass play is unchanged.
 
 ### Added
 - **bass: `BassChain` for a host with pictures and gaps** — what the plug-in needs to play its bass path through the
