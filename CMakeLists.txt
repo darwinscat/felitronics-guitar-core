@@ -60,7 +60,7 @@ if(PROJECT_IS_TOP_LEVEL)
     include(FetchContent)
     set(FELITRONICS_GUITAR_FCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../felitronics-core" CACHE PATH
         "Local felitronics-core checkout (used if present); else the pinned release is fetched")
-    set(FELITRONICS_GUITAR_FCORE_TAG "v0.61.2" CACHE STRING
+    set(FELITRONICS_GUITAR_FCORE_TAG "v0.63.0" CACHE STRING
         "felitronics-core git tag to fetch when no local checkout is present")
     if(FELITRONICS_GUITAR_FCORE_DIR AND EXISTS "${FELITRONICS_GUITAR_FCORE_DIR}/CMakeLists.txt")
         message(STATUS "felitronics-core: local checkout — ${FELITRONICS_GUITAR_FCORE_DIR}")

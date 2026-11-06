@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+### Changed
+- **felitronics-core pinned to v0.63.0** (`FELITRONICS_GUITAR_FCORE_TAG`): the bass amp's stages the bass module plays
+  (`basscomp`, `cabinet`, `eq::BassCuts`, `eq::EqLink`, `dynamics::CharacterComp`, `measurement::bassReferenceUnityGain`,
+  `core::BypassFade`). A host that pins core itself moves its pin with this one.
+- **tools/wasm-rig: the processor is `rig-port.js`.** fcrig's AudioWorklet processor moved, whole, into `rig-port.js`
+  (`RigProcessor`), the rig half a pack player's worklet shares; `fcrig-worklet.js` is fcrig's glue and the
+  registration (`'fc-rig'`, unchanged), and fcbass's worklet subclasses the same class. A page vendoring fcrig ships
+  `rig-port.js` beside `fcrig-worklet.js` (it imports it by that name). The processor also takes ABI 6's crossover
+  as `{ set: { crossover: { amount, hz, invert, cleanDb } } }` where the module has it. `rig-parity.mjs` and
+  `rig-compare.mjs` link it.
+
 ### Added
 - **bass: a new module — `BassChain`, the bass amp's chain** (`felitronics::bass`, header-only, JUCE-free), moved from
   OrbitAmp's processor so the bass amps' plug-ins and their web port play one chain: input cut → GATE (its key) →
@@ -36,14 +47,6 @@
   through the knobs by the app's ids, the gain dial, BLEND, two cabinets, the gate's two places, a character switch, an
   effect leaving the strip and the cabinet out and back; the contract; no allocation in 200 blocks with every stage at
   work and two captures sounding. Built with `FELITRONICS_GUITAR_WITH_BASS_WEB` (on at the top level).
-
-### Changed
-- **tools/wasm-rig: the processor is `rig-port.js`.** fcrig's AudioWorklet processor moved, whole, into `rig-port.js`
-  (`RigProcessor`), the rig half a pack player's worklet shares; `fcrig-worklet.js` is fcrig's glue and the
-  registration (`'fc-rig'`, unchanged), and fcbass's worklet subclasses the same class. A page vendoring fcrig ships
-  `rig-port.js` beside `fcrig-worklet.js` (it imports it by that name). The processor also takes ABI 6's crossover
-  as `{ set: { crossover: { amount, hz, invert, cleanDb } } }` where the module has it. `rig-parity.mjs` and
-  `rig-compare.mjs` link it.
 
 ## v0.8.0 — 2026-11-02
 
