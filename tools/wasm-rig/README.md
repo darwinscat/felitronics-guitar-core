@@ -80,6 +80,19 @@ The contract in short (the header has it whole): one thread owns an instance; `p
 throw, and never allocate while the captures are Linear or WaveNet (LSTM and ConvNet allocate inside the pinned NAM); `prepare()` takes 1 kHz … 768 kHz, maxBlock 1 … 65536, 1 or 2 channels, and a refusal
 disarms; a mono call runs ONE network per sounding capture, so a guitar is prepared for 1 channel.
 
+### ABI 6 — the crossover blend (v0.9.0)
+
+| entry point | what it is |
+|---|---|
+| `fc_rig_set_crossover_amount(rig, amount)` | `RigPlayer::setCrossoverAmount`: 0 … 1, the clean input in place of the capture's low end; 0 is the player without it, bit for bit. 1 taken, 0 refused (NULL, non-finite) |
+| `fc_rig_set_crossover_hz(rig, hz)` | `RigPlayer::setCrossoverHz`: the crossover, clamped onto the player's range |
+| `fc_rig_set_crossover_invert(rig, on)` | `RigPlayer::setCrossoverInvert`: every slot's clean tap inverted |
+| `fc_rig_set_crossover_clean_db(rig, db)` | `RigPlayer::setCrossoverCleanDb`: the clean leg's level, ±24 dB |
+
+All four glide (10 ms) and are kept across loads, as the player keeps them. OrbitAmp's bass amps tell the player
+`1 − BLEND` (BLEND 1, the capture alone, is amount 0). The processor takes them as `{ set: { crossover: { amount, hz,
+invert, cleanDb } } }`.
+
 ### ABI 4 — the preload (v0.6.0)
 
 | entry point | what it is |
@@ -275,7 +288,7 @@ felitronics-core v0.61.1
 NeuralAmpModelerCore v0.5.4
 Eigen 5.0.1
 namz v4.4.0
-fc_rig ABI 5
+fc_rig ABI 6
 emscripten 6.0.9 (…)
 flags -fno-exceptions -fno-rtti -msimd128 -msse4.1; exceptions on the NAM objects only, wasm legacy EH
 wasm features sign-ext nontrapping-float-to-int simd exception-handling

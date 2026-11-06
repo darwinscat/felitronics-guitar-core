@@ -5,6 +5,11 @@
 ## Unreleased
 
 ### Added
+- **fc_rig ABI 6: the crossover blend.** `fc_rig_set_crossover_amount`, `fc_rig_set_crossover_hz`,
+  `fc_rig_set_crossover_invert` and `fc_rig_set_crossover_clean_db` — one `RigPlayer::setCrossover*` call each, a
+  non-finite value or a NULL instance refused (0). A page plays a bass amp's BLEND through them (amount `1 − BLEND`).
+  `RigAbiTests`: the ABI plays the pack bit for bit as RigPlayer driven directly through the crossover in, its
+  frequency, the clean taps inverted, the clean leg up, and out again (two models, mono and stereo); the contract.
 - **bass: a new module — `BassChain`, the bass amp's chain** (`felitronics::bass`, header-only, JUCE-free), moved from
   OrbitAmp's processor so the bass amps' plug-ins and their web port play one chain: input cut → GATE (its key) →
   ENVELOPE's key → COMP → cut → OCTAVE → cut → ENVELOPE → the host's AMP → cut → the gate's END mute → the seam →

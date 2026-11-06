@@ -326,3 +326,21 @@ FC_EXPORT uint8_t* fc_rig_put_file (fc_rig* rig, const char* id, int size)
     }
     return reinterpret_cast<uint8_t*> (bytes->data());
 }
+
+// ---- ABI 6 -----------------------------------------------------------------------------------------------------------
+FC_EXPORT int fc_rig_set_crossover_amount (fc_rig* rig, double amount)
+{
+    return rig != nullptr && rig->player.setCrossoverAmount (amount) ? 1 : 0;
+}
+FC_EXPORT int fc_rig_set_crossover_hz (fc_rig* rig, double hz)
+{
+    return rig != nullptr && rig->player.setCrossoverHz (hz) ? 1 : 0;
+}
+FC_EXPORT void fc_rig_set_crossover_invert (fc_rig* rig, int on)
+{
+    if (rig != nullptr) rig->player.setCrossoverInvert (on != 0);
+}
+FC_EXPORT int fc_rig_set_crossover_clean_db (fc_rig* rig, double db)
+{
+    return rig != nullptr && rig->player.setCrossoverCleanDb (db) ? 1 : 0;
+}

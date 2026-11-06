@@ -62,7 +62,8 @@ float sample (int i, int ch)
     return (float) v;
 }
 
-enum class Kind { Gain, Dial, Switch, Max, Normalize, Trims, Shape, Reset, Reload, Unload, Standby, Feed };
+enum class Kind { Gain, Dial, Switch, Max, Normalize, Trims, Shape, Reset, Reload, Unload, Standby, Feed,
+                  XoAmount, XoHz, XoInvert, XoClean };
 struct Event { int block; Kind kind; std::string name, value; double a = 0.0, b = 0.0; };
 
 /** The player as the app drives it: a ModelSource over the files, one job per pump, run and delivered in place. */
@@ -152,6 +153,10 @@ void applyDirect (Direct& d, const Event& e, const std::string& manifest)
         case Kind::Unload:    d.p.unload(); d.feed(); break;
         case Kind::Standby:   d.p.setStandby (e.a != 0.0); break;
         case Kind::Feed:      d.fed = true; d.feedDb = e.a; d.feed(); break;
+        case Kind::XoAmount:  (void) d.p.setCrossoverAmount (e.a); break;
+        case Kind::XoHz:      (void) d.p.setCrossoverHz (e.a); break;
+        case Kind::XoInvert:  d.p.setCrossoverInvert (e.a != 0.0); break;
+        case Kind::XoClean:   (void) d.p.setCrossoverCleanDb (e.a); break;
     }
 }
 
@@ -171,6 +176,10 @@ void applyAbi (Abi& a, const Event& e, const std::string& manifest)
         case Kind::Unload:    fc_rig_unload (a.r); break;
         case Kind::Standby:   fc_rig_set_standby (a.r, e.a != 0.0 ? 1 : 0); break;
         case Kind::Feed:      (void) fc_rig_set_feed_db (a.r, e.a); break;
+        case Kind::XoAmount:  (void) fc_rig_set_crossover_amount (a.r, e.a); break;
+        case Kind::XoHz:      (void) fc_rig_set_crossover_hz (a.r, e.a); break;
+        case Kind::XoInvert:  fc_rig_set_crossover_invert (a.r, e.a != 0.0 ? 1 : 0); break;
+        case Kind::XoClean:   (void) fc_rig_set_crossover_clean_db (a.r, e.a); break;
     }
 }
 
@@ -276,6 +285,12 @@ std::vector<Event> theHand()
         { 1010, Kind::Trims, "", "", 1.0 },
         { 1020, Kind::Shape, "", "", 0.5, 1.0 },
         { 1040, Kind::Gain, "", "", 190.0 },
+        { 1060, Kind::XoAmount, "", "", 0.6 },       // ABI 6: the crossover blend in, a bass amp's clean low end…
+        { 1080, Kind::XoHz, "", "", 120.0 },         // …its frequency gliding…
+        { 1100, Kind::XoInvert, "", "", 1.0 },       // …the clean taps inverted…
+        { 1120, Kind::XoClean, "", "", 3.0 },        // …the clean leg 3 dB up…
+        { 1150, Kind::XoInvert, "", "", 0.0 },
+        { 1170, Kind::XoAmount, "", "", 0.0 },       // …and out again
     };
 }
 
@@ -295,7 +310,7 @@ void bitIdentity()
     const auto two = compare (files, 1, 0, theHand(), blocks);
     report ("two models, mono", two, blocks);
     ok (two.differBlocks == 0, "two models, mono: identical through the sweep, the link, a channel, tone, blend, "
-                               "normalise and trims off and on, a blend shape, a reset");
+                               "normalise and trims off and on, a blend shape, a reset, the crossover blend in and out");
     ok (two.energy > 1.0 && two.moved > 0.05, "…and it is the pack playing, not silence or the input");
     ok (two.pairs > 0, "…and two networks did run between two captures");
     ok (two.abiJobs == two.directJobs && two.handed == two.fetched,
@@ -528,6 +543,15 @@ void contract()
         ok (fc_rig_set_feed_db (r, std::numeric_limits<double>::quiet_NaN()) == 0
             && fc_rig_set_feed_db (r, std::numeric_limits<double>::infinity()) == 0 && fc_rig_set_feed_db (r, 3.0) == 1,
             "a non-finite feed is refused, a finite one taken");
+        ok (fc_rig_set_crossover_amount (r, std::numeric_limits<double>::quiet_NaN()) == 0
+            && fc_rig_set_crossover_hz (r, std::numeric_limits<double>::infinity()) == 0
+            && fc_rig_set_crossover_clean_db (r, std::numeric_limits<double>::quiet_NaN()) == 0
+            && fc_rig_set_crossover_amount (nullptr, 0.5) == 0 && fc_rig_set_crossover_hz (nullptr, 150.0) == 0
+            && fc_rig_set_crossover_clean_db (nullptr, 0.0) == 0
+            && fc_rig_set_crossover_amount (r, 0.0) == 1 && fc_rig_set_crossover_hz (r, 150.0) == 1
+            && fc_rig_set_crossover_clean_db (r, 0.0) == 1,
+            "ABI 6: a non-finite crossover value or a NULL instance is refused, a finite one taken");
+        fc_rig_set_crossover_invert (nullptr, 1);
         ok (fc_rig_scope_read (r, d.data(), w.data(), 16) == 0, "prepared, nothing processed: no frame yet");
         float* io = fc_rig_buffer (r, 0);
         std::fill (io, io + kBlock, 0.1f);
@@ -542,8 +566,8 @@ void contract()
         ok (fc_rig_scope_frames (r) == frames, "stood by, the count stands still");
         fc_rig_destroy (r);
     }
-    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 5u,
-        "abi_version answers the header's 5 (the lighter load and the files up front since v0.7.0; the preload since v0.6.0; the scope at the app's two points since v0.5.1)");
+    ok (fc_rig_abi_version() == FC_RIG_ABI_VERSION && FC_RIG_ABI_VERSION == 6u,
+        "abi_version answers the header's 6 (the crossover blend since v0.9.0; the lighter load and the files up front since v0.7.0; the preload since v0.6.0; the scope at the app's two points since v0.5.1)");
     fc_rig* r = fc_rig_create();
     float x[4] {};
     ok (fc_rig_process (r, x, nullptr, 4) == 0, "process before prepare is refused");
