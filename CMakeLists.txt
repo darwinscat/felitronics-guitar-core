@@ -38,6 +38,10 @@ option(FELITRONICS_GUITAR_WITH_NAM
 option(FELITRONICS_GUITAR_WITH_FX
        "Build the fc_guitar_fx C ABI (tools/wasm) over core's delay + reverb (felitronics-core v0.61.0+)"
        "${PROJECT_IS_TOP_LEVEL}")
+# The bass amp's chain (modules/bass): JUCE-free, over core's bass stages — so it needs the core that has them.
+option(FELITRONICS_GUITAR_WITH_BASS
+       "Build felitronics::bass, the bass amp's chain, over core's basscomp, cabinet, octave, envfilter and chorus (felitronics-core v0.63.0+)"
+       ON)
 # The browser's pack player, the same way: this repository's own product, built when it is the top level and NAM is
 # on (it plays NAM captures); opt-in for a consumer.
 option(FELITRONICS_GUITAR_WITH_RIG
@@ -100,6 +104,16 @@ endif()
 add_subdirectory(modules/nam)         # compiled NAM backend; self-gates on FELITRONICS_WITH_NAM
 add_subdirectory(modules/rigplayer)   # header-only pack player over nam; same gate
 add_subdirectory(modules/poweramp)    # header-only; core + eq + oversampling + saturation
+if(FELITRONICS_GUITAR_WITH_BASS)
+    foreach(_bass_dep IN ITEMS basscomp cabinet octave envfilter chorus)
+        if(NOT TARGET felitronics::${_bass_dep})
+            message(FATAL_ERROR "FELITRONICS_GUITAR_WITH_BASS needs felitronics-core v0.63.0 or later (felitronics::basscomp, "
+                                "cabinet, octave, envfilter, chorus); this core has no felitronics::${_bass_dep}. Use a newer core "
+                                "or set it OFF.")
+        endif()
+    endforeach()
+    add_subdirectory(modules/bass)    # header-only; core's bass stages
+endif()
 
 # The browser's echo and room. Core's delay and reverb modules first shipped in v0.61.0; an older core has
 # neither target, and that is a refusal here, not a silently smaller build.

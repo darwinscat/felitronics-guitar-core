@@ -19,6 +19,10 @@
 #include <felitronics/rigplayer/SectionBiquad.h>
 #include <felitronics/rigplayer/ToneKnobs.h>
 #endif
+#if defined(FELITRONICS_GUITAR_HYGIENE_BASS)   // the bass amp's chain, where it is built (FELITRONICS_GUITAR_WITH_BASS)
+#include <felitronics/bass/BassChain.h>
+template class felitronics::bass::BassChainT<>;   // every member instantiated, so the warnings see all of it
+#endif
 #include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/poweramp/SagEnvelope.h>
 #include <felitronics/poweramp/TubeStage.h>

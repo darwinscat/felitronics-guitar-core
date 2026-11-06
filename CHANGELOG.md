@@ -2,6 +2,25 @@
 
 # Changelog
 
+## Unreleased
+
+### Added
+- **bass: a new module — `BassChain`, the bass amp's chain** (`felitronics::bass`, header-only, JUCE-free), moved from
+  OrbitAmp's processor so the bass amps' plug-ins and their web port play one chain: input cut → GATE (its key) →
+  ENVELOPE's key → COMP → cut → OCTAVE → cut → ENVELOPE → the host's AMP → cut → the gate's END mute → the seam →
+  CHORUS → CAB with the DI mixed in → the bass's cuts. One method per stage, each called once per block with that
+  block's `Settings` (the app's parameters, in the app's units — and which links work), and `process (left, right, n,
+  settings, amp)` calling them in that order around the host's AMP. The wiring moved with it: OCTAVE's, ENVELOPE's and
+  CHORUS's one-slider laws fed as the app feeds them (`tellOctave`, `filterKnobsNow`, `tellChorus`), the inner cuts at
+  a third of the HPF's corner, the cuts' places (`cutSettings`), the tone's bass overrides (`toneSettings`) and the
+  CAB's DI mix gliding over 20 ms, its two settled vector passes a policy (`BassChainT<VectorOps>`) so a plug-in keeps
+  its own library's bits. Needs felitronics-core v0.63.0 (`basscomp`, `cabinet`, `octave`, `envfilter`, `chorus`);
+  `FELITRONICS_GUITAR_WITH_BASS` (ON) refuses an older core by name. Measured (`modules/bass/tests/BassChainTests.cpp`):
+  every stage out of the way is a wire bit for bit, the seam copying the one signal; the stages one by one are
+  `process()` sample for sample; CAB/DI at 0 % is the DI bit for bit and at 100 % through a unit impulse the signal at
+  the bass's reference level (within 1e-5); at work, host blocks of 512, 128 and 333 play within 1e-6; the gate at the
+  END closes a note under its threshold; the knobs' wiring; no allocation in 180 blocks with every stage at work.
+
 ## v0.8.0 — 2026-11-02
 
 namz v5.0.0 — the `.orbitrig` schema 5, its frequency knob and a capture's own lag and polarity — played, and a bass
