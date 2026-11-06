@@ -42,6 +42,10 @@ option(FELITRONICS_GUITAR_WITH_FX
 option(FELITRONICS_GUITAR_WITH_BASS
        "Build felitronics::bass, the bass amp's chain, over core's basscomp, cabinet, octave, envfilter and chorus (felitronics-core v0.63.0+)"
        ON)
+# The browser's bass amp: the chain and the pack player behind the fc_bass C ABI (tools/wasm-bass), the way fcrig is built.
+option(FELITRONICS_GUITAR_WITH_BASS_WEB
+       "Build the fc_bass C ABI (tools/wasm-bass) over felitronics::bass and the fc_rig player (needs NAM, the rig and the bass chain)"
+       "${PROJECT_IS_TOP_LEVEL}")
 # The browser's pack player, the same way: this repository's own product, built when it is the top level and NAM is
 # on (it plays NAM captures); opt-in for a consumer.
 option(FELITRONICS_GUITAR_WITH_RIG
@@ -128,6 +132,11 @@ endif()
 # The browser's pack player: RigPlayer behind the fc_rig C ABI, and under emscripten the fcrig module.
 if(FELITRONICS_GUITAR_WITH_RIG AND FELITRONICS_GUITAR_WITH_NAM)
     add_subdirectory(tools/wasm-rig)
+endif()
+
+# The browser's bass amp: fc_bass over the chain and fc_rig's player (tools/wasm-bass), and under emscripten fcbass.
+if(FELITRONICS_GUITAR_WITH_BASS_WEB AND FELITRONICS_GUITAR_WITH_BASS AND FELITRONICS_GUITAR_WITH_RIG AND FELITRONICS_GUITAR_WITH_NAM)
+    add_subdirectory(tools/wasm-bass)
 endif()
 
 if(FELITRONICS_GUITAR_BUILD_TESTS)
