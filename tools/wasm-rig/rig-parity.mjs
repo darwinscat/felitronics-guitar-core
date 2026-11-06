@@ -9,7 +9,7 @@
 // --stand-in names NAM's example A2 (the architecture of every site pack): without a real pack, THE START and the
 // session's decisions are timed on it, packed by the namz CLI under the fixture's manifest (see `timedPack`).
 //
-// <build-dir> holds what build.sh ships (fcrig.mjs, fcrig.wasm, fcrig-worklet.js). The fixture pack (written by
+// <build-dir> holds what build.sh ships (fcrig.mjs, fcrig.wasm, fcrig-worklet.js, rig-port.js). The fixture pack (written by
 // fc_rig_render --fixture) is always played; <packs-dir>, when given, adds real packs: every one of PACKS found there
 // as <name>.orbitrig/ (rig.json beside its captures). What it proves:
 //   1. THE WORKLET LOADS WHERE IT WILL RUN: the processor and the glue as ES modules in a context shaped like an
@@ -105,8 +105,13 @@ async function loadWorklet(sampleRate) {
     const worklet = new vm.SourceTextModule(fs.readFileSync(path.join(dir, 'fcrig-worklet.js'), 'utf8'), {
         context: ctx, identifier: 'fcrig-worklet.js',
         initializeImportMeta(meta) { meta.url = 'https://worklet.invalid/fcrig-worklet.js'; } });
+    // The rig half every pack player's worklet shares (rig-port.js), beside it under its own name.
+    const port = new vm.SourceTextModule(fs.readFileSync(path.join(dir, 'rig-port.js'), 'utf8'), {
+        context: ctx, identifier: 'rig-port.js',
+        initializeImportMeta(meta) { meta.url = 'https://worklet.invalid/rig-port.js'; } });
     await worklet.link((spec, referrer) => {
         if (spec === './fcrig.mjs' && referrer === worklet) return wrapper;
+        if (spec === './rig-port.js' && referrer === worklet) return port;
         if (spec === './glue.mjs' && referrer === wrapper) return glue;
         throw new Error('the worklet imports ' + spec);
     });

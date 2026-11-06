@@ -7,8 +7,9 @@
 #   fcrig.mjs          the emscripten glue, an ES module whose default export is the factory (createFcRig), linked
 #                      for -sENVIRONMENT=worklet: it never fetches; the processor hands it the module.
 #   fcrig.wasm         the module: RigPlayer, NamStage and NeuralAmpModelerCore behind the fc_rig ABI.
-#   fcrig-worklet.js   the AudioWorklet processor ('fc-rig'), copied as it is; it imports ./fcrig.mjs, so the two
-#                      travel together under these names (README.md).
+#   fcrig-worklet.js   the AudioWorklet processor ('fc-rig'), copied as it is; it imports ./fcrig.mjs and
+#   rig-port.js        ./rig-port.js (the rig half it shares with fcbass's), so the three travel together under these
+#                      names (README.md).
 #   BUILD-INFO         what it was built from: this repository, felitronics-core, NeuralAmpModelerCore, Eigen, namz, the
 #                      ABI version, the toolchain and the flags.
 #
@@ -73,7 +74,7 @@ emcmake cmake -S "$ROOT" -B "$BUILD" "${GEN[@]}" \
 grep -E "felitronics-core:|NeuralAmpModelerCore:|Eigen:|namz:" "$OUT/configure.log" || true
 cmake --build "$BUILD" --target fcrig
 
-cp "$BUILD/tools/wasm-rig/fcrig.mjs" "$BUILD/tools/wasm-rig/fcrig.wasm" "$HERE/fcrig-worklet.js" "$OUT/"
+cp "$BUILD/tools/wasm-rig/fcrig.mjs" "$BUILD/tools/wasm-rig/fcrig.wasm" "$HERE/fcrig-worklet.js" "$HERE/rig-port.js" "$OUT/"
 CORE="$(sed -n 1p "$BUILD/fc-rig-deps.txt")"
 NAM="$(sed -n 2p "$BUILD/fc-rig-deps.txt")"
 NAMZ="$(sed -n 3p "$BUILD/fc-rig-deps.txt")"
@@ -110,7 +111,7 @@ if grep -q "toResizableBuffer" "$OUT/fcrig.mjs"; then echo "the glue names toRes
 echo
 echo "=== size"
 printf "  %-20s %10s %10s %10s\n" file raw gzip brotli
-for f in fcrig.wasm fcrig.mjs fcrig-worklet.js; do
+for f in fcrig.wasm fcrig.mjs fcrig-worklet.js rig-port.js; do
     raw=$(wc -c < "$OUT/$f")
     gz=$(gzip -9 -c "$OUT/$f" | wc -c)
     if command -v brotli > /dev/null; then br=$(brotli -q 11 -c "$OUT/$f" | wc -c); else br="n/a"; fi

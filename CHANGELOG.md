@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+### Changed
+- **tools/wasm-rig: the processor is `rig-port.js`.** fcrig's AudioWorklet processor moved, whole, into `rig-port.js`
+  (`RigProcessor`), the rig half a pack player's worklet shares; `fcrig-worklet.js` is fcrig's glue and the
+  registration (`'fc-rig'`, unchanged), and fcbass's worklet subclasses the same class. A page vendoring fcrig ships
+  `rig-port.js` beside `fcrig-worklet.js` (it imports it by that name). The processor also takes ABI 6's crossover
+  as `{ set: { crossover: { amount, hz, invert, cleanDb } } }` where the module has it. `rig-parity.mjs` and
+  `rig-compare.mjs` link it.
+
 ### Added
 - **fc_rig ABI 6: the crossover blend.** `fc_rig_set_crossover_amount`, `fc_rig_set_crossover_hz`,
   `fc_rig_set_crossover_invert` and `fc_rig_set_crossover_clean_db` — one `RigPlayer::setCrossover*` call each, a

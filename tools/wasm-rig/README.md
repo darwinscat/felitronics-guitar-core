@@ -13,7 +13,8 @@ knobs and the crossfade along the gain dial by itself. The module holds no DSP o
 | `../fc_rig_abi.h` | the C ABI: the contract, the load job, `FC_RIG_ABI_VERSION` |
 | `fc_rig.cpp` | its translation unit — one RigPlayer call per entry point, compiled without exceptions |
 | `fc_rig_manifest.cpp` | rig.json through namz's reader — nlohmann, so compiled with exceptions |
-| `fcrig-worklet.js` | the AudioWorklet processor, `'fc-rig'` |
+| `fcrig-worklet.js` | the AudioWorklet processor, `'fc-rig'`: fcrig's glue and the registration (from v0.9.0) |
+| `rig-port.js` | the processor itself — the rig half every pack player's worklet shares (`RigProcessor`; fcbass's subclasses it); `fcrig-worklet.js` imports it by this name |
 | `build.sh` | builds `fcrig.mjs` + `fcrig.wasm` into `tools/wasm-rig/build/`, with `BUILD-INFO` |
 | `tests/RigAbiTests.cpp`, `tests/rig_fixture.h` | the ABI against RigPlayer driven directly, bit for bit; the job protocol; the contract; no allocation |
 | `rig-parity.mjs`, `fc_rig_render.cpp` | the shipped module in a worklet-shaped scope against the native render |
@@ -433,9 +434,10 @@ the incoming capture's warm-up beside the outgoing capture's drain — on an eng
 
 ## Vendoring
 
-As `fcguitarfx`: the three files travel together and the worklet's static `import './fcrig.mjs'` must keep pointing
-at the glue — with content-hashed names, rename the glue, rewrite that one import line in the copied worklet (or put
-the three in one hashed directory), and hash the worklet after the rewrite. Ship `BUILD-INFO` beside them. The ABI
+As `fcguitarfx`: the files travel together and the worklet's static imports — `./fcrig.mjs` and, from v0.9.0,
+`./rig-port.js` — must keep pointing at the glue and the rig half — with content-hashed names, rename them, rewrite
+those import lines in the copied worklet (or put the four in one hashed directory), and hash the worklet after the
+rewrite. Ship `BUILD-INFO` beside them. The ABI
 version is the `#define FC_RIG_ABI_VERSION <n>u` line of `tools/fc_rig_abi.h`. Licences: this module is AGPL-3.0;
 it compiles in NeuralAmpModelerCore (MIT), nlohmann/json (MIT), Eigen (MPL-2.0) and namz (`THIRD_PARTY_NOTICES.md`).
 
