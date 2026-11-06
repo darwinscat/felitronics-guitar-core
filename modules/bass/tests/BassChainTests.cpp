@@ -10,6 +10,12 @@
 //   blocks (within the cuts' ulp off their cadence); the gate at the END mutes what the chain added; the knobs reach
 //   their stages as the app wires them (the inner cuts at a third of the HPF, the cuts' places, the tone's bass
 //   overrides); and process() allocates nothing.
+//
+//   A HOST WITH PICTURES AND GAPS: the stages' parts (OCTAVE alone and its cut, ENVELOPE a piece at a time from a place
+//   in the key, the cut after the AMP and the END mute apart, CAB through the host's own cabinet) play what the stages
+//   play, bit for bit; a gap is its parts (the cuts over silence, the key taken, the effects handed no channels), bit for
+//   bit, and allocates nothing; the effects' tells are counted, CHORUS answers whether it ran, the cabinet whether it
+//   was in the path.
 
 #include <felitronics_test.h>
 #include <alloc_counter.h>
@@ -256,6 +262,161 @@ int main()
         const auto worn = bass::toneSettings (console, true);
         test::ok (core::exactlyEqual (worn.loDb, 0.0) && core::exactlyEqual (worn.b1Db, 0.0) && core::exactlyEqual (worn.hiDb, 0.0),
                   "on a pack wearing a tone of its own, BASS, MIDDLE and TREBLE flat");
+    }
+
+    test::group ("a host with pictures: the stages' parts play what the stages play");
+    {
+        // Chain a plays the stages; chain b plays them as the plug-in does around its pictures: OCTAVE in pieces of 100 and
+        // its cut once on the block, ENVELOPE in pieces of 37 from their place in the key, the cut after the AMP and the
+        // END mute apart, CAB through a cabinet of the host's own — on blocks of 333, so no piece is the block.
+        const auto s = working();
+        const auto ir = cabinetShot();
+        constexpr int block = 333;
+        BassChain a, b;
+        (void) a.prepare (fs, block, 2, s);
+        (void) b.prepare (fs, block, 2, s, false);
+        cabinet::CabinetIr own;
+        own.setReference (cabinet::CabinetIr::Reference::bass);
+        own.prepare (fs, block, 2);
+        (void) a.cabinet().load (ir.data(), (int) ir.size(), fs);
+        (void) own.load (ir.data(), (int) ir.size(), fs);
+        const auto amp = [] (float* mono, int n) { for (int i = 0; i < n; ++i) mono[i] = std::tanh (3.0f * mono[i]); };
+        std::vector<float> al (block), ar (block), bl (block), br (block);
+        bool same = true, ranAlways = true;
+        for (size_t at = 0; at + block <= x.size(); at += block)
+        {
+            std::memcpy (al.data(), x.data() + at, sizeof (float) * block);
+            std::memcpy (bl.data(), x.data() + at, sizeof (float) * block);
+            float* ap[] { al.data(), ar.data() };
+            float* bp[] { bl.data(), br.data() };
+
+            a.inputCut (al.data(), block, s);
+            a.gateAnalyse (al.data(), block, s);
+            a.keepEnvelopeKey (al.data(), block, s);
+            a.compress (al.data(), block, s);
+            a.octaveDown (al.data(), block, s);
+            a.envelope (al.data(), block, s);
+            amp (al.data(), block);
+            a.afterAmp (al.data(), block, s);
+            a.widen (ap, 2, block);
+            a.chorus (ap, 2, block, s);
+            a.cabinetStage (ap, 2, block, s);
+            a.bassCuts (ap, 2, block, s);
+
+            b.inputCut (bl.data(), block, s);
+            b.gateAnalyse (bl.data(), block, s);
+            b.keepEnvelopeKey (bl.data(), block, s);
+            b.compress (bl.data(), block, s);
+            for (int done = 0; done < block; done += 100)
+                b.octave (bl.data() + done, std::min (100, block - done), s);
+            b.cut (2, bl.data(), block, s);
+            for (int done = 0; done < block; done += 37)
+                b.envelope (bl.data() + done, std::min (37, block - done), s, done);
+            amp (bl.data(), block);
+            b.cut (3, bl.data(), block, s);
+            b.muteAtEnd (bl.data(), block, s);
+            b.widen (bp, 2, block);
+            ranAlways = b.chorus (bp, 2, block, s) && ranAlways;
+            b.cabinetStage (bp, 2, block, s, own);
+            b.bassCuts (bp, 2, block, s);
+
+            same = same && std::memcmp (al.data(), bl.data(), sizeof (float) * block) == 0
+                        && std::memcmp (ar.data(), br.data(), sizeof (float) * block) == 0;
+        }
+        test::ok (same, "the same samples, both planes, every block");
+        test::ok (ranAlways && b.cabinetRan(), "CHORUS answers it ran; the cabinet that it was in the path");
+        test::ok (b.effectReady (0) && b.effectReady (1) && b.effectReady (2), "the three effects prepared");
+
+        auto out = s;
+        out.cabWorks = false;
+        float* bp[] { bl.data(), br.data() };
+        for (int k = 0; k < 20; ++k)   // the cabinet's fade out, and past it
+            b.cabinetStage (bp, 2, block, out, own);
+        test::ok (! b.cabinetRan(), "the cabinet out: out of the path, once its fade is over");
+    }
+
+    test::group ("a gap is its parts, and time");
+    {
+        // Two chains play the phrase's first half, then a gap of 2.5 blocks — gap() on one, its parts on the other, as a
+        // host drawing through it calls them — then the rest: the same samples. A third, with no gap, plays otherwise.
+        const auto s = working();
+        constexpr int block = 256;
+        BassChain a, b, c;
+        for (auto* ch : { &a, &b, &c })
+            (void) ch->prepare (fs, block, 2, s);
+        const auto amp = [] (float* mono, int n) { for (int i = 0; i < n; ++i) mono[i] *= 2.0f; };
+        std::vector<float> l (block), r (block);
+        const auto play = [&] (BassChain& ch, size_t from, size_t to, std::vector<float>& out)
+        {
+            for (size_t at = from; at < to; at += block)
+            {
+                const int n = (int) std::min ((size_t) block, to - at);
+                std::memcpy (l.data(), x.data() + at, sizeof (float) * (size_t) n);
+                ch.process (l.data(), r.data(), n, s, amp);
+                out.insert (out.end(), l.begin(), l.begin() + n);
+                out.insert (out.end(), r.begin(), r.begin() + n);
+            }
+        };
+        const size_t half = x.size() / 2;
+        std::vector<float> oa, ob, oc;
+        play (a, 0, half, oa);
+        play (b, 0, half, ob);
+        play (c, 0, half, oc);
+
+        constexpr int gapLength = 640;
+        a.gap (gapLength, s);
+        {
+            std::vector<float> plane (block), wide (2 * block);
+            for (int start = 0; start < gapLength; start += block)
+            {
+                const int len = std::min (block, gapLength - start);
+                for (int k = 0; k < 4; ++k)
+                {
+                    std::fill (plane.begin(), plane.end(), 0.0f);
+                    b.cut (k, plane.data(), len, s);
+                    if (k == 0)
+                        b.takeKey (plane.data(), len);
+                }
+                std::fill (wide.begin(), wide.end(), 0.0f);
+                float* planes[] { wide.data(), wide.data() + block };
+                b.bassCuts (planes, 2, len, s);
+                b.octave (nullptr, len, s);
+                for (int done = 0; done < len; done += 50)
+                    b.envelope (nullptr, std::min (50, len - done), s, done);
+                (void) b.chorus (nullptr, 0, len, s);
+            }
+        }
+        oa.clear();
+        ob.clear();
+        oc.clear();
+        play (a, half, x.size(), oa);
+        play (b, half, x.size(), ob);
+        play (c, half, x.size(), oc);
+        test::ok (oa.size() == ob.size() && std::memcmp (oa.data(), ob.data(), sizeof (float) * oa.size()) == 0,
+                  "gap() and its parts: the same samples after it, both planes");
+        test::ok (worst (oa, oc) > 1.0e-6, "and a gap is time: the chain that had none plays otherwise ("
+                                               + std::to_string (worst (oa, oc)) + ")");
+
+        const long long before = alloc::count.load();
+        a.gap (5 * block + 17, s);
+        test::okNoAlloc (alloc::count.load() == before, "a gap of five blocks and a piece allocates nothing");
+    }
+
+    test::group ("the effects' tells are counted");
+    {
+        auto s = working();
+        BassChain chain;
+        (void) chain.prepare (fs, 128, 2, s);
+        const int o = chain.told (0), e = chain.told (1), c = chain.told (2);
+        std::vector<float> l (128, 0.0f), r (128, 0.0f);
+        const auto amp = [] (float*, int) {};
+        chain.process (l.data(), r.data(), 128, s, amp);
+        test::ok (chain.told (0) == o && chain.told (1) == e && chain.told (2) == c, "the same knobs: no tell");
+        s.octave = 0.8f;
+        s.chorus = 0.1f;
+        chain.process (l.data(), r.data(), 128, s, amp);
+        test::ok (chain.told (0) == o + 1 && chain.told (1) == e && chain.told (2) == c + 1,
+                  "OCTAVE and CHORUS moved: one tell each, ENVELOPE none");
     }
 
     test::group ("no allocation in process()");

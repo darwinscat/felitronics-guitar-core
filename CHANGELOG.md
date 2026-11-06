@@ -2,6 +2,33 @@
 
 # Changelog
 
+## v0.10.0 — 2026-11-06
+
+`BassChain` for a host with pictures and gaps: what the bass amps' plug-in plays its bass path through, bit for bit.
+What the chain and fcbass play is unchanged.
+
+### Added
+- **bass: `BassChain` for a host with pictures and gaps** — what the plug-in needs to play its bass path through the
+  chain bit for bit, its pictures and its gaps with it. Nothing `process()` plays has moved (BassChainTests, the ABI
+  suite and the web's parity against the plug-in, unchanged).
+  - The parts some stages are made of: `octave` (OCTAVE alone, run a piece at a time for its picture) and `cut (at, …)`
+    (each of the four inner cuts, once on the whole block — its bits depend on its blocks); `envelope (…, keyAt)` from
+    a place in the kept key, for ENVELOPE run a column at a time; `muteAtEnd` (the cut after the AMP and the END mute
+    apart, for a reading between them).
+  - A GAP — time with silence, no samples: `gap (n, settings)`, or its parts for a host drawing through it: the cuts
+    over silence, the input cut's output as the key (`takeKey`), OCTAVE, ENVELOPE and CHORUS handed no channels.
+  - The cabinet the host's own: `cabinetStage (…, stage)` plays the host's `cabinet::CabinetIr`, and `prepare`'s
+    `ownCabinet` false leaves the chain's unprepared — for a host whose cabinet's producer side runs under its own lock.
+  - Read-outs: `chorus` answers whether the stage ran; `cabinetRan()` whether the cabinet was in the path;
+    `effectReady (which)` and `told (which)`, each effect's prepare and its count of tells; the gate's voicing
+    (`setGateConfig`, the app's DECAY).
+  - The effects' knob mappings as statics — `octaveKnobs`, `envelopeKnobs`, `chorusKnobs` — so what a host draws is
+    what the stage was told.
+
+### Fixed
+- **bass: the cabinet's threading, said right.** `cabinet()`'s producer side is one thread at a time (core's
+  `CabinetIr` takes no lock since v0.63.0); the class note said "under CabinetIr's lock".
+
 ## v0.9.0 — 2026-11-06
 
 The bass amp's chain, played by the plug-ins and by a browser: `BassChain`, and fcbass, its web module — RedGrooveBass
