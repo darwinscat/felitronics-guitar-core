@@ -2,7 +2,10 @@
 
 # Changelog
 
-## Unreleased
+## v0.9.0 — 2026-11-06
+
+The bass amp's chain, played by the plug-ins and by a browser: `BassChain`, and fcbass, its web module — RedGrooveBass
+in an AudioWorklet, held to the plug-in's own renders. fc_rig ABI 6, the crossover blend.
 
 ### Changed
 - **felitronics-core pinned to v0.63.0** (`FELITRONICS_GUITAR_FCORE_TAG`): the bass amp's stages the bass module plays
