@@ -20,9 +20,10 @@
 // the host's callback — what a host without stages of its own between them plays.
 //
 // THE CONTRACT. prepare() allocates; the stage methods allocate nothing, lock nothing, throw nothing. One thread owns
-// the chain's audio side; cabinet() is the cabinet's producer side (CabinetIr's own contract: its load and post on
-// another thread, under its lock). A block longer than the prepared maximum is refused by the stages that keep a copy
-// of it (ENVELOPE's key, the fades, the DI) exactly as the app refuses it: a host cuts its blocks to what it prepared.
+// the chain's audio side; cabinet() is the cabinet's producer side (CabinetIr's own contract: its prepare, load and post
+// on another thread, one thread at a time — a host with more holds its own lock around them). A block longer than the
+// prepared maximum is refused by the stages that keep a copy of it (ENVELOPE's key, the fades, the DI) exactly as the app
+// refuses it: a host cuts its blocks to what it prepared.
 
 #include <felitronics/basscomp/BassComp.h>
 #include <felitronics/cabinet/CabinetIr.h>
@@ -389,7 +390,8 @@ public:
 
     // ---- what a host reads and loads --------------------------------------------------------------------------------
 
-    /** The cabinet: its producer side (load, setPost, flushPending) is the host's, under CabinetIr's lock. */
+    /** The cabinet: its producer side (prepare, load, setPost, setReference, flushPending) is the host's — one thread at
+        a time, CabinetIr's contract: a host with more than one holds its own lock around them. */
     cabinet::CabinetIr&       cabinet() noexcept       { return cab; }
     const cabinet::CabinetIr& cabinet() const noexcept { return cab; }
 

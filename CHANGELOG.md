@@ -2,6 +2,12 @@
 
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **bass: the cabinet's threading, said right.** `cabinet()`'s producer side is one thread at a time (core's
+  `CabinetIr` takes no lock since v0.63.0); the class note said "under CabinetIr's lock".
+
 ## v0.9.0 — 2026-11-06
 
 The bass amp's chain, played by the plug-ins and by a browser: `BassChain`, and fcbass, its web module — RedGrooveBass
