@@ -20,8 +20,10 @@
 //   in.f32       the input, mono float32; out.f32 the output, both planes interleaved, float32 — after `warm-frames` of
 //                silence played first and not written
 //
-// THE SCHEDULE, as the processor keeps it: prepare (rate, block); the pack loaded; the cabinet; the knobs; then per
-// block: process, and the job pump — take a job; if it needs bytes, they are read and handed in; run and deliver.
+// THE SCHEDULE, as the processor keeps it: prepare (rate, block); the pack loaded and its files handed in up front (the
+// site's way, fc_rig ABI 5); the cabinet; the knobs; then per block: process, and the job pump — take a job, run and
+// deliver it. (Where a capture lands decides, at a session rate other than the pack's, the phase its rate-match starts
+// at — so the two renders keep the same schedule.)
 
 #include "fc_bass_abi.h"
 #include "fc_rig_abi.h"
@@ -32,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -114,6 +117,17 @@ int main (int argc, char** argv)
     if (fc_bass_prepare (bass, rate, block) != 1) { std::fprintf (stderr, "prepare refused\n"); return 1; }
     const auto manifest = readFile (dir + "/rig.json");
     if (fc_rig_load (rig, manifest.data(), (int) manifest.size()) != 1) { std::fprintf (stderr, "load refused\n"); return 1; }
+    // THE FILES UP FRONT, as the site hands a pack's files in with it (fc_rig ABI 5): every file the pack names, so no
+    // job waits for its bytes and a capture lands at the same block here as in the worklet.
+    for (const auto& entry : std::filesystem::directory_iterator (dir))
+    {
+        const auto name = entry.path().filename().string();
+        if (! entry.is_regular_file() || name == "rig.json") continue;
+        const auto bytes = readFile (entry.path().string());
+        if (bytes.empty()) continue;
+        if (uint8_t* p = fc_rig_put_file (rig, name.c_str(), (int) bytes.size()))
+            std::memcpy (p, bytes.data(), bytes.size());
+    }
 
     double irRate = 0.0;
     const auto ir = readWav (argv[5], irRate);
@@ -151,16 +165,20 @@ int main (int argc, char** argv)
     float* r = fc_bass_buffer (bass, 1);
     std::vector<float> out;
     out.reserve (2 * in.size());
+    long blocks = 0;
     const auto pump = [&]
     {
+        ++blocks;
         if (fc_rig_take_job (rig) != 1) return;
         if (fc_rig_job_needs_bytes (rig) == 1)
         {
             const auto bytes = readFile (dir + "/" + std::string (fc_rig_job_file (rig), (std::size_t) fc_rig_job_file_length (rig)));
             if (! bytes.empty()) std::memcpy (fc_rig_job_bytes (rig, (int) bytes.size()), bytes.data(), bytes.size());
         }
+        const std::string file (fc_rig_job_file (rig), (std::size_t) fc_rig_job_file_length (rig));
         fc_rig_job_run (rig);
         fc_rig_job_deliver (rig);
+        if (std::getenv ("FC_BASS_RENDER_JOBS") != nullptr) std::fprintf (stderr, "job %s after block %ld\n", file.c_str(), blocks);
     };
     for (long done = 0; done < warm;)
     {

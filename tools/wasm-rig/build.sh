@@ -25,8 +25,8 @@
 #                               to SIMD128's (Safari 16.4) — README.md, "Browser floor".
 # Assertions off: the shipped module. The checked configuration of this source is the native ABI suite.
 #
-# CORE IS PINNED: the tag the top-level CMakeLists names (v0.61.1 — the first whose FlushToZero.h compiles for wasm
-# under -msse4.1), fetched, unless FELITRONICS_CORE_DIR names a checkout to build against instead. NAM and namz are
+# CORE IS PINNED: the tag the top-level CMakeLists names (v0.63.0; v0.61.1 was the first whose FlushToZero.h compiles
+# for wasm under -msse4.1), fetched, unless FELITRONICS_CORE_DIR names a checkout to build against instead. NAM and namz are
 # the pins modules/nam names (NeuralAmpModelerCore v0.5.4, namz v4.4.0), fetched — or FELITRONICS_NAM_CORE_SRC /
 # FELITRONICS_NAMZ_SRC, checkouts of those same tags, for a build without the network. BUILD-INFO says which.
 set -euo pipefail

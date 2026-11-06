@@ -47,6 +47,16 @@
   through the knobs by the app's ids, the gain dial, BLEND, two cabinets, the gate's two places, a character switch, an
   effect leaving the strip and the cabinet out and back; the contract; no allocation in 200 blocks with every stage at
   work and two captures sounding. Built with `FELITRONICS_GUITAR_WITH_BASS_WEB` (on at the top level).
+- **tools/wasm-bass: `fcbass`, the bass amp in a browser AudioWorklet** — `build.sh` (fcrig's flags and checks) makes
+  `fcbass.wasm` (989 782 bytes, 360 150 gzip), `fcbass.mjs`, `fcbass-worklet.js` (`'fc-bass'`: fcrig's processor,
+  `rig-port.js`, around an fc_bass — the same messages, plus `{ bass }` knobs by the app's ids, `{ cab }` the cabinet's
+  IR, and COMP's squeeze in `{ read }`) and `BUILD-INFO` (both ABIs). `bass-parity.mjs` holds the web to its native build
+  and to OrbitAmp's own renders of RedGrooveBass (orbit-amp's `RedGrooveBassReference`: both gears, the walker as it
+  opens, every stage at work, with and without its limiter): at 48 kHz, 12 sessions, the web within 4.96e-6 of its native
+  build (-98 dB), within 4.96e-6 of the plug-in's chain and 3.78e-5 of the plug-in with its limiter in. At 44.1 kHz the
+  player's rate-match runs and the web is 2.3e-3 … 6.3e-3 from its native build on the SGT-DI (the AMP alone 2.3e-3; the
+  plug-in itself spreads up to 4.5e-3 across its host blocks there) — the rig's, an open item; bounded at 1e-2.
+  `tools/wasm-bass/README.md` has what a page owes it.
 
 ## v0.8.0 — 2026-11-02
 

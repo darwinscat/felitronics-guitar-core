@@ -87,4 +87,17 @@ if(NOT EMSCRIPTEN)
     # The native half of bass-parity.mjs: a pack and a cabinet through this same ABI on the processor's schedule.
     add_executable(fc_bass_render fc_bass_render.cpp)
     target_link_libraries(fc_bass_render PRIVATE felitronics::bass_abi)
+
+    # The wasm module and the native render against the plug-in's own renders, when there are all three: build.sh's output,
+    # orbit-amp's RedGrooveBassReference output (its renders, --cabinets, --params) and the pack it played.
+    set(FELITRONICS_GUITAR_BASS_WASM_DIR "" CACHE PATH "tools/wasm-bass/build.sh output for the parity run")
+    set(FELITRONICS_GUITAR_BASS_REFERENCES "" CACHE PATH "RedGrooveBassReference's output (orbit-amp) the parity run is held to")
+    set(FELITRONICS_GUITAR_BASS_PACK "" CACHE PATH "The .orbitrig the references played (orbit-amp resources/set/Devices/Ampeg SGT-DI.orbitrig)")
+    if(FELITRONICS_GUITAR_BASS_WASM_DIR AND FELITRONICS_GUITAR_BASS_REFERENCES AND FELITRONICS_GUITAR_BASS_PACK)
+        find_program(FELITRONICS_NODE node REQUIRED)
+        add_test(NAME felitronics_bass_wasm_parity
+                 COMMAND ${FELITRONICS_NODE} --experimental-vm-modules ${CMAKE_CURRENT_SOURCE_DIR}/bass-parity.mjs
+                         ${FELITRONICS_GUITAR_BASS_WASM_DIR} $<TARGET_FILE:fc_bass_render>
+                         ${FELITRONICS_GUITAR_BASS_REFERENCES} ${FELITRONICS_GUITAR_BASS_PACK})
+    endif()
 endif()
