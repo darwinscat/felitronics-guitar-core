@@ -80,6 +80,8 @@
 //   5         + fc_rig_put_file; and fc_rig_job_run builds ONE network on a mono prepare and skips NAM's zero prewarm
 //             (ABI 5 below) — the same audio, bit for bit, at a fraction of the cost and half the memory (v0.7.0);
 //             + fc_rig_warm_quiet, fc_rig_audible, fc_rig_signature (the start without a burst: ABI 5 below)
+//   6         + fc_rig_set_crossover_amount, fc_rig_set_crossover_hz, fc_rig_set_crossover_invert,
+//             fc_rig_set_crossover_clean_db — the crossover blend, a bass amp's clean low end (ABI 6 below; v0.9.0)
 //
 // ====================================================================================
 // ABI 2 — THE SCOPE, PARK AND THE FEED (OrbitAmp's ScopeTap, its PARK, its block IN)
@@ -176,9 +178,23 @@
 //                     its architecture, layer config and rate, never its weights); 0 = none held. Two
 //                     captures with one signature cost the same to run, so a host that timed one may keep the answer.
 
+// ====================================================================================
+// ABI 6 — THE CROSSOVER BLEND (RigPlayer::setCrossover*): a bass amp's clean low end (v0.9.0)
+// ====================================================================================
+// Below a frequency the CLEAN input, held back by each capture's own lag so the two bands meet in time, in place of the
+// capture's low end — the host's, not the pack's (rigplayer/RigPlayer.h, "THE CROSSOVER BLEND"). OrbitAmp's bass amps
+// tell it from their BLEND: the amount is 1 - BLEND (BLEND 1, the capture alone, is amount 0).
+//   fc_rig_set_crossover_amount(amount)  0 … 1, clamped; 0 is the player without it, bit for bit. 1 = taken, 0 = refused
+//                     (no instance, a non-finite amount: nothing changes).
+//   fc_rig_set_crossover_hz(hz)          the crossover, clamped onto RigPlayer::kCrossoverMinHz … kCrossoverMaxHz. As above.
+//   fc_rig_set_crossover_invert(on)      every slot's clean tap inverted on top of what the table reads (a capture that
+//                     hands its input back inverted notches at the seam otherwise).
+//   fc_rig_set_crossover_clean_db(db)    the clean leg's level against the device, ±24 dB clamped; 0 by default. As above.
+// All four glide (10 ms) and are kept across fc_rig_load / fc_rig_unload, as the player keeps them.
+
 #include <stdint.h>
 
-#define FC_RIG_ABI_VERSION 5u
+#define FC_RIG_ABI_VERSION 6u
 
 #ifdef __cplusplus
 extern "C" {
@@ -251,6 +267,11 @@ uint8_t* fc_rig_put_file (fc_rig* rig, const char* id, int size);   // write `si
 int      fc_rig_warm_quiet (fc_rig* rig, int max_blocks);      // blocks of silence fed to a warming capture now
 int      fc_rig_audible (fc_rig* rig);                         // 1 = a capture may be heard (the law's gain > 0)
 uint32_t fc_rig_signature (fc_rig* rig, int slot);             // the slot's capture's architecture signature; 0 = none
+// ---- ABI 6: the crossover blend (see ABI 6 above) ------------------------------------------------------------------
+int      fc_rig_set_crossover_amount (fc_rig* rig, double amount);   // 0 … 1; 0 = without it. 1 taken, 0 refused
+int      fc_rig_set_crossover_hz (fc_rig* rig, double hz);           // clamped onto the player's range
+void     fc_rig_set_crossover_invert (fc_rig* rig, int on);          // every slot's clean tap inverted
+int      fc_rig_set_crossover_clean_db (fc_rig* rig, double db);     // the clean leg's level, ±24 dB
 
 #ifdef __cplusplus
 }

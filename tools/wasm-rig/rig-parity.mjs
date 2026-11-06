@@ -9,7 +9,7 @@
 // --stand-in names NAM's example A2 (the architecture of every site pack): without a real pack, THE START and the
 // session's decisions are timed on it, packed by the namz CLI under the fixture's manifest (see `timedPack`).
 //
-// <build-dir> holds what build.sh ships (fcrig.mjs, fcrig.wasm, fcrig-worklet.js). The fixture pack (written by
+// <build-dir> holds what build.sh ships (fcrig.mjs, fcrig.wasm, fcrig-worklet.js, rig-port.js). The fixture pack (written by
 // fc_rig_render --fixture) is always played; <packs-dir>, when given, adds real packs: every one of PACKS found there
 // as <name>.orbitrig/ (rig.json beside its captures). What it proves:
 //   1. THE WORKLET LOADS WHERE IT WILL RUN: the processor and the glue as ES modules in a context shaped like an
@@ -105,8 +105,13 @@ async function loadWorklet(sampleRate) {
     const worklet = new vm.SourceTextModule(fs.readFileSync(path.join(dir, 'fcrig-worklet.js'), 'utf8'), {
         context: ctx, identifier: 'fcrig-worklet.js',
         initializeImportMeta(meta) { meta.url = 'https://worklet.invalid/fcrig-worklet.js'; } });
+    // The rig half every pack player's worklet shares (rig-port.js), beside it under its own name.
+    const port = new vm.SourceTextModule(fs.readFileSync(path.join(dir, 'rig-port.js'), 'utf8'), {
+        context: ctx, identifier: 'rig-port.js',
+        initializeImportMeta(meta) { meta.url = 'https://worklet.invalid/rig-port.js'; } });
     await worklet.link((spec, referrer) => {
         if (spec === './fcrig.mjs' && referrer === worklet) return wrapper;
+        if (spec === './rig-port.js' && referrer === worklet) return port;
         if (spec === './glue.mjs' && referrer === wrapper) return glue;
         throw new Error('the worklet imports ' + spec);
     });
@@ -341,9 +346,9 @@ group('the worklet loads in an AudioWorkletGlobalScope, and its exports are the 
     const want = [...fs.readFileSync(header, 'utf8').matchAll(/^[A-Za-z_][A-Za-z0-9_ *]* (fc_rig_[a-z_]+) \(/gm)]
         .map((m) => '_' + m[1]).sort();
     const got = Object.keys(proc.m).filter((k) => k.startsWith('_fc_rig_')).sort();
-    ok(want.length === 48, `the header declares 48 entry points (read ${want.length})`);
+    ok(want.length === 52, `the header declares 52 entry points (read ${want.length}) — ABI 6 added the crossover's four`);
     ok(JSON.stringify(got) === JSON.stringify(want), `the module exports exactly the header's entry points\n      got  ${got}\n      want ${want}`);
-    ok(proc.m._fc_rig_abi_version() === 5, 'abi_version answers 5');
+    ok(proc.m._fc_rig_abi_version() === 6, 'abi_version answers 6');
     ok(!/toResizableBuffer/.test(GLUE), 'the glue never calls WebAssembly.Memory.toResizableBuffer (Chrome 144+)');
     proc.port.onmessage({ data: { dispose: true } });
 }

@@ -5,7 +5,7 @@
 # architectures through static initialisers, and plain static linking silently drops them), so poweramp
 # alone (FELITRONICS_GUITAR_WITH_NAM=OFF) still configures on 3.22.
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_guitar_core VERSION 0.8.0 LANGUAGES CXX)
+project(felitronics_guitar_core VERSION 0.9.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -38,6 +38,14 @@ option(FELITRONICS_GUITAR_WITH_NAM
 option(FELITRONICS_GUITAR_WITH_FX
        "Build the fc_guitar_fx C ABI (tools/wasm) over core's delay + reverb (felitronics-core v0.61.0+)"
        "${PROJECT_IS_TOP_LEVEL}")
+# The bass amp's chain (modules/bass): JUCE-free, over core's bass stages — so it needs the core that has them.
+option(FELITRONICS_GUITAR_WITH_BASS
+       "Build felitronics::bass, the bass amp's chain, over core's basscomp, cabinet, octave, envfilter and chorus (felitronics-core v0.63.0+)"
+       ON)
+# The browser's bass amp: the chain and the pack player behind the fc_bass C ABI (tools/wasm-bass), the way fcrig is built.
+option(FELITRONICS_GUITAR_WITH_BASS_WEB
+       "Build the fc_bass C ABI (tools/wasm-bass) over felitronics::bass and the fc_rig player (needs NAM, the rig and the bass chain)"
+       "${PROJECT_IS_TOP_LEVEL}")
 # The browser's pack player, the same way: this repository's own product, built when it is the top level and NAM is
 # on (it plays NAM captures); opt-in for a consumer.
 option(FELITRONICS_GUITAR_WITH_RIG
@@ -52,7 +60,7 @@ if(PROJECT_IS_TOP_LEVEL)
     include(FetchContent)
     set(FELITRONICS_GUITAR_FCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../felitronics-core" CACHE PATH
         "Local felitronics-core checkout (used if present); else the pinned release is fetched")
-    set(FELITRONICS_GUITAR_FCORE_TAG "v0.61.2" CACHE STRING
+    set(FELITRONICS_GUITAR_FCORE_TAG "v0.63.0" CACHE STRING
         "felitronics-core git tag to fetch when no local checkout is present")
     if(FELITRONICS_GUITAR_FCORE_DIR AND EXISTS "${FELITRONICS_GUITAR_FCORE_DIR}/CMakeLists.txt")
         message(STATUS "felitronics-core: local checkout — ${FELITRONICS_GUITAR_FCORE_DIR}")
@@ -100,6 +108,16 @@ endif()
 add_subdirectory(modules/nam)         # compiled NAM backend; self-gates on FELITRONICS_WITH_NAM
 add_subdirectory(modules/rigplayer)   # header-only pack player over nam; same gate
 add_subdirectory(modules/poweramp)    # header-only; core + eq + oversampling + saturation
+if(FELITRONICS_GUITAR_WITH_BASS)
+    foreach(_bass_dep IN ITEMS basscomp cabinet octave envfilter chorus)
+        if(NOT TARGET felitronics::${_bass_dep})
+            message(FATAL_ERROR "FELITRONICS_GUITAR_WITH_BASS needs felitronics-core v0.63.0 or later (felitronics::basscomp, "
+                                "cabinet, octave, envfilter, chorus); this core has no felitronics::${_bass_dep}. Use a newer core "
+                                "or set it OFF.")
+        endif()
+    endforeach()
+    add_subdirectory(modules/bass)    # header-only; core's bass stages
+endif()
 
 # The browser's echo and room. Core's delay and reverb modules first shipped in v0.61.0; an older core has
 # neither target, and that is a refusal here, not a silently smaller build.
@@ -114,6 +132,11 @@ endif()
 # The browser's pack player: RigPlayer behind the fc_rig C ABI, and under emscripten the fcrig module.
 if(FELITRONICS_GUITAR_WITH_RIG AND FELITRONICS_GUITAR_WITH_NAM)
     add_subdirectory(tools/wasm-rig)
+endif()
+
+# The browser's bass amp: fc_bass over the chain and fc_rig's player (tools/wasm-bass), and under emscripten fcbass.
+if(FELITRONICS_GUITAR_WITH_BASS_WEB AND FELITRONICS_GUITAR_WITH_BASS AND FELITRONICS_GUITAR_WITH_RIG AND FELITRONICS_GUITAR_WITH_NAM)
+    add_subdirectory(tools/wasm-bass)
 endif()
 
 if(FELITRONICS_GUITAR_BUILD_TESTS)

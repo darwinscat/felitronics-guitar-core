@@ -5,7 +5,7 @@
 //
 //   node --experimental-vm-modules tools/wasm-rig/rig-compare.mjs <old-build-dir> <new-build-dir> <pack.orbitrig>...
 //
-// A build dir is what build.sh leaves (fcrig.mjs, fcrig.wasm, fcrig-worklet.js); each module is loaded the way its
+// A build dir is what build.sh leaves (fcrig.mjs, fcrig.wasm, fcrig-worklet.js, and from v0.9.0 rig-port.js); each module is loaded the way its
 // own worklet loads it, in a simulated AudioWorkletGlobalScope, and then driven straight through its fc_rig_* entry
 // points — so what is compared is the module, not either worklet.
 //
@@ -51,7 +51,13 @@ async function loadModule(dir) {
                                         { context: ctx });
     const worklet = new vm.SourceTextModule(fs.readFileSync(path.join(dir, 'fcrig-worklet.js'), 'utf8'),
                                             { context: ctx, ...meta('https://worklet.invalid/fcrig-worklet.js') });
-    await worklet.link((spec, ref) => (spec === './fcrig.mjs' && ref === worklet ? spy : glue));
+    // From v0.9.0 the worklet imports the rig half it shares with fcbass's (rig-port.js), beside it in the build dir.
+    const portFile = path.join(dir, 'rig-port.js');
+    const port = fs.existsSync(portFile)
+        ? new vm.SourceTextModule(fs.readFileSync(portFile, 'utf8'), { context: ctx, ...meta('https://worklet.invalid/rig-port.js') })
+        : null;
+    await worklet.link((spec, ref) => (spec === './fcrig.mjs' && ref === worklet ? spy
+                                       : spec === './rig-port.js' && port ? port : glue));
     await worklet.evaluate();
     const wasm = await vm.runInContext('WebAssembly', ctx).compile(fs.readFileSync(path.join(dir, 'fcrig.wasm')));
     const proc = new registered({ numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
