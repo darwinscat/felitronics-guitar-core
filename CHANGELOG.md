@@ -2,7 +2,13 @@
 
 # Changelog
 
-## Unreleased
+## v0.11.0 — 2026-11-11
+
+namz v5.1.0 — a pack that carries its own high-pass and low-pass — played. Packs without them play as before.
+
+### Changed
+- **namz pinned to v5.1.0** (`FELITRONICS_NAMZ_TAG`, `FELITRONICS_NAMZ_COMMIT` = `0c5fcb0`). A host that pins namz itself
+  (OrbitAmp FORCEs both) moves its pin with this one.
 
 ### Added
 - **The pack's own filters played** — namz `chain[].high_pass` and `low_pass`: a Butterworth of
