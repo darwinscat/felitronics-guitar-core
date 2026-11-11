@@ -2,6 +2,20 @@
 
 # Changelog
 
+## v0.11.0 — 2026-11-11
+
+namz v5.1.0 — a pack that carries its own high-pass and low-pass — played. Packs without them play as before.
+
+### Changed
+- **namz pinned to v5.1.0** (`FELITRONICS_NAMZ_TAG`, `FELITRONICS_NAMZ_COMMIT` = `0c5fcb0`). A host that pins namz itself
+  (OrbitAmp FORCEs both) moves its pin with this one.
+
+### Added
+- **The pack's own filters played** — namz `chain[].high_pass` and `low_pass`: a Butterworth of
+  6 to 48 dB an octave (`rigplayer/PackFilter.h`, double-precision state), `pre` where the pack's input level meets the
+  guitar, before anything splits, or `post` after the mix, where its output level goes. Published on load like the
+  levels and built on the audio thread, nothing allocated; a placement other than pre or post is skipped.
+
 ## v0.10.0 — 2026-11-06
 
 `BassChain` for a host with pictures and gaps: what the bass amps' plug-in plays its bass path through, bit for bit.

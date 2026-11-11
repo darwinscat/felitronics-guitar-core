@@ -3495,5 +3495,63 @@ int main() {
         }
     }
 
+    group("the pack's own filters: high_pass and low_pass, Butterworth, where the pack says");
+    {
+        const auto filtered = [] (namz::rig::Stage::Filter hp, namz::rig::Stage::Filter lp) {
+            auto r = testRig();
+            r.chain[0].highPass = std::move(hp);
+            r.chain[0].lowPass  = std::move(lp);
+            return throughTheFormat(r);
+        };
+        Bench plain(testRig());
+        Bench hp(filtered({ 80.0, 24, "post" }, {}));
+        Bench lp(filtered({}, { 2000.0, 12, "post" }));
+        // Measured over 75 blocks, 19200 samples: a whole number of cycles of every frequency asked below (40 Hz is
+        // 1200 samples), so the RMS is not read off a part of a cycle.
+        const auto rel = [&plain] (Bench& b, double hz) {
+            return db(b.gainAt(hz, 0.1, 96, 75)) - db(plain.gainAt(hz, 0.1, 96, 75));
+        };
+
+        // A Butterworth's own numbers, through the format and the player: -3 dB at the corner, the slope's worth an
+        // octave out, nothing in the band. (The low-pass an octave up is a touch past -12.3: the bilinear transform
+        // squeezes the top of the band, and the corner alone is prewarped.)
+        approx(rel(hp, 80.0),   -3.01, 0.15, "high-pass 80 Hz, 24 dB: -3 dB at 80 Hz");
+        approx(rel(hp, 40.0),  -24.10, 0.40, "…-24 dB an octave under it");
+        approx(rel(hp, 1000.0),  0.00, 0.05, "…and nothing at 1 kHz");
+        approx(rel(lp, 2000.0), -3.01, 0.15, "low-pass 2 kHz, 12 dB: -3 dB at 2 kHz");
+        approx(rel(lp, 4000.0), -12.5, 0.40, "…about -12 dB an octave over it");
+        approx(rel(lp, 200.0),   0.00, 0.05, "…and nothing at 200 Hz");
+
+        // A placement a player does not know is skipped, as a tone knob's is.
+        Bench odd(filtered({ 80.0, 24, "middle" }, {}));
+        approx(rel(odd, 40.0), 0.0, 0.05, "a placement other than pre or post is no filter");
+
+        // A pack without filters, loaded over one with them, plays unfiltered.
+        hp.load(testRig());
+        approx(rel(hp, 40.0), 0.0, 0.05, "the next pack without filters plays without them");
+
+        // PRE OR POST, told apart by a model with an offset: silence in, the offset out. A high-pass before the model
+        // filters the silence and leaves the offset standing; after it, it takes the offset away.
+        const auto meanOf = [] (Bench& b) {
+            std::vector<float> l((std::size_t) kBlock);
+            double sum = 0.0; long n = 0;
+            for (int k = 0; k < 80; ++k) {
+                std::fill(l.begin(), l.end(), 0.0f);
+                float* io[2] { l.data(), nullptr };
+                felitronics::test::run (b.p.process(io, 1, kBlock));
+                b.p.serviceHere();
+                if (k >= 48) for (const float v : l) { sum += (double) v; ++n; }
+            }
+            return sum / (double) std::max(1L, n);
+        };
+        const auto biased = [] (const std::string& nam) { return [nam] (const std::string&) { return bytesOf(nam); }; };
+        const auto model = biasModel(0.5, 0.25);
+        Bench pre(testRig()), post(testRig());
+        pre.p.load(filtered({ 80.0, 24, "pre" }, {}).chain[0], biased(model));
+        post.p.load(filtered({ 80.0, 24, "post" }, {}).chain[0], biased(model));
+        ok(std::abs(meanOf(pre) - 0.25) < 0.02, "a pre high-pass is before the model: the model's offset stands");
+        ok(std::abs(meanOf(post)) < 0.01, "a post high-pass is after it: the offset is gone");
+    }
+
     return felitronics::test::report();
 }
