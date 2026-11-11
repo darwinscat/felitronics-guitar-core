@@ -2,6 +2,14 @@
 
 # Changelog
 
+## Unreleased
+
+### Added
+- **The pack's own filters played** — namz `chain[].high_pass` and `low_pass`: a Butterworth of
+  6 to 48 dB an octave (`rigplayer/PackFilter.h`, double-precision state), `pre` where the pack's input level meets the
+  guitar, before anything splits, or `post` after the mix, where its output level goes. Published on load like the
+  levels and built on the audio thread, nothing allocated; a placement other than pre or post is skipped.
+
 ## v0.10.0 — 2026-11-06
 
 `BassChain` for a host with pictures and gaps: what the bass amps' plug-in plays its bass path through, bit for bit.
