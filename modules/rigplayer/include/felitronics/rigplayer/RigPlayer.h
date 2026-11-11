@@ -59,6 +59,7 @@
 #include <felitronics/rigplayer/AlignmentTable.h>
 #include <felitronics/rigplayer/BlendKnob.h>
 #include <felitronics/rigplayer/CrossoverBlend.h>
+#include <felitronics/rigplayer/PackFilter.h>
 #include <felitronics/rigplayer/RigSelection.h>
 #include <felitronics/rigplayer/ToneKnobs.h>
 
@@ -327,6 +328,8 @@ public:
         fs_       = usableSampleRate (sampleRate);
         maxBlock_ = maxBlock;
         channels_ = numChannels;   // validated above — law 11(b) forbids the clamp that was here
+        for (auto& f : packFilter_) f.reset();
+        filterRebuild_ = true;     // the pack's filters are designed at fs_: rebuilt at the next block
         coldAfter_.store(coldSamples(coldSeconds_), std::memory_order_release);
         dipSamples_ = std::max(1LL, (long long) std::llround(kDipSeconds * fs_));
         for (auto& n : nam_) n.prepare(fs_, maxBlock_, channels_);   // a mono host's slots run one network each
@@ -507,6 +510,7 @@ public:
         for (auto& f : fir_) f.clearAudioState();
         dry_.clearAudioState();
         dryLatency_.reset();             // the dry leg's ring: a LITERAL replay of the previous stream
+        for (auto& f : packFilter_) f.reset();   // …and the pack's own filters' memory
         wire_.reset();                   // …and the stand-by wire's, for the same reason
         clearAudioState();
         // THE BANDS SNAP, THEY DO NOT RETIRE. prepare() zeroes `bandRt_.count` because its
@@ -579,6 +583,7 @@ public:
         if (stage.kind != namz::rig::StageKind::Nam || stage.device.files.empty()) return false;
         stage_  = stage;
         publishLevels();          // the new pack's levels stand from here, not from the end of load()
+        publishFilters();         // …and its own filters
         source_ = std::move(source);
         const auto& d = stage_.device;
         // One model per DISTINCT file: several settings pointing at one file — the pack's link — share
@@ -676,6 +681,7 @@ public:
         // device (setFeedDb), and the wire is behind it. publishLevels() says so for an empty player,
         // so a setter called while nothing is loaded publishes the same two numbers this does.
         publishLevels();
+        publishFilters();
         chainGain_.store(1.0f, std::memory_order_release);
         for (auto& g : slotGain_) g.store(1.0f, std::memory_order_release);
         for (auto& p : pendDelay_) p.store(0, std::memory_order_release);
@@ -1608,6 +1614,12 @@ public:
             }
             rampInto(a, nch, count, inGain_.load(std::memory_order_acquire), curIn_);
 
+            // THE PACK'S OWN FILTERS (namz `high_pass`, `low_pass`): rebuilt when a load published new ones or the rate
+            // moved — and the `pre` ones run here, where the pack's input level has just met the guitar, before anything
+            // splits: the dry side of a blend is the same guitar and gets the same filter.
+            refreshPackFilters();
+            runPackFilters(1, a, nch, count);
+
             // Keep the DRY block before anything touches it: the same DI the models are fed, which is
             // the whole economy of a blend. Taken ahead of the pre-model tone — the hardware's dry path
             // leaves at the input jack.
@@ -1870,6 +1882,9 @@ public:
             // THE CROSSOVER BLEND (setCrossoverAmount): the clean leg tapped at each slot's lag and mixed by this block's
             // law exactly as the models were, then split with the device by one Linkwitz–Riley pair.
             if (xo) xo_.run(a, count);
+
+            // …and the `post` ones, on what the stage leaves with: after the mix, where its output level is applied.
+            runPackFilters(2, a, nch, count);
 
             // THE PACK'S OUTPUT LEVEL, and it goes last: after the mix. One number for the whole
             // stage, and applied any earlier it would ride the wet side alone and move a blend the
@@ -2192,6 +2207,44 @@ private:
         }
         inGain_ .store(linOf((hostIn_  ? *hostIn_  : stage_.inputDb) + feedDb_), std::memory_order_release);
         outGain_.store(linOf(hostOut_ ? *hostOut_ : stage_.outputDb), std::memory_order_release);
+    }
+
+    /// THE PACK'S OWN FILTERS, published for the audio thread: each one's frequency, order and place, then the
+    /// generation. A filter the pack does not state, or states with a placement other than "pre" or "post", is
+    /// nowhere — skipped, as a tone knob with an unknown placement is. An empty player has none.
+    void publishFilters() {
+        const bool nam = stage_.kind == namz::rig::StageKind::Nam;
+        const namz::rig::Stage::Filter* f[2] { &stage_.highPass, &stage_.lowPass };
+        for (int i = 0; i < 2; ++i) {
+            const int place = ! nam || ! f[i]->on() ? 0
+                            : f[i]->placement == "pre" ? 1 : f[i]->placement == "post" ? 2 : 0;
+            filterSpec_[i].hz.store(place != 0 ? f[i]->hz : 0.0, std::memory_order_relaxed);
+            filterSpec_[i].order.store(place != 0 ? f[i]->dbPerOct / 6 : 0, std::memory_order_relaxed);
+            filterSpec_[i].place.store(place, std::memory_order_relaxed);
+        }
+        filterGen_.fetch_add(1, std::memory_order_release);
+    }
+
+    // Audio thread: the filters rebuilt from the published spec when it moved (or the rate did). The state is kept
+    // across a rebuild — two packs filtered alike swap seamlessly — and cleared for a filter that was not running.
+    void refreshPackFilters() noexcept {
+        const unsigned g = filterGen_.load(std::memory_order_acquire);
+        if (g == filterSeen_ && ! filterRebuild_) return;
+        filterSeen_ = g;
+        filterRebuild_ = false;
+        for (int i = 0; i < 2; ++i) {
+            const int place = filterSpec_[i].place.load(std::memory_order_relaxed);
+            packFilter_[i].set(i == 0, filterSpec_[i].hz.load(std::memory_order_relaxed),
+                               filterSpec_[i].order.load(std::memory_order_relaxed), fs_);
+            const int now = packFilter_[i].on() ? place : 0;
+            if (now != 0 && packPlace_[i] == 0) packFilter_[i].reset();
+            packPlace_[i] = now;
+        }
+    }
+
+    void runPackFilters(int place, float* const* a, int nch, int n) noexcept {
+        for (int i = 0; i < 2; ++i)
+            if (packPlace_[i] == place) packFilter_[i].process(a, nch, n);
     }
 
     std::uint64_t modelIdOf(int file) const {
@@ -3088,6 +3141,16 @@ private:
     // after the dry block has already been taken.
     std::atomic<float>         inGain_ { 1.0f }, outGain_ { 1.0f };
     std::optional<double>      hostIn_, hostOut_;      // message thread only; empty = the pack's own
+    // THE PACK'S OWN FILTERS (namz Stage::highPass, lowPass — index 0 and 1): the spec as the message thread last
+    // published it — the frequency, the order and where (0 nowhere, 1 pre, 2 post) — under a generation the audio
+    // thread compares with the one it built for. The filters themselves are the audio thread's.
+    struct FilterSpec { std::atomic<double> hz { 0.0 }; std::atomic<int> order { 0 }, place { 0 }; };
+    FilterSpec                 filterSpec_[2];
+    std::atomic<unsigned>      filterGen_ { 0 };
+    unsigned                   filterSeen_ = 0;        // audio thread: the generation packFilter_ was built for
+    bool                       filterRebuild_ = true;  // set by prepare(): the rate may have moved
+    PackFilter                 packFilter_[2];
+    int                        packPlace_[2] { 0, 0 };
     // The feed (setFeedDb): its dB on the message thread, summed into inGain_ there; its gain alone for the scope's dry.
     double                     feedDb_ = 0.0;
     std::atomic<float>         feedGain_ { 1.0f };
