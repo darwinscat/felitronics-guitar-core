@@ -6,8 +6,8 @@
 // Linkwitz–Riley pair that splits both sides, and the glides:
 //
 //     out = HP4(device) + LP4((1 − amount) · device + amount · clean)
-//     clean = the slots' clean taps (each at its capture's lag and polarity), mixed as the slots are, then the pack's
-//             own dry part mixed in by the blend knob exactly as it is mixed into the device
+//     clean = the slots' clean taps (each at its capture's lag and polarity, through its clean match's all-passes), mixed
+//             as the slots are, then the pack's own dry part mixed in by the blend knob exactly as it is mixed into the device
 //
 // LP4 and HP4 are core's eq::Crossover2, built of the same two Butterworth SVFs a side (eq::Svf, Q = 1/√2), run on the
 // clean leg's low half and the device's high half — so a device that is a wire sums to the pair's all-pass.
@@ -16,9 +16,16 @@
 // delayed by the slot's alignment delay through a line that mirrors the slot's own, and mixed by the law's recipe —
 // mixSlots, the ONE spelling of how a block's two slots become one plane, which the player's models go through too.
 //
+// A CAPTURE'S CLEAN MATCH (AlignmentTable.h, CleanMatch) bends each slot's tap to the capture's low end: its lag and
+// polarity arrive as the tap's own (taps, clean's `invert`), and its two first-order all-passes run here, per slot and
+// plane, after the line — each section a coefficient that glides as the polarity does, and a section at 1 (none) is not
+// run at all: its memory follows its input, so the clean leg of a capture with no match is the one it always was, bit
+// for bit, and a section that glides in starts from where the signal stands.
+//
 // Threads: the setters may be called from the message thread (atomics); everything else is the audio thread's, or a
 // restart's (prepare / clear / snap), which never runs beside it. No allocation outside prepare().
 
+#include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/core/StateGrid.h>
 #include <felitronics/eq/Svf.h>
@@ -168,6 +175,7 @@ public:
         for (auto& f : hp_) f.reset();
         for (auto& r : ring_) std::fill(r.begin(), r.end(), 0.0f);
         for (auto& l : lines_) l.clear();
+        clearSections(0); clearSections(1);
         w_ = 0;
         grid_.reset();
         for (auto& t : tap_) t = Tap {};                      // the next look snaps each tap to its slot
@@ -214,7 +222,9 @@ public:
     // The slot's line is cleared wherever the player clears the slot's own (a landing, a retime, falling asleep), and a
     // plane's where the host stops handing it over — only while running: a start clears everything anyway.
     void clearSlotLine(int slot) noexcept {
-        if (run_) lines_[(std::size_t) (slot & 1)].clear();
+        if (! run_) return;
+        lines_[(std::size_t) (slot & 1)].clear();
+        clearSections(slot & 1);                              // …and its all-passes' memory, which the line fed
     }
     // PARKED (the player's stand-by): nothing of this runs, and crossoverRunning() says so until the player is back.
     void setParked(bool on) noexcept { parked_ = on; running_.store(run_ && ! on, std::memory_order_release); }
@@ -223,6 +233,8 @@ public:
     void stopPlane(int c) noexcept {
         if (! run_ || c < 0 || c >= kMaxChannels) return;
         for (auto& l : lines_) l.clearPlane(c);
+        for (auto& slot : apX_) slot[(std::size_t) c].fill(0.0f);
+        for (auto& slot : apY_) slot[(std::size_t) c].fill(0.0f);
         std::fill(ring_[c].begin(), ring_[c].end(), 0.0f);
         for (auto& f : lp_) f.resetChannel(c);
         for (auto& f : hp_) f.resetChannel(c);
@@ -262,19 +274,30 @@ public:
     // plane the host did not hand over carries silence, as its delay lines do.
     // `invert[i]`: whether slot i's capture hands its input back inverted (its own reading, or the host's word) — the
     // slot's clean tap takes that polarity, gliding, before the slots are mixed; the pack's dry part never does.
-    void clean(int nch, int count, const MixRecipe& r, const bool invert[2]) noexcept {
+    // `allpass[i]`: slot i's capture's two clean-match sections, as first-order all-pass coefficients (sectionCoefficient;
+    // 1 = no section) — landing and gliding as its polarity does.
+    void clean(int nch, int count, const MixRecipe& r, const bool invert[2], const float allpass[2][2]) noexcept {
         const float decay = std::exp(-(float) count / (float) (0.010 * fs_));
-        float signEnd[2], signStep[2];
+        float signEnd[2], signStep[2], apEnd[2][2], apStep[2][2];
+        bool  apRun[2][2];
         const float level = cleanG_.load(std::memory_order_acquire);
         for (int i = 0; i < 2; ++i) {
             // A SLOT'S GAIN on its clean tap: its capture's polarity times the clean level — the capture calibration, on
             // the model-referenced part alone (the pack's dry part joins after). It LANDS with a new capture and on a slot
             // silent at both ends; only an edit to a capture that is heard glides.
             const float want = (invert[i] ? -1.0f : 1.0f) * level;
-            if (snapSign_ || snapGain_[i]) sign_[i] = want;
+            const bool lands = snapSign_ || snapGain_[i];
+            if (lands) sign_[i] = want;
             snapGain_[i] = false;
             signEnd[i]  = glideEnd(want, sign_[i], decay);
             signStep[i] = (signEnd[i] - sign_[i]) / (float) count;
+            // …and its clean match's sections, the same way. A section that stays at 1 through the block is not run.
+            for (int s = 0; s < 2; ++s) {
+                if (lands) apC_[i][s] = allpass[i][s];
+                apEnd[i][s]  = glideEnd(allpass[i][s], apC_[i][s], decay);
+                apStep[i][s] = (apEnd[i][s] - apC_[i][s]) / (float) count;
+                apRun[i][s]  = ! (isOne(apC_[i][s]) && isOne(apEnd[i][s]));
+            }
         }
         for (int c = 0; c < channels_; ++c) {
             float* cl = clean_[c].data();
@@ -286,6 +309,7 @@ public:
                 if (! r.run[i]) { std::fill(slot[i], slot[i] + count, 0.0f); continue; }
                 for (int k = 0; k < count; ++k) slot[i][k] = tapAt(tap_[i], ring, count, k);
                 lines_[i].process(c, slot[i], count, lineTmp_.data());
+                for (int s = 0; s < 2; ++s) section(i, c, s, slot[i], count, apRun[i][s], apStep[i][s]);
                 // The slot's gain AFTER its line: a polarity or level that lands reaches what the line still holds too,
                 // as the capture's own reading does on the device side (its line holds the capture's output).
                 float g = sign_[i];
@@ -296,7 +320,21 @@ public:
         for (auto& t : tap_) t.pos = std::min(t.pos + count, fadeLen_);
         for (auto& l : lines_) l.advance(count);              // the slots' line clocks, in step with the player's
         sign_[0] = signEnd[0]; sign_[1] = signEnd[1];
+        for (int i = 0; i < 2; ++i)
+            for (int s = 0; s < 2; ++s) apC_[i][s] = apEnd[i][s];
+        // Law 8, and a bad sample's NaN: a section's memory decays by |c| a sample on silence — 0.995 for a 39 Hz corner —
+        // and a NaN in it would stay there for ever. Flushed once a block (finite state at or above 1e-15 is untouched).
+        for (auto& slot : apX_) for (auto& plane : slot) for (float& v : plane) felitronics::core::flushPoison(v);
+        for (auto& slot : apY_) for (auto& plane : slot) for (float& v : plane) felitronics::core::flushPoison(v);
         snapSign_ = false;
+    }
+    // A FIRST-ORDER ALL-PASS SECTION'S COEFFICIENT for a corner at `hz` at the rate `fs` — the bilinear transform of
+    // (1 − s/ω)/(1 + s/ω), prewarped at the corner: A(z) = (c + z⁻¹)/(1 + c·z⁻¹), c = (tan(πf/fs) − 1)/(tan(πf/fs) + 1),
+    // 0 degrees at DC, −90 at the corner, −180 at Nyquist. Not positive, or at or past 0.49·fs: 1, which is no section.
+    static float sectionCoefficient(double hz, double fs) noexcept {
+        if (! (hz > 0.0) || ! (fs > 0.0) || hz >= 0.49 * fs) return 1.0f;
+        const double t = std::tan(3.14159265358979323846 * hz / fs);
+        return (float) ((t - 1.0) / (t + 1.0));
     }
     // THE SPLIT, on the audio-time grid (law 8a): per segment the glides take one step of the ~10 ms law and walk it
     // linearly, the frequency is designed where it has got to, and the filters are flushed on the boundary. Every
@@ -369,6 +407,28 @@ private:
     }
     static bool isOne(float g) noexcept { return felitronics::core::exactlyEqual(g, 1.0f); }
 
+    // Slot i's section s on plane c, in place: y = c·(x − y₁) + x₁, the coefficient walking its glide. A section not
+    // run keeps its memory where its input stands (x₁ = y₁ = the last sample), which is exactly the state of a section at
+    // 1 that ran — so one that glides in from 1 starts without a step.
+    void section(int i, int c, int s, float* x, int count, bool on, float step) noexcept {
+        float& x1 = apX_[(std::size_t) i][(std::size_t) c][(std::size_t) s];
+        float& y1 = apY_[(std::size_t) i][(std::size_t) c][(std::size_t) s];
+        if (! on) { if (count > 0) x1 = y1 = x[count - 1]; return; }
+        float k = apC_[i][s], a = x1, b = y1;
+        for (int n = 0; n < count; ++n) {
+            k += step;
+            const float in = x[n];
+            b = k * (in - b) + a;
+            a = in;
+            x[n] = b;
+        }
+        x1 = a; y1 = b;
+    }
+    void clearSections(int i) noexcept {
+        for (auto& plane : apX_[(std::size_t) i]) plane.fill(0.0f);
+        for (auto& plane : apY_[(std::size_t) i]) plane.fill(0.0f);
+    }
+
     void design(float hz) noexcept {
         for (auto& f : lp_) f.setParams(felitronics::eq::FilterType::LowPass,  (double) hz, kQ, 0.0);
         for (auto& f : hp_) f.setParams(felitronics::eq::FilterType::HighPass, (double) hz, kQ, 0.0);
@@ -393,6 +453,8 @@ private:
     bool   run_ = false;
     float  mix_ = 0.0f, dryG_ = 0.0f, wetG_ = 1.0f;            // the split's fade, the clean and the device's low weights
     float  sign_[2] { 1.0f, 1.0f };                            // each slot's clean gain: polarity × level, gliding
+    float  apC_[2][2] { { 1.0f, 1.0f }, { 1.0f, 1.0f } };      // each slot's clean-match sections' coefficients, gliding…
+    std::array<std::array<float, 2>, kMaxChannels> apX_[2] {}, apY_[2] {};   // …and their memory per plane: x₁, y₁
     float  hzRt_ = 150.0f, hzAt_ = 0.0f;                       // the frequency gliding, and the one designed
     int    fadeLen_ = 1;                                       // a tap's crossfade: 10 ms at fs_
     Tap    tap_[2];
