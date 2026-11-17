@@ -272,6 +272,20 @@ What the player reads per capture, and what the host decides:
   nothing to add: trim with `setCrossoverLag`, the bench's. A capture whose `input_lag_samples` is NEGATIVE leads its
   DI — a training artefact: the clean leg cannot be advanced, so it plays on time and `crossoverLagFits()` reports
   false; the player does not delay the model.
+- **A capture's clean match** (`CleanMatch`, `AlignmentTable::cleanMatchByFile`): a lag and a polarity line the clean
+  leg up with a capture only where its phase is a delay, and a pedal's coupling caps turn its low end ahead of that —
+  with the clean leg at the capture's level the ReVolt Bass Dirt dipped 14 dB at 41 Hz at 50/50, lag and polarity
+  stated. The host fits the clean leg to the capture instead: `measureCleanMatch(device, source, table, inputDb, rate)`
+  plays 15 tones (30 … 260 Hz, `cleanMatchTones()`) at about −20 dBFS through each distinct model (a NamStage at the
+  model's own rate, any thread but the audio one, about 4 s of audio a file), locks in on each (`toneResponse`), and
+  `fitCleanMatch` picks the polarity, delay (0 … 5 ms) and up to two first-order all-pass corners (10 Hz … 2 kHz) whose
+  phase is nearest the capture's at every tone alike — where a dip lands depends on the clean leg's level against the
+  capture there, which is the host's. The table's own reading is a candidate, and a capture nothing beats it on gets no
+  match. Handed in with `setAlignment`, the match's lag and polarity REPLACE the capture's readings for its clean tap
+  (the host trim still adds), and its sections run on the tap after its line, gliding as the polarity does; a section
+  at none is not run, so a capture with no match plays bit for bit as before. A synthetic capture (a 30 Hz and a 45 Hz
+  high-pass, 12 samples late) dips the low sum −6.4 dB at 50/50 with its lag alone and stays within 0.01 dB, 30 – 260
+  Hz, with its match. Nothing of it is in the pack; `load()` starts without one.
 - **`setCrossoverReferenceLag(offset)`** says how late the table's reference (`crossoverLagReference()`: the pack's
   first file, or the first that loaded when measured) trails its DI — the relative readings' missing number; a host
   can measure it as `measureAlignment` does, the probe through the file against the probe itself. It is the PACK's: kept

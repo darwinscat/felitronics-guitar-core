@@ -14,6 +14,10 @@
 //   · a step of the amount, the frequency, the polarity or the lag glides: no sample step above the settled signal's own;
 //   · law 8: silence after a note is exactly silence, with no subnormal on the way;
 //   · no allocation in process() with the crossover running and moving; law 11 through core's harness;
+//   · a capture whose low end turns (a 30 Hz and a 45 Hz high-pass, 12 samples late) dips the blend's low sum with its
+//     lag alone, and sums flat (±0.5 dB, 30 – 260 Hz, at 50/50 and 80/20) with the clean match measureCleanMatch fits to
+//     it; a capture that is a delay keeps the reading it came with, and a wrong one is put right; a match handed in while
+//     heard glides, and silence after it is exactly silence;
 //   · INFORMATIONAL: the seam on a real capture (NAM's example models, and any capture named in
 //     FELITRONICS_GUITAR_CROSSOVER_CAPTURES, ':'-separated) — the summed level's dip at 80/120/150/200 Hz.
 
@@ -435,6 +439,12 @@ void noAllocation() {
         if (k == 0)   { test::run(p.setCrossoverAmount(0.7)); }
         if (k == 50)  { test::run(p.setCrossoverHz(400.0)); p.setCrossoverInvert(true); }
         if (k == 100) { test::run(p.setCrossoverLag(11)); }
+        if (k == 120) {                              // a clean match lands on a heard capture: its sections run from here on
+            AlignmentTable t = p.alignment();
+            CleanMatch m; m.lag = 30; m.inverted = true; m.allpassHz[0] = 39.0; m.allpassHz[1] = 132.0; m.sampleRate = 48000.0;
+            t.cleanMatchByFile["early"] = m;
+            p.setAlignment(t);
+        }
         if (k == 150) { test::run(p.setCrossoverAmount(1.0)); test::run(p.setCrossoverHz(60.0)); }
         if (k == 200) { test::run(p.setCrossoverAmount(0.0)); }
         if (k == 520) { test::run(p.setCrossoverAmount(0.4)); }
@@ -663,6 +673,132 @@ void seamOnRealCaptures() {
     ok(true, "printed above");
 }
 
+
+// ------------------------------------------------------------------------------------------------ the clean match ----
+
+/** A capture whose low end TURNS, as a pedal's coupling caps turn it: a first-order high-pass at 30 Hz and a second-order
+    Butterworth one at 45 Hz, `lag` samples late — NAM's Linear architecture holding the impulse response, 4096 taps (85
+    ms: the slowest pole is down to 1e-7 by then), laid out as delayModel lays its one tap. */
+std::string highPassModel(int lag) {
+    constexpr double fs = 48000.0;
+    constexpr int n = 4096;
+    std::vector<double> h((std::size_t) n, 0.0);
+    const double t = std::tan(kPi * 30.0 / fs), b0 = 1.0 / (1.0 + t), a1 = (t - 1.0) / (t + 1.0);
+    const double w0 = 2.0 * kPi * 45.0 / fs, cw = std::cos(w0), al = std::sin(w0) / (2.0 * 0.7071067811865476), a0 = 1.0 + al;
+    const double q0 = 0.5 * (1.0 + cw) / a0, q1 = -(1.0 + cw) / a0, p1 = -2.0 * cw / a0, p2 = (1.0 - al) / a0;
+    double x1 = 0.0, y1 = 0.0, u1 = 0.0, u2 = 0.0, v1 = 0.0, v2 = 0.0;
+    for (int i = 0; i + lag < n; ++i) {
+        const double x = i == 0 ? 1.0 : 0.0;
+        const double u = b0 * (x - x1) - a1 * y1; x1 = x; y1 = u;
+        const double v = q0 * u + q1 * u1 + q0 * u2 - p1 * v1 - p2 * v2; u2 = u1; u1 = u; v2 = v1; v1 = v;
+        h[(std::size_t) (i + lag)] = v;
+    }
+    std::string w = "[";
+    for (int i = 0; i < n; ++i) { char b[32]; std::snprintf(b, sizeof b, "%.9g%s", h[(std::size_t) i], i + 1 < n ? "," : "]"); w += b; }
+    return R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":4096,"bias":false,"implementation":"direct"},"weights":)"
+         + w + R"(,"sample_rate":48000})";
+}
+
+/** The pack's own readings of a one-capture pack, as namz 5 states them: `lag` samples late against its DI. */
+AlignmentTable statedLag(const std::string& id, int lag, bool inverted = false) {
+    AlignmentTable t;
+    t.fromPack = true; t.reference = id; t.derivedFromAbsolute = true;
+    t.lagByFile = { { id, 0 } }; t.absoluteLagByFile = { { id, lag } };
+    if (inverted) t.invertedByFile = { { id, true } };
+    return t;
+}
+
+/** The low sum's worst dip, 30 – 260 Hz on a 1/6-octave grid, at `amount`, crossover 150 Hz: the summed level against
+    the two bands' levels added as if they met in phase — the device's own (amount 0) and the clean leg's (1, as built). */
+double worstLowDip(const std::vector<Cap>& caps, const AlignmentTable& t, double amount) {
+    Bench wet(caps, 48000.0, 60.0, crossover(150.0, 0.0)), sum(caps, 48000.0, 60.0, crossover(150.0, amount));
+    wet.p.setAlignment(t); sum.p.setAlignment(t);
+    wet.settle(20); sum.settle(40);
+    double worst = 0.0;
+    for (double f = 30.0; f <= 261.0; f *= std::pow(2.0, 1.0 / 6.0)) {
+        const Resp W = ratio(lockIn(wet, f, 0.1, 40, 120)), Y = ratio(lockIn(sum, f, 0.1, 40, 120));
+        const double r4 = std::pow(f / 150.0, 4.0), lp = 1.0 / (1.0 + r4), hp = r4 / (1.0 + r4);
+        const double inPhase = hp * W.mag + lp * ((1.0 - amount) * W.mag + amount);
+        const double db = 20.0 * std::log10(Y.mag / inPhase);
+        worst = std::abs(db) > std::abs(worst) ? db : worst;
+    }
+    return worst;
+}
+
+void cleanMatchFlattensTheLowSum() {
+    group("a capture whose low end turns: the blend's low sum dips with the lag alone, and is flat with its clean match");
+    const std::string model = highPassModel(12);
+    const std::vector<Cap> caps { { "hp", model, "60", std::nullopt } };
+    const auto bytes = bytesOf(model);
+    const AlignmentTable stated = statedLag("hp", 12);
+    // THE FIT, as a host runs it: the device's own model, from the pack's readings.
+    const auto matches = measureCleanMatch(rigOf(caps).chain[0].device, [&bytes](const std::string&) { return bytes; }, stated);
+    const auto m = matches.find("hp");
+    ok(m != matches.end(), "the fit finds a match for the capture");
+    if (m == matches.end()) return;
+    const CleanMatch& cm = m->second;
+    ok(cm.allpassHz[0] > 0.0, "…with a section in it: lag " + std::to_string(cm.lag) + (cm.inverted ? ", inverted" : ", not inverted")
+       + ", all-passes at " + fmt(cm.allpassHz[0], "%.1f") + " Hz and " + fmt(cm.allpassHz[1], "%.1f") + " Hz");
+    AlignmentTable fitted = stated;
+    fitted.cleanMatchByFile = matches;
+    // THE CONTROL — the player as it was, the pack's lag and polarity alone: the low sum dips (the red reading).
+    const double before = worstLowDip(caps, stated, 0.5);
+    ok(before < -3.0, "50/50 with the lag alone: worst " + fmt(before, "%.2f") + " dB — the test sees the dip");
+    for (const double amount : { 0.5, 0.2 }) {
+        const double after = worstLowDip(caps, fitted, amount);
+        ok(std::abs(after) <= 0.5, fmt(100.0 * (1.0 - amount), "%.0f") + "/" + fmt(100.0 * amount, "%.0f")
+           + " with the clean match: worst " + fmt(after, "%.3f") + " dB, 30 – 260 Hz");
+    }
+}
+
+void cleanMatchKeepsAStraightReading() {
+    group("a capture that is a delay keeps the reading it came with; a wrong one is put right, with no section");
+    const std::string model = delayModel(12, 1.0);
+    const std::vector<Cap> caps { { "d", model, "60", std::nullopt } };
+    const auto bytes = bytesOf(model);
+    const auto src = [&bytes](const std::string&) { return bytes; };
+    const auto device = rigOf(caps).chain[0].device;
+    const auto right = measureCleanMatch(device, src, statedLag("d", 12));
+    ok(right.empty(), "stated 12 samples late, and it is: no match (" + std::to_string(right.size()) + ")");
+    const auto wrong = measureCleanMatch(device, src, statedLag("d", 0, true));
+    const auto m = wrong.find("d");
+    ok(m != wrong.end() && m->second.lag == 12 && ! m->second.inverted && ! (m->second.allpassHz[0] > 0.0) && ! (m->second.allpassHz[1] > 0.0),
+       "stated on time and inverted: matched 12 samples late, not inverted, no section");
+}
+
+void cleanMatchGlidesAndFallsSilent() {
+    group("a clean match handed in while heard glides; silence after it is exactly silence");
+    const std::vector<Cap> caps { { "early", gainModel(0.5), "60", 0 }, { "late", gainModel(0.5), "240", 0 } };
+    AlignmentTable t; t.reference = "early"; t.lagByFile = { { "early", 0 }, { "late", 0 } };
+    AlignmentTable matched = t;
+    CleanMatch cm; cm.lag = 25; cm.inverted = true; cm.allpassHz[0] = 39.0; cm.allpassHz[1] = 132.0; cm.sampleRate = 48000.0;
+    matched.cleanMatchByFile["early"] = cm;
+    constexpr int kEdit = 200;
+    const std::size_t e = (std::size_t) kEdit * kBlock;
+    Bench b(caps, 48000.0, 60.0, crossover(150.0, 0.5)), still(caps, 48000.0, 60.0, crossover(150.0, 0.5));
+    b.p.setAlignment(t); still.p.setAlignment(matched);
+    std::vector<float> y, z;
+    for (int k = 0; k < kEdit + 300; ++k) {
+        if (k == kEdit) b.p.setAlignment(matched);
+        b.block([&b](long i) { return bass(i, b.fs); });
+        still.block([&still](long i) { return bass(i, still.fs); });
+        y.insert(y.end(), b.y.begin(), b.y.end()); z.insert(z.end(), still.y.begin(), still.y.end());
+    }
+    const double settled = std::max(biggestStep(y, e - 9600, e), biggestStep(y, e + 24000, e + 33600));
+    const double glide = biggestStep(y, e, e + 9600);
+    std::vector<float> cut(y.begin(), y.begin() + (long) e);
+    cut.insert(cut.end(), z.begin() + (long) e, z.end());
+    const double hard = biggestStep(cut, e, e + 2);
+    ok(glide <= 1.1 * settled && hard > 3.0 * settled, "lag 25, inverted, 39 + 132 Hz handed in: the biggest step through "
+       "the glide " + fmt(glide, "%.5f") + ", settled " + fmt(settled, "%.5f") + "; a cut at the same instant " + fmt(hard, "%.5f"));
+    long subnormal = 0, last = -1, n = 0;
+    for (int k = 0; k < 750; ++k) {                  // two seconds
+        still.block([](long) { return 0.0f; });
+        for (const float v : still.y) { if (std::fpclassify(v) == FP_SUBNORMAL) ++subnormal; if (v != 0.0f) last = n; ++n; }
+    }
+    ok(still.p.crossoverRunning() && subnormal == 0 && last >= 0 && last < 48000, "with the match: the last non-zero sample "
+       "at " + std::to_string(last) + ", " + std::to_string(subnormal) + " subnormal samples in 2 s of silence");
+}
 
 // --------------------------------------------------------------------------------------- review round 1 ----
 
@@ -1443,6 +1579,9 @@ int main() {
     alignmentReachReported();
     restartLandsTheLatestDelay();
     alignmentFitsAtTheBoundaryAndUnload();
+    cleanMatchFlattensTheLowSum();
+    cleanMatchKeepsAStraightReading();
+    cleanMatchGlidesAndFallsSilent();
     seamOnRealCaptures();
     return test::report();
 }

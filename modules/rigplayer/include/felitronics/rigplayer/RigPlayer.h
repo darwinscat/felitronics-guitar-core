@@ -34,7 +34,8 @@
 //     become biquads — on the side of the models its circuit puts it. ToneKnobs.h, pure.
 //   • A blend knob mixes the DI the models were fed, through the dry path's own response. BlendKnob.h.
 //   • The crossover blend — the host's, not the pack's (setCrossoverAmount): below a frequency the CLEAN input,
-//     above it the device, split by one Linkwitz–Riley pair, the clean leg held back by what the models carry.
+//     above it the device, split by one Linkwitz–Riley pair, the clean leg held back by what the models carry —
+//     and, where the host fitted a capture's clean match (AlignmentTable.h), turned as its low end turns.
 //   • THE PACK'S OWN TWO LEVELS BRACKET EVERYTHING IT DOES. `chain[].input_db` is the level of the
 //     guitar into this device, and it goes FIRST — ahead of the dry copy, because a blend knob mixes
 //     one guitar with itself and both ends must be fed the same signal. `chain[].output_db` is the
@@ -979,7 +980,9 @@ public:
     // model: a slot silent at both ends of a block takes it at once, as a model lands; a slot that is HEARD takes a delay
     // of the capture it is playing (a table handed in mid-mix, a model rate learned at a landing) through a 10 ms
     // crossfade of its line — never a splice; a capture on its way out keeps its delay until it is silent. A prepare()
-    // lands every slot's at once, because a prepare leaves nothing to splice (see restateInHostSamples).
+    // lands every slot's at once, because a prepare leaves nothing to splice (see restateInHostSamples). A table may carry
+    // the host's CLEAN MATCHES too (cleanMatchByFile, measureCleanMatch): the crossover's clean taps take them, moving as
+    // any reading moves (the crossover blend, above); the alignment delays never read them.
     void setAlignment(AlignmentTable table) {
         bindReferenceLag(table, false);
         align_ = std::move(table);
@@ -1310,6 +1313,14 @@ public:
     // returning to 0 sweeps down, fades out and, once every glide has arrived, stops the filters (crossoverRunning()).
     // The amount, the frequency, the clean level and the polarity glide (10 ms); a lag crossfades its tap (10 ms). What the player cannot do is the
     // device's own phase near the seam — a coupling cap, a tone stack: that is in the capture, and only measured.
+    //
+    // …AND MEASURED IT IS, BY THE HOST: a capture's CLEAN MATCH (AlignmentTable.h — measureCleanMatch on the models it
+    // loaded, off the audio thread, handed in with setAlignment as the table's cleanMatchByFile). The capture's clean tap
+    // then takes the match's lag and polarity in place of its own readings, and runs through the match's two first-order
+    // all-passes, so the clean leg turns with the device's low end and the low sum stays flat where the lag alone left a
+    // dip. A match handed in while its capture is heard moves as every reading does: the lag crossfades its tap, the
+    // polarity and the sections glide (10 ms). A capture with none plays as it always did, bit for bit. load() starts
+    // from the pack's table, with no match: a host that fits them hands them in again for every pack it loads.
     //
     // Message thread. A non-finite value is refused (false) and changes nothing; the range is clamped. The frequency, the
     // amount, the clean level and the polarity are kept across load() and unload() — the bench's, like the host's
@@ -1838,7 +1849,9 @@ public:
                 const int own[2] { ownLagRt(xt, held[0]), ownLagRt(xt, held[1]) };
                 xo_.taps(held, own, law);
                 const bool inv[2] { invertRt(xt, held[0]), invertRt(xt, held[1]) };
-                xo_.clean(nch, count, recipe, inv);
+                const float ap[2][2] { { sectionRt(xt, held[0], 0), sectionRt(xt, held[0], 1) },
+                                       { sectionRt(xt, held[1], 0), sectionRt(xt, held[1], 1) } };
+                xo_.clean(nch, count, recipe, inv, ap);
             }
 
             // The knobs AFTER the distortion, shaping what came out.
@@ -1928,13 +1941,18 @@ private:
         const double runSR = felitronics::nam::NamStage::rateMatch(fs_, std::isnan(rate) ? -1.0 : rate).modelRunSR;
         return align_.lagOf(models_[k].id, fs_, runSR, xoRefOffset_, xoTrim_);
     }
-    // Per model, for the audio thread: its lag in host samples (clamped to the reach) and whether it inverts.
+    // Per model, for the audio thread: its lag in host samples (clamped to the reach), whether it inverts, and its clean
+    // match's two all-pass coefficients at the host rate (CrossoverBlend::sectionCoefficient; 1 = no section, as built).
     struct XoModels {
         explicit XoModels(std::size_t count)
-            : n(count), lag(std::make_unique<std::atomic<int>[]>(count)), inv(std::make_unique<std::atomic<bool>[]>(count)) {}
+            : n(count), lag(std::make_unique<std::atomic<int>[]>(count)), inv(std::make_unique<std::atomic<bool>[]>(count)),
+              ap(std::make_unique<std::atomic<float>[]>(2 * count)) {
+            for (std::size_t k = 0; k < 2 * count; ++k) ap[k].store(1.0f, std::memory_order_relaxed);
+        }
         std::size_t n;
-        std::unique_ptr<std::atomic<int>[]>  lag;
-        std::unique_ptr<std::atomic<bool>[]> inv;
+        std::unique_ptr<std::atomic<int>[]>   lag;
+        std::unique_ptr<std::atomic<bool>[]>  inv;
+        std::unique_ptr<std::atomic<float>[]> ap;
     };
     // A staged delay and the capture it belongs to, in one word: the model id above, the delay (0 … kMaxDelay) below.
     static std::uint64_t staged(std::uint64_t model, int delay) noexcept {
@@ -1946,6 +1964,10 @@ private:
     // Audio thread: the lag of the capture a slot holds, as published.
     static int ownLagRt(const XoModels* t, std::uint64_t held) noexcept {
         return t != nullptr && held >= 1 && held <= t->n ? t->lag[(std::size_t) held - 1].load(std::memory_order_relaxed) : 0;
+    }
+    static float sectionRt(const XoModels* t, std::uint64_t held, int s) noexcept {
+        return t != nullptr && held >= 1 && held <= t->n ? t->ap[2 * ((std::size_t) held - 1) + (std::size_t) (s & 1)].load(std::memory_order_relaxed)
+                                                         : 1.0f;
     }
     bool invertRt(const XoModels* t, std::uint64_t held) const noexcept {
         const bool own = t != nullptr && held >= 1 && held <= t->n && t->inv[(std::size_t) held - 1].load(std::memory_order_relaxed);
@@ -1963,9 +1985,14 @@ private:
         for (std::size_t k = 0; k < models_.size(); ++k) {
             const int own = ownLagOf(k);
             if (prepared_ && (own < 0 || own > xo_.maxLag())) fits = false;
-            const auto inv = align_.invertedByFile.find(models_[k].id);
             into.lag[k].store(std::clamp(own, 0, xo_.maxLag()), std::memory_order_relaxed);
-            into.inv[k].store(inv != align_.invertedByFile.end() && inv->second, std::memory_order_relaxed);
+            into.inv[k].store(align_.invertsClean(models_[k].id), std::memory_order_relaxed);
+            // The clean match's sections, designed at the host rate (a prepare() publishes again, so a new rate redesigns).
+            const auto cm = align_.cleanMatchByFile.find(models_[k].id);
+            for (int s = 0; s < 2; ++s)
+                into.ap[2 * k + (std::size_t) s].store(cm == align_.cleanMatchByFile.end() ? 1.0f
+                                                       : CrossoverBlend::sectionCoefficient(cm->second.allpassHz[s], fs_),
+                                                       std::memory_order_relaxed);
         }
         xoFits_ = fits;
         // THE SLOTS' ALIGNMENT DELAYS have a reach too (kMaxDelay host samples): a table or a rate that asks more is

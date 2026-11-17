@@ -2,6 +2,21 @@
 
 # Changelog
 
+## v0.12.0 — 2026-11-17
+
+The crossover blend's clean match: a capture whose low end turns ahead of its lag no longer thins the blend's low sum.
+A player told no match plays as before, bit for bit.
+
+### Added
+- **rigplayer: a capture's clean match** (`AlignmentTable::CleanMatch`, `measureCleanMatch`, `fitCleanMatch`) — a lag,
+  a polarity and up to two first-order all-passes for the crossover blend's clean tap, fitted on fifteen tones from
+  30 to 260 Hz played through the capture's own model at its own rate. The pack's lag and polarity are one of the
+  candidates: where nothing beats them, the capture gets no match. Measured by the host, off the audio thread, about a
+  tenth of a second a capture; handed to the player per file (`cleanMatchByFile`).
+- **CrossoverBlend plays it** — the match's lag in the clean tap, its polarity in the sign, its all-passes per slot,
+  gliding like the polarity while heard; a section that is off never runs. On the bass packs the low sum at 50/50 went
+  from dips of up to 16.5 dB to within 0.43 dB from 30 to 260 Hz (OrbitAmp's bass amps, measured through the player).
+
 ## v0.11.0 — 2026-11-11
 
 namz v5.1.0 — a pack that carries its own high-pass and low-pass — played. Packs without them play as before.
