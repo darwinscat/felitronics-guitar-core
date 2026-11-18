@@ -15,13 +15,20 @@ namespace felitronics::rigplayer {
 
 inline constexpr int kSearch = 96;   // samples either way; real drift between two models is single digits
 
-struct Best { int lag = 0; double corr = -1.0; };
+struct Best { int lag = 0; double corr = -1.0; bool inverted = false; };
 
 // The lag (in [-search, search]) at which `cur` best aligns to `ref` by NORMALIZED cross-correlation,
 // evaluated over the interior [search, N-search) so every shifted index is in range. The result is the
 // DELAY of `cur` relative to `ref` (cur[i] approx ref[i-lag]); read `cur` at index k+lag to align it.
 // Returns {0, -1} when the two differ in length, are too short to search, or carry no energy at all —
 // "no reading", which is a different answer from "aligned at zero".
+//
+// THE PEAK BY ITS SIZE, NOT ITS SIGN. Two captures of one device can play inverted against each other — a
+// boost that adds a stage does it (the Victory V4's boosted captures against its plain ones) — and then the
+// main lobe is negative. Taking the largest POSITIVE value picked a ripple far from it: 78 and 96 samples
+// for captures that lined up within four, and a blend between two of them combed. A polarity is not a
+// delay: `corr` is the peak's size (0 … 1, so a negative one still means no reading) and `inverted` its
+// sign.
 inline Best bestLag (std::span<const float> ref, std::span<const float> cur, int search = kSearch) {
     Best out;
     if (ref.size() != cur.size() || ref.size() <= (std::size_t) (2 * search)) return out;
@@ -37,7 +44,7 @@ inline Best bestLag (std::span<const float> ref, std::span<const float> cur, int
         // silent models came back aligned at -96 samples and the player delayed one against the other.
         if (xx <= 0.0 || yy <= 0.0) continue;
         const double c = num / std::sqrt (xx * yy);
-        if (c > out.corr) { out.corr = c; out.lag = lag; }
+        if (std::abs (c) > out.corr) { out.corr = std::abs (c); out.lag = lag; out.inverted = c < 0.0; }
     }
     return out;
 }

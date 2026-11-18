@@ -4,8 +4,8 @@
 
 ## v0.14.0 — 2026-11-18
 
-The clean match a pack carries is fitted here, by one function for every side that builds a pack. Nothing a player
-plays has changed.
+The clean match a pack carries is fitted here, by one function for every side that builds a pack; and two captures
+that play inverted against each other are lined up by their real delay. A pack that states its lags plays as before.
 
 ### Added
 - **rigplayer: `fitPackCleanMatches`** (`rigplayer/PackCleanMatch.h`) — sets namz 5.2's `files[].clean_match` on every
@@ -19,7 +19,13 @@ plays has changed.
 - **rigplayer: `cleanMatchReadable`** — namz's own reading rule for a clean match (a lag 0 to `kMaxLagSamples`, a
   polarity of ±1, at most two finite corners of at least `kMinCleanMatchHz`): what it reads, namz writes and reads back.
 
-## v0.13.0 — 2026-11-18
+### Fixed
+- **rigplayer: `bestLag` takes the correlation's peak by its size, not its sign.** Two captures of one device can play
+  inverted against each other (the Victory V4's boosted captures against its plain ones), and then the main lobe is
+  negative: the largest positive value was a ripple far from it, so an export measured 78 and 96 samples for captures
+  within four of each other, and a blend between two neighbours combed down to -28 dB. `corr` is now the peak's size
+  (0 to 1; a negative one still means no reading) and the new `inverted` its sign. Its readers are a pack's export and
+  the player's own measurement for a pack that states no lags (`measureAlignment`).
 
 The player takes a capture's clean match from the pack: a pack that carries one plays the crossover blend matched at
 once, with nothing fitted at load. A pack without one plays as before, bit for bit.
