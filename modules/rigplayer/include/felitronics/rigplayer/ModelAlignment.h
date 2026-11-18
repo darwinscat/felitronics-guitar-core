@@ -23,9 +23,9 @@ struct Best { int lag = 0; double corr = -1.0; bool inverted = false; };
 // Returns {0, -1} when the two differ in length, are too short to search, or carry no energy at all —
 // "no reading", which is a different answer from "aligned at zero".
 //
-// THE PEAK BY ITS SIZE, NOT ITS SIGN. Two captures of one device can play inverted against each other — a
-// boost that adds a stage does it (the Victory V4's boosted captures against its plain ones) — and then the
-// main lobe is negative. Taking the largest POSITIVE value picked a ripple far from it: 78 and 96 samples
+// THE PEAK BY ITS SIZE, NOT ITS SIGN. Two captures of one device can play inverted against each other — the
+// Victory V4's boosted captures do against its plain ones (measured 18.11; why is not established) — and then
+// the main lobe is negative. Taking the largest POSITIVE value picked a ripple far from it: 78 and 96 samples
 // for captures that lined up within four, and a blend between two of them combed. A polarity is not a
 // delay: `corr` is the peak's size (0 … 1, so a negative one still means no reading) and `inverted` its
 // sign.
