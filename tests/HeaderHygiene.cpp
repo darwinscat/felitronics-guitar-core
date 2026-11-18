@@ -14,6 +14,7 @@
 #include <felitronics/rigplayer/BlendKnob.h>
 #include <felitronics/rigplayer/ModelAlignment.h>
 #include <felitronics/rigplayer/ModelBlend.h>
+#include <felitronics/rigplayer/PackCleanMatch.h>
 #include <felitronics/rigplayer/RigPlayer.h>
 #include <felitronics/rigplayer/RigSelection.h>
 #include <felitronics/rigplayer/SectionBiquad.h>
