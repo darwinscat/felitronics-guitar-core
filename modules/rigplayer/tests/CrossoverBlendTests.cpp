@@ -74,12 +74,12 @@ std::string gainModel(double w) {
     return buf;
 }
 
-std::string delayModel(int d, double w) {
+std::string delayModel(int d, double w, int rate = 48000) {
     std::string s = "[";
     for (int i = 0; i < d; ++i) s += "0.0,";
     s += std::to_string(w) + "]";
     return R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":)" + std::to_string(d + 1)
-         + R"(,"bias":false,"implementation":"direct"},"weights":)" + s + R"(,"sample_rate":48000})";
+         + R"(,"bias":false,"implementation":"direct"},"weights":)" + s + R"(,"sample_rate":)" + std::to_string(rate) + "}";
 }
 
 std::string fileText(const std::string& path) {
@@ -682,8 +682,8 @@ void seamOnRealCaptures() {
 /** A capture whose low end TURNS, as a pedal's coupling caps turn it: a first-order high-pass at 30 Hz and a second-order
     Butterworth one at 45 Hz, `lag` samples late — NAM's Linear architecture holding the impulse response, 4096 taps (85
     ms: the slowest pole is down to 1e-7 by then), laid out as delayModel lays its one tap. */
-std::string highPassModel(int lag) {
-    constexpr double fs = 48000.0;
+std::string highPassModel(int lag, int rate = 48000) {
+    const double fs = (double) rate;
     constexpr int n = 4096;
     std::vector<double> h((std::size_t) n, 0.0);
     const double t = std::tan(kPi * 30.0 / fs), b0 = 1.0 / (1.0 + t), a1 = (t - 1.0) / (t + 1.0);
@@ -699,7 +699,7 @@ std::string highPassModel(int lag) {
     std::string w = "[";
     for (int i = 0; i < n; ++i) { char b[32]; std::snprintf(b, sizeof b, "%.9g%s", h[(std::size_t) i], i + 1 < n ? "," : "]"); w += b; }
     return R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":4096,"bias":false,"implementation":"direct"},"weights":)"
-         + w + R"(,"sample_rate":48000})";
+         + w + R"(,"sample_rate":)" + std::to_string(rate) + "}";
 }
 
 /** The pack's own readings of a one-capture pack, as namz 5 states them: `lag` samples late against its DI. */
@@ -872,14 +872,14 @@ void packCleanMatchRead() {
     auto& files = r.chain[0].device.files;
     files[0].cleanMatch = packMatch(25, -1, { 39.03, 132.2 });
     files[1].cleanMatch = packMatch(30, 1, { 80.5 });
-    files[2].cleanMatch = packMatch(-7, -1, {});
+    files[2].cleanMatch = packMatch(0, -1, {});
     const auto t = AlignmentTable::fromDevice(r.chain[0].device);
     CleanMatch a; a.lag = 25; a.inverted = true; a.allpassHz[0] = 39.03; a.allpassHz[1] = 132.2;
     CleanMatch b; b.lag = 30; b.allpassHz[0] = 80.5;
-    CleanMatch c; c.lag = -7; c.inverted = true;
+    CleanMatch c; c.inverted = true;
     ok(matchOf(t, "a") && sameMatch(*matchOf(t, "a"), a), "two corners: lag 25, inverted, 39.03 and 132.2 Hz, in the file's own rate (0)");
     ok(matchOf(t, "b") && sameMatch(*matchOf(t, "b"), b), "one corner: lag 30, as it is, 80.5 Hz, no second section");
-    ok(matchOf(t, "c") && sameMatch(*matchOf(t, "c"), c), "no corner: lag -7, inverted, no section");
+    ok(matchOf(t, "c") && sameMatch(*matchOf(t, "c"), c), "no corner: lag 0, inverted, no section");
     ok(t.cleanMatchByFile.size() == 3 && ! matchOf(t, "d"), "the file without one has none");
     // The models' own readings are what the pack states without the matches: a clean match is the clean leg's alone.
     auto bare = r;
@@ -892,14 +892,26 @@ void packCleanMatchRead() {
        && t.invertsClean("d"), "at 96 kHz for a 48 kHz model: a tapped 50 late, inverted; b as it is (its own reading inverts); "
        "d by its own reading, 340 late, inverted");
     // ALL OR NOTHING, as namz reads it: a match a host built past the format is no match.
-    auto bad = r;
-    auto& bf = bad.chain[0].device.files;
-    bf[0].cleanMatch = packMatch(25, 0, {});                         // a sign that is neither
-    bf[1].cleanMatch = packMatch(30, 1, { 40.0, 80.0, 160.0 });      // three sections
-    bf[2].cleanMatch = packMatch(12, 1, { 0.0 });                    // a corner at 0 Hz
-    bf[3].cleanMatch = packMatch(namz::rig::kMaxLagSamples + 1, 1, {});
-    ok(AlignmentTable::fromDevice(bad.chain[0].device).cleanMatchByFile.empty(),
-       "polarity 0, three corners, a corner at 0 Hz, a lag past the bound: no match");
+    // Each case alone on the first file, so one rule that lets its case through fails on its own.
+    const std::vector<std::pair<const char*, namz::rig::FileEntry::CleanMatch>> past {
+        { "a sign that is neither", packMatch(25, 0, {}) },
+        { "three sections", packMatch(30, 1, { 40.0, 80.0, 160.0 }) },
+        { "a corner under kMinCleanMatchHz", packMatch(12, 1, { 40.0, std::nextafter(namz::rig::kMinCleanMatchHz, 0.0) }) },
+        { "a corner that is not finite", packMatch(12, 1, { std::numeric_limits<double>::infinity() }) },
+        { "a lag past kMaxLagSamples", packMatch(namz::rig::kMaxLagSamples + 1, 1, {}) },
+        { "a lag before the DI (-1)", packMatch(-1, 1, {}) } };
+    std::string through;
+    for (const auto& [what, m] : past) {
+        auto bad = r;
+        bad.chain[0].device.files[0].cleanMatch = m;
+        if (matchOf(AlignmentTable::fromDevice(bad.chain[0].device), "a")) through += std::string(through.empty() ? "" : ", ") + what;
+    }
+    auto edge = r;
+    edge.chain[0].device.files[0].cleanMatch = packMatch(namz::rig::kMaxLagSamples, 1, { namz::rig::kMinCleanMatchHz });
+    const auto e = matchOf(AlignmentTable::fromDevice(edge.chain[0].device), "a");
+    ok(through.empty() && e && e->lag == namz::rig::kMaxLagSamples && core::exactlyEqual(e->allpassHz[0], namz::rig::kMinCleanMatchHz),
+       "a match past namz's rule is none (" + (through.empty() ? std::string("none let through") : "let through: " + through)
+       + "); its edges, kMaxLagSamples and kMinCleanMatchHz, are read");
     // From the manifest's JSON, through namz's own reader.
     const std::string json = R"({"format":"orbitrig","chain":[{"kind":"nam","slot":"pedal",
         "controls":[{"name":"gain","role":"gain","sweep":300,"values":["60","240"]}],
@@ -927,10 +939,6 @@ void packCleanMatchAlone() {
     p.p.load(r, [&p](const std::string& id) { return p.files.at(id); });
     ok(matchOf(p.p.alignment(), "b") && ! p.p.alignmentFromPack() && p.p.crossoverLagFits(), "the player loaded with it holds "
        "the match; alignmentFromPack() still false");
-    // A match that LEADS the DI, as a negative input_lag_samples does: the clean leg cannot be advanced — reported.
-    r.chain[0].device.files[1].cleanMatch = packMatch(-5, 1, {});
-    p.p.load(r, [&p](const std::string& id) { return p.files.at(id); });
-    ok(! p.p.crossoverLagFits(), "a match 5 samples early: crossoverLagFits() false");
 }
 
 /** A player's output over a dial walk across a two-capture pack, sample for sample. */
@@ -964,23 +972,31 @@ std::unique_ptr<Bench> openPack(const std::vector<Cap>& caps, double fs, const n
 
 void packCleanMatchPlaysAsTheHosts() {
     group("a pack's clean match plays bit for bit as the same match handed in by a host (v0.12.0's path), at any rate");
-    const std::vector<Cap> caps { { "hp", highPassModel(12), "60", std::nullopt }, { "d", delayModel(20, -1.0), "240", std::nullopt } };
-    const auto bare = schema5(caps, { 12, 20 }, { 1, -1 });
-    auto packed = bare;
-    packed.chain[0].device.files[0].cleanMatch = packMatch(25, -1, { 39.03, 132.2 });
-    packed.chain[0].device.files[1].cleanMatch = packMatch(14, 1, { 61.0 });
-    // The host's matches as measureCleanMatch states them: in the fit's rate, the model's own (these are 48 kHz).
-    std::map<std::string, CleanMatch> host;
-    { CleanMatch m; m.lag = 25; m.inverted = true; m.allpassHz[0] = 39.03; m.allpassHz[1] = 132.2; m.sampleRate = 48000.0; host["hp"] = m; }
-    { CleanMatch m; m.lag = 14; m.allpassHz[0] = 61.0; m.sampleRate = 48000.0; host["d"] = m; }
-    for (const double fs : { 48000.0, 44100.0 }) {
+    // The models' rate tag (the rate the pack's numbers are in) against the host's: the models' own, another, the reverse.
+    struct Case { int model; double host; };
+    for (const Case rc : { Case { 48000, 48000.0 }, Case { 48000, 44100.0 }, Case { 44100, 48000.0 } }) {
+        const std::vector<Cap> caps { { "hp", highPassModel(12, rc.model), "60", std::nullopt },
+                                      { "d", delayModel(20, -1.0, rc.model), "240", std::nullopt } };
+        const auto bare = schema5(caps, { 12, 20 }, { 1, -1 });
+        auto packed = bare;
+        packed.chain[0].device.files[0].cleanMatch = packMatch(25, -1, { 39.03, 132.2 });
+        packed.chain[0].device.files[1].cleanMatch = packMatch(14, 1, { 61.0 });
+        // The host's matches as measureCleanMatch states them: in the fit's rate, the model's own.
+        std::map<std::string, CleanMatch> host;
+        { CleanMatch m; m.lag = 25; m.inverted = true; m.allpassHz[0] = 39.03; m.allpassHz[1] = 132.2; m.sampleRate = rc.model; host["hp"] = m; }
+        { CleanMatch m; m.lag = 14; m.allpassHz[0] = 61.0; m.sampleRate = rc.model; host["d"] = m; }
+        const double fs = rc.host;
+        const std::string what = fmt(rc.model / 1000.0, "%.1f") + " kHz models";
         auto fromPack = openPack(caps, fs, packed), fromHost = openPack(caps, fs, bare), without = openPack(caps, fs, bare);
         AlignmentTable t = fromHost->p.alignment();
         t.cleanMatchByFile = host;
         fromHost->p.setAlignment(t);
         const auto y = walk(*fromPack), z = walk(*fromHost), w = walk(*without);
         const long diff = differing(y, z), seen = differing(z, w);
-        ok(diff == 0 && seen > 0, "at " + fmt(fs / 1000.0, "%.1f") + " kHz, a 48 kHz pack: " + std::to_string(diff) + " of "
+        // A rate NamStage refuses (it plays 48 kHz captures, within half a hertz) loads no model on either path: the pair
+        // must still agree, and the walk hearing nothing of the matches is then the loader's doing, not the match's.
+        const bool plays = felitronics::nam::NamStage::acceptsModelRate((double) rc.model);
+        ok(diff == 0 && (plays ? seen > 0 : seen == 0), what + (plays ? "" : " (refused by NamStage)") + " at a " + fmt(fs / 1000.0, "%.1f") + " kHz host: " + std::to_string(diff) + " of "
            + std::to_string(y.size()) + " samples differ from the host's path (" + std::to_string(seen)
            + " differ with no match: the walk hears the matches)");
         // A RATE CHANGE keeps the pack's matches, redesigned at the new rate, as it keeps the host's.
@@ -988,7 +1004,7 @@ void packCleanMatchPlaysAsTheHosts() {
         for (Bench* b : { fromPack.get(), fromHost.get(), without.get() }) { test::run(b->p.prepare(next, kBlock, 1)); b->fs = next; }
         const auto y2 = walk(*fromPack), z2 = walk(*fromHost), w2 = walk(*without);
         const long diff2 = differing(y2, z2), seen2 = differing(z2, w2);
-        ok(diff2 == 0 && seen2 > 0, "…prepared again at " + fmt(next / 1000.0, "%.1f") + " kHz: " + std::to_string(diff2)
+        ok(diff2 == 0 && (plays ? seen2 > 0 : seen2 == 0), what + ", prepared again at " + fmt(next / 1000.0, "%.1f") + " kHz: " + std::to_string(diff2)
            + " samples differ from the host's path (" + std::to_string(seen2) + " with no match)");
     }
 }

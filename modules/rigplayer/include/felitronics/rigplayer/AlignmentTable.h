@@ -215,11 +215,14 @@ struct AlignmentTable {
             if (f.inputLagSamples) out.absoluteLagByFile[f.id] = *f.inputLagSamples;
             if (f.polarity && *f.polarity == -1) out.invertedByFile[f.id] = true;
             // namz 5.2's `clean_match`, in the file's own rate as its lags are (sampleRate 0): read whole or not at all, by
-            // the rule namz reads it with, so an entry a host built past the format is no match either.
+            // the rule namz reads it with — a lag of 0 to kMaxLagSamples (the clean leg is never tapped early), a polarity
+            // of +1 or -1, at most two finite corners of at least kMinCleanMatchHz — so an entry a host built past the
+            // format is no match either.
             if (const auto& m = f.cleanMatch;
-                m && m->lagSamples >= -namz::rig::kMaxLagSamples && m->lagSamples <= namz::rig::kMaxLagSamples
+                m && m->lagSamples >= 0 && m->lagSamples <= namz::rig::kMaxLagSamples
                   && (m->polarity == 1 || m->polarity == -1) && m->allpassHz.size() <= 2
-                  && std::all_of(m->allpassHz.begin(), m->allpassHz.end(), [](double hz) { return std::isfinite(hz) && hz > 0.0; })) {
+                  && std::all_of(m->allpassHz.begin(), m->allpassHz.end(),
+                                 [](double hz) { return std::isfinite(hz) && hz >= namz::rig::kMinCleanMatchHz; })) {
                 CleanMatch cm;
                 cm.lag = m->lagSamples;
                 cm.inverted = m->polarity == -1;

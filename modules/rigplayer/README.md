@@ -286,12 +286,11 @@ What the player reads per capture, and what the host decides:
   at none is not run, so a capture with no match plays bit for bit as before. A synthetic capture (a 30 Hz and a 45 Hz
   high-pass, 12 samples late) dips the low sum −6.4 dB at 50/50 with its lag alone and stays within 0.01 dB, 30 – 260
   Hz, with its match. A pack may carry the match, fitted once when it was built: namz 5.2's `files[].clean_match`
-  (NAMZ-FORMAT.md — `lag_samples`, `polarity`, `allpass_hz` of zero to two corners), which `fromDevice` reads into
+  (NAMZ-FORMAT.md — `lag_samples` 0 to 48000, `polarity`, `allpass_hz` of zero to two corners of 1 Hz or more), which `fromDevice` reads into
   `cleanMatchByFile` in the file's own rate (`sampleRate` 0, as the pack's other numbers), read whole or not at all as
   namz reads it. `load()` then plays it at once — bit for bit as the same match handed in with `setAlignment` — and a
   host fits only for a pack that states none; a pack that states only matches keeps them (its `empty()` and
-  `alignmentFromPack()` still say the models' offsets are not the pack's). A negative match lag is played as a
-  negative `input_lag_samples` is: on time, `crossoverLagFits()` false. A pack without `clean_match` plays bit for bit
+  `alignmentFromPack()` still say the models' offsets are not the pack's). A pack without `clean_match` plays bit for bit
   as before; `load()` starts with no match then.
 - **`setCrossoverReferenceLag(offset)`** says how late the table's reference (`crossoverLagReference()`: the pack's
   first file, or the first that loaded when measured) trails its DI — the relative readings' missing number; a host
