@@ -2,6 +2,22 @@
 
 # Changelog
 
+## v0.13.0 — 2026-11-18
+
+The player takes a capture's clean match from the pack: a pack that carries one plays the crossover blend matched at
+once, with nothing fitted at load. A pack without one plays as before, bit for bit.
+
+### Added
+- **rigplayer: the pack's own clean match** — namz 5.2's `files[].clean_match` (`lag_samples`, `polarity`, `allpass_hz`
+  of zero to two corners) read by `AlignmentTable::fromDevice` into `cleanMatchByFile`, in the file's own rate as the
+  pack's other numbers (`sampleRate` 0), whole or not at all by namz's own rule. `load()` plays it bit for bit as the
+  same match handed in with `setAlignment`, at the model's rate and at another; a pack that states only matches keeps
+  them (`empty()` and `alignmentFromPack()` still say its models' offsets are not stated).
+
+### Changed
+- **namz pinned to v5.2.0** (`FELITRONICS_NAMZ_TAG`, `FELITRONICS_NAMZ_COMMIT` = `b140a05`), for `FileEntry::cleanMatch`.
+  A host that pins namz itself (OrbitAmp FORCEs both) moves its pin with this one.
+
 ## v0.12.0 — 2026-11-17
 
 The crossover blend's clean match: a capture whose low end turns ahead of its lag no longer thins the blend's low sum.

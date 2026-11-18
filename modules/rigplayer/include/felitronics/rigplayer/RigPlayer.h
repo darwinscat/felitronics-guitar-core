@@ -614,8 +614,8 @@ public:
                 if (namz::rig::resolve(d, axes_, c.name, axes_[c.name]) != nullptr) break;
         for (const auto& t : tones())      toneAt_[t.name]  = toneStart(t);
         for (const auto& b : stage_.blend) blendAt_[b.name] = blendStart(b);
-        // The models' offsets, from the pack when it carries them — measured once, when it was built.
-        // A pack without them leaves the table empty; the host may measure and setAlignment().
+        // The models' offsets and the captures' clean matches, from the pack when it carries them — measured once, when it
+        // was built. A pack without them leaves the table empty; the host may measure and setAlignment().
         align_ = AlignmentTable::fromDevice(d);
         modelRate_.assign(models_.size(), std::numeric_limits<double>::quiet_NaN());   // learned when it lands
         // THE PACK'S IDENTITY for the reference offset: its stamped rigId, else this very load (an unstamped pack cannot be
@@ -982,7 +982,9 @@ public:
     // crossfade of its line — never a splice; a capture on its way out keeps its delay until it is silent. A prepare()
     // lands every slot's at once, because a prepare leaves nothing to splice (see restateInHostSamples). A table may carry
     // the host's CLEAN MATCHES too (cleanMatchByFile, measureCleanMatch): the crossover's clean taps take them, moving as
-    // any reading moves (the crossover blend, above); the alignment delays never read them.
+    // any reading moves (the crossover blend, above); the alignment delays never read them. The table handed in REPLACES
+    // the one load() read, the pack's own matches with it: a host that measures a pack's alignment keeps what it wants of
+    // alignment().cleanMatchByFile in its table.
     void setAlignment(AlignmentTable table) {
         bindReferenceLag(table, false);
         align_ = std::move(table);
@@ -1314,13 +1316,15 @@ public:
     // The amount, the frequency, the clean level and the polarity glide (10 ms); a lag crossfades its tap (10 ms). What the player cannot do is the
     // device's own phase near the seam — a coupling cap, a tone stack: that is in the capture, and only measured.
     //
-    // …AND MEASURED IT IS, BY THE HOST: a capture's CLEAN MATCH (AlignmentTable.h — measureCleanMatch on the models it
-    // loaded, off the audio thread, handed in with setAlignment as the table's cleanMatchByFile). The capture's clean tap
+    // …AND MEASURED IT IS: a capture's CLEAN MATCH (AlignmentTable.h), carried by the pack (namz 5.2's `clean_match`, read
+    // at load) or fitted by the host (measureCleanMatch on the models it loaded, off the audio thread, handed in with
+    // setAlignment as the table's cleanMatchByFile) — the same match plays the same either way. The capture's clean tap
     // then takes the match's lag and polarity in place of its own readings, and runs through the match's two first-order
     // all-passes, so the clean leg turns with the device's low end and the low sum stays flat where the lag alone left a
     // dip. A match handed in while its capture is heard moves as every reading does: the lag crossfades its tap, the
     // polarity and the sections glide (10 ms). A capture with none plays as it always did, bit for bit. load() starts
-    // from the pack's table, with no match: a host that fits them hands them in again for every pack it loads.
+    // from the pack's table — its own matches when it states them, none else: a host that fits them hands them in again
+    // for every pack it loads that states none.
     //
     // Message thread. A non-finite value is refused (false) and changes nothing; the range is clamped. The frequency, the
     // amount, the clean level and the polarity are kept across load() and unload() — the bench's, like the host's
