@@ -82,16 +82,19 @@ inline std::vector<float> probeThrough(const std::vector<std::byte>& model, cons
 //
 // The cure is a filter on the clean leg that turns as the device does: a delay, a polarity and up to two first-order
 // all-passes. All of it is unity gain at every frequency — the clean leg's level is untouched; only its phase follows
-// the capture's. It is FITTED to the capture's own response at a handful of tones (fitCleanMatch), by the host, off the
-// audio thread, on the models it loaded (measureCleanMatch); the player applies it per slot, gliding (RigPlayer,
-// CrossoverBlend). Nothing of it is in the pack: it is read off the models, whenever a pack is loaded.
+// the capture's. It is FITTED to the capture's own response at a handful of tones (fitCleanMatch). A pack may carry it,
+// fitted once when it was built (namz 5.2's `clean_match`, NAMZ-FORMAT.md), and fromDevice reads it at load; for a pack
+// that does not, a host fits it off the audio thread on the models it loaded (measureCleanMatch) and hands it in with the
+// table. Either way the player applies it per slot, gliding (RigPlayer, CrossoverBlend).
 struct CleanMatch {
     // How late the clean leg is tapped, in `sampleRate` samples, counted from the DI as a capture's `input_lag_samples`
     // is — the fit's delay, which REPLACES that reading for the clean tap (RigPlayer::setCrossoverLag still adds to it).
     int    lag = 0;
     bool   inverted = false;               // the fit's polarity, in place of the capture's own
     double allpassHz[2] { 0.0, 0.0 };      // the two sections' corners, in Hz; 0 = no section
-    double sampleRate = 0.0;               // the rate `lag` is in: the rate the fit ran at (not positive = the table's)
+    // The rate `lag` is in: the rate the fit ran at (not positive = the table's — for a pack's table, whose numbers are each
+    // in their own model's rate, the model's: a pack's match is read with 0 here, as its other numbers are).
+    double sampleRate = 0.0;
 };
 
 struct AlignmentTable {
@@ -116,7 +119,8 @@ struct AlignmentTable {
     // in their own model's rate, so a player compares them in TIME (delayOfAbsolute) once it knows the rates; the derived
     // `lagByFile` stays as the table's shape (its reference, its files) and for a host that reads it.
     bool derivedFromAbsolute = false;
-    // THE CLEAN MATCH a host fitted per capture (CleanMatch above; measureCleanMatch). A file that has one is tapped for
+    // THE CLEAN MATCH per capture (CleanMatch above): the pack's own `clean_match` (fromDevice), or what a host fitted
+    // (measureCleanMatch) and handed in with the table. A file that has one is tapped for
     // the crossover's clean leg at ITS lag and polarity, in place of the readings above, and through its all-passes. The
     // models' own alignment against each other (delayOf, delayOfAbsolute) never reads it: it is the clean leg's alone.
     std::map<std::string, CleanMatch> cleanMatchByFile;
@@ -197,7 +201,7 @@ struct AlignmentTable {
     // THE PACK'S OWN READINGS. The relative table needs every distinct file measured — a pair with one side unknown
     // cannot be lined up, and a half-measured table applied as if whole delays some models against nothing — from
     // `lag_samples`, or derived from `input_lag_samples` when every file has that instead (namz 5). A file's absolute
-    // lag and polarity are read wherever stated. Nothing stated at all: the table is empty.
+    // lag and polarity are read wherever stated, and so is its clean match. Nothing stated at all: the table is empty.
     static AlignmentTable fromDevice(const namz::rig::Device& d) {
         AlignmentTable out;
         out.fromPack = true;
@@ -210,6 +214,18 @@ struct AlignmentTable {
             if (out.reference.empty()) out.reference = f.id;
             if (f.inputLagSamples) out.absoluteLagByFile[f.id] = *f.inputLagSamples;
             if (f.polarity && *f.polarity == -1) out.invertedByFile[f.id] = true;
+            // namz 5.2's `clean_match`, in the file's own rate as its lags are (sampleRate 0): read whole or not at all, by
+            // the rule namz reads it with, so an entry a host built past the format is no match either.
+            if (const auto& m = f.cleanMatch;
+                m && m->lagSamples >= -namz::rig::kMaxLagSamples && m->lagSamples <= namz::rig::kMaxLagSamples
+                  && (m->polarity == 1 || m->polarity == -1) && m->allpassHz.size() <= 2
+                  && std::all_of(m->allpassHz.begin(), m->allpassHz.end(), [](double hz) { return std::isfinite(hz) && hz > 0.0; })) {
+                CleanMatch cm;
+                cm.lag = m->lagSamples;
+                cm.inverted = m->polarity == -1;
+                for (std::size_t s = 0; s < m->allpassHz.size(); ++s) cm.allpassHz[s] = m->allpassHz[s];
+                out.cleanMatchByFile[f.id] = cm;
+            }
             allRelative = allRelative && f.lagSamples.has_value();
             allAbsolute = allAbsolute && f.inputLagSamples.has_value();
         }
@@ -227,7 +243,9 @@ struct AlignmentTable {
                 out.lagByFile[id] = (int) rel;
             }
         }
-        if (out.lagByFile.empty() && out.absoluteLagByFile.empty() && out.invertedByFile.empty()) return AlignmentTable {};
+        // A pack that states only clean matches keeps them: they are its readings, even with no alignment beside them.
+        if (out.lagByFile.empty() && out.absoluteLagByFile.empty() && out.invertedByFile.empty() && out.cleanMatchByFile.empty())
+            return AlignmentTable {};
         return out;
     }
 };
