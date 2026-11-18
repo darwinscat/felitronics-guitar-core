@@ -2,7 +2,7 @@
 
 # Changelog
 
-## v0.13.0 — unreleased
+## v0.13.0 — 2026-11-18
 
 The player takes a capture's clean match from the pack: a pack that carries one plays the crossover blend matched at
 once, with nothing fitted at load. A pack without one plays as before, bit for bit.
@@ -15,8 +15,8 @@ once, with nothing fitted at load. A pack without one plays as before, bit for b
   them (`empty()` and `alignmentFromPack()` still say its models' offsets are not stated).
 
 ### Changed
-- **Needs namz 5.2.0** (`FileEntry::cleanMatch`). The pin moves with the namz release; a host that pins namz itself
-  moves its pin with this one.
+- **namz pinned to v5.2.0** (`FELITRONICS_NAMZ_TAG`, `FELITRONICS_NAMZ_COMMIT` = `b140a05`), for `FileEntry::cleanMatch`.
+  A host that pins namz itself (OrbitAmp FORCEs both) moves its pin with this one.
 
 ## v0.12.0 — 2026-11-17
 
