@@ -31,6 +31,18 @@ int main() {
         const auto b = bestLag (ref, cur);
         t::ok (b.lag == d, "delay " + std::to_string (d) + " -> lag " + std::to_string (b.lag));
     }
+    t::group ("an inverted copy is found by the peak's size, not its sign");
+    // The Victory V4's boosted captures play inverted against its plain ones; the largest POSITIVE value then
+    // was a ripple far from the main lobe, and the pack stated 78 and 96 samples for captures within four.
+    for (int d : { 0, 2, -4, 12, -30 }) {
+        auto cur = delayed (ref, d);
+        for (auto& x : cur) x = -x;
+        const auto b = bestLag (ref, cur);
+        t::ok (b.lag == d && b.inverted && b.corr > 0.999,
+               "inverted, delay " + std::to_string (d) + " -> lag " + std::to_string (b.lag)
+                   + (b.inverted ? ", inverted" : ", NOT inverted") + ", corr " + std::to_string (b.corr));
+    }
+    t::ok (! bestLag (ref, delayed (ref, 5)).inverted, "…and a copy in phase is not inverted");
     t::group ("degenerate inputs");
     t::ok (bestLag (ref, sig (2048)).corr < 0.0, "different lengths -> {0, -1}");
     std::vector<float> zero (4096, 0.0f);

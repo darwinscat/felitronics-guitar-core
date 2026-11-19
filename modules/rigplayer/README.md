@@ -292,6 +292,15 @@ What the player reads per capture, and what the host decides:
   host fits only for a pack that states none; a pack that states only matches keeps them (its `empty()` and
   `alignmentFromPack()` still say the models' offsets are not the pack's). A pack without `clean_match` plays bit for bit
   as before; `load()` starts with no match then.
+- **Fitting the match a pack carries** (`rigplayer/PackCleanMatch.h`): `fitPackCleanMatches(stage, source, rate)` sets
+  `clean_match` on EVERY file entry of a NAM stage, or on none — the side that builds a pack calls it, off the audio
+  thread. Each distinct file is fitted alone by `measureCleanMatch`, from the player's own table for the stage and its
+  `input_db`; two entries of one file share the first's. Where the fit beats nothing the entry states what it started
+  from — the lag and polarity the player taps the clean leg by with no match (`lagOf`, `invertsClean`), no corners — in
+  the same rate as a fitted one: the file's own, as NAMZ-FORMAT.md states it. A match already on the entries is not a
+  start, so a second run gives the same matches. It returns "" or why not, naming the file (no bytes, bytes that do not
+  load, a fit that threw, a match outside what the format reads — `cleanMatchReadable`, namz's own rule), and then the
+  stage is untouched.
 - **`setCrossoverReferenceLag(offset)`** says how late the table's reference (`crossoverLagReference()`: the pack's
   first file, or the first that loaded when measured) trails its DI — the relative readings' missing number; a host
   can measure it as `measureAlignment` does, the probe through the file against the probe itself. It is the PACK's: kept

@@ -2,6 +2,31 @@
 
 # Changelog
 
+## v0.14.0 — 2026-11-19
+
+The clean match a pack carries is fitted here, by one function for every side that builds a pack; and two captures
+that play inverted against each other are lined up by their real delay. A pack that states its lags plays as before.
+
+### Added
+- **rigplayer: `fitPackCleanMatches`** (`rigplayer/PackCleanMatch.h`) — sets namz 5.2's `files[].clean_match` on every
+  file entry of a NAM stage or on none: each distinct file fitted alone by `measureCleanMatch` from the player's table
+  for the stage, two entries of one file sharing the first's. Where the fit beats nothing the entry states what it
+  started from (`lagOf` and `invertsClean` over the stage's readings without their matches, no corners), in the same
+  rate as a fitted match — the model's own, else the rate asked for. A match already on the entries is not a start: a
+  second run gives the same matches. Returns "" or why not, naming the file — no bytes, bytes that do not load, a fit
+  that threw, a match outside what the format reads (a start lag below 0 or past `kMaxLagSamples` where the fit beats
+  nothing) — and the stage is then untouched.
+- **rigplayer: `cleanMatchReadable`** — namz's own reading rule for a clean match (a lag 0 to `kMaxLagSamples`, a
+  polarity of ±1, at most two finite corners of at least `kMinCleanMatchHz`): what it reads, namz writes and reads back.
+
+### Fixed
+- **rigplayer: `bestLag` takes the correlation's peak by its size, not its sign.** Two captures of one device can play
+  inverted against each other (the Victory V4's boosted captures against its plain ones), and then the main lobe is
+  negative: the largest positive value was a ripple far from it, so an export measured 78 and 96 samples for captures
+  within four of each other, and a blend between two neighbours combed down to -28 dB. `corr` is now the peak's size
+  (0 to 1; a negative one still means no reading) and the new `inverted` its sign. Its readers are a pack's export and
+  the player's own measurement for a pack that states no lags (`measureAlignment`).
+
 ## v0.13.0 — 2026-11-18
 
 The player takes a capture's clean match from the pack: a pack that carries one plays the crossover blend matched at
