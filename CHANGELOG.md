@@ -2,7 +2,7 @@
 
 # Changelog
 
-## v0.14.0 — 2026-11-18
+## v0.14.0 — 2026-11-19
 
 The clean match a pack carries is fitted here, by one function for every side that builds a pack; and two captures
 that play inverted against each other are lined up by their real delay. A pack that states its lags plays as before.
