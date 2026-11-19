@@ -27,6 +27,8 @@ that play inverted against each other are lined up by their real delay. A pack t
   (0 to 1; a negative one still means no reading) and the new `inverted` its sign. Its readers are a pack's export and
   the player's own measurement for a pack that states no lags (`measureAlignment`).
 
+## v0.13.0 — 2026-11-18
+
 The player takes a capture's clean match from the pack: a pack that carries one plays the crossover blend matched at
 once, with nothing fitted at load. A pack without one plays as before, bit for bit.
 
